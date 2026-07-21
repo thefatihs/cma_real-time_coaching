@@ -48,3 +48,11 @@ uv run pytest
 6. Gerçek zamanlı çağrı merkezi koçluğu için API geliştirme
 7. Performans, gecikme ve doğruluk ölçümleri
 8. Üretim ortamına hazırlık, izleme ve dağıtım
+
+## Offline ASR Baseline
+
+İlk çevrimdışı ASR temeli Faster-Whisper kullanır. Yerel geliştirme ayarları, GPU'su olmayan geliştirme bilgisayarında çalışabilmesi için `tiny` model, `cpu` cihazı ve `int8` hesaplama türüdür.
+
+Bu yapılandırma yalnızca geliştirme için bir başlangıç noktasıdır. `tiny`, projenin nihai doğruluk modeli değildir. Daha büyük ve daha doğru modeller ileride AWS üzerindeki GPU ortamında karşılaştırmalı olarak test edilecektir.
+
+Mevcut modül tek bir ses dosyasını işler; henüz canlı akış desteği yoktur. Otomatik testler gerçek modeli sahte bir nesneyle değiştirir. Bu nedenle testler model dosyası indirmez, internet bağlantısı veya CUDA gerektirmez.
