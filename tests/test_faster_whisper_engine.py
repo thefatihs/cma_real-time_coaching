@@ -139,9 +139,30 @@ def test_successful_transcription_returns_structured_result(
     assert settings == {
         "vad_filter": False,
         "condition_on_previous_text": True,
+        "initial_prompt": None,
         "language": "tr",
         "beam_size": 1,
     }
+
+
+def test_accuracy_options_are_passed_to_faster_whisper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created_models, _ = install_fake_model(monkeypatch)
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+    engine = FasterWhisperEngine(
+        vad_filter=True,
+        condition_on_previous_text=False,
+        initial_prompt="Çağrı merkezi görüşmesi.",
+    )
+
+    engine.transcribe_file(audio_path)
+
+    _, settings = created_models[0].transcribe_calls[0]
+    assert settings["vad_filter"] is True
+    assert settings["condition_on_previous_text"] is False
+    assert settings["initial_prompt"] == "Çağrı merkezi görüşmesi."
 
 
 def test_missing_optional_metadata_uses_safe_defaults(

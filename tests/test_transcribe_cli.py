@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from app.asr.models import TranscriptionResult, TranscriptionSegment
-from scripts.transcribe_file import main
+from scripts.transcribe_file import main, write_transcript
 
 
 class FakeEngine:
@@ -67,6 +67,9 @@ def test_successful_output_and_engine_settings(
         "language": "tr",
         "beam_size": 1,
         "cpu_threads": 4,
+        "vad_filter": False,
+        "condition_on_previous_text": True,
+        "initial_prompt": None,
     }
 
 
@@ -114,3 +117,68 @@ def test_expected_errors_return_nonzero_exit_code(
     assert exit_code == 1
     assert expected_message in captured.err
     assert captured.out == ""
+
+
+def test_accuracy_flags_and_selected_options_are_reported(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    engine = FakeEngine(result=make_result())
+    received_settings: dict[str, object] = {}
+
+    def engine_factory(**settings: object) -> FakeEngine:
+        received_settings.update(settings)
+        return engine
+
+    exit_code = main(
+        [
+            "audio.wav",
+            "--vad-filter",
+            "--no-condition-on-previous-text",
+            "--initial-prompt",
+            "Çağrı merkezi",
+        ],
+        engine_factory=engine_factory,
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert received_settings["vad_filter"] is True
+    assert received_settings["condition_on_previous_text"] is False
+    assert received_settings["initial_prompt"] == "Çağrı merkezi"
+    assert "VAD filter: True" in output
+    assert "Condition on previous text: False" in output
+    assert "Initial prompt: Çağrı merkezi" in output
+
+
+def test_utf8_output_contains_only_clean_transcript() -> None:
+    engine = FakeEngine(result=make_result())
+    writes: list[tuple[Path, str]] = []
+
+    exit_code = main(
+        ["audio.wav", "--output-text", "private/hypothesis.txt"],
+        engine_factory=lambda **kwargs: engine,
+        transcript_writer=lambda path, text: writes.append((path, text)),
+    )
+
+    assert exit_code == 0
+    assert writes == [(Path("private/hypothesis.txt"), "Merhaba dünya.")]
+
+
+def test_transcript_writer_uses_utf8_for_turkish_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[tuple[Path, str, str | None]] = []
+
+    def fake_write_text(
+        path: Path, text: str, encoding: str | None = None, **kwargs: object
+    ) -> int:
+        writes.append((path, text, encoding))
+        return len(text)
+
+    monkeypatch.setattr(Path, "write_text", fake_write_text)
+
+    write_transcript(Path("private/hypothesis.txt"), "İyi günler, nasılsınız?")
+
+    assert writes == [
+        (Path("private/hypothesis.txt"), "İyi günler, nasılsınız?", "utf-8")
+    ]

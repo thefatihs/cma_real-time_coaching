@@ -17,6 +17,9 @@ class FasterWhisperEngine:
         language: str | None = "tr",
         beam_size: int = 1,
         cpu_threads: int = 4,
+        vad_filter: bool = False,
+        condition_on_previous_text: bool = True,
+        initial_prompt: str | None = None,
     ) -> None:
         self.model_size = model_size
         self.device = device
@@ -24,6 +27,9 @@ class FasterWhisperEngine:
         self.language = language
         self.beam_size = beam_size
         self.cpu_threads = cpu_threads
+        self.vad_filter = vad_filter
+        self.condition_on_previous_text = condition_on_previous_text
+        self.initial_prompt = initial_prompt
         self._model: WhisperModel | None = None
 
     def _create_model(self) -> WhisperModel:
@@ -45,8 +51,9 @@ class FasterWhisperEngine:
         started_at = perf_counter()
         raw_segments, info = self._get_model().transcribe(
             str(audio_path),
-            vad_filter=False,
-            condition_on_previous_text=True,
+            vad_filter=self.vad_filter,
+            condition_on_previous_text=self.condition_on_previous_text,
+            initial_prompt=self.initial_prompt,
             language=self.language,
             beam_size=self.beam_size,
         )

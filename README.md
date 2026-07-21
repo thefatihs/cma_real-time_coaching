@@ -74,3 +74,56 @@ WAV örneği ve isteğe bağlı ayarlar:
 ```shell
 uv run python scripts/transcribe_file.py samples/deneme.wav --model tiny --language tr --beam-size 1 --cpu-threads 4
 ```
+
+## Accuracy Evaluation
+
+Model doğruluğunu anlamlı biçimde ölçmek için insan tarafından dinlenip doğrulanmış referans transkriptler gerekir. ASR çıktısı bu güvenilir metinle karşılaştırılır:
+
+- WER (Word Error Rate), kelime düzeyindeki değiştirme, silme ve ekleme hatalarını ölçer.
+- CER (Character Error Rate), aynı karşılaştırmayı karakter düzeyinde yapar.
+
+Ham çağrı merkezi kayıtları ve özel referans transkriptleri Git deposunun dışında kalmalıdır. Değerlendirme aracı bu harici UTF-8 metin dosyalarının yollarını yalnızca çalışma anında kabul eder:
+
+```shell
+uv run python scripts/evaluate_transcript.py --reference C:\CallMetricPrivate\references\call_001.txt --hypothesis C:\CallMetricPrivate\hypotheses\call_001.txt
+```
+
+Yerel `tiny`, CPU ve `int8` yapılandırması yalnızca işlevsel bir başlangıçtır; nihai doğruluk modeli değildir. Son model seçimi, gerçek çağrı merkezi verileri kullanılarak AWS GPU ortamında yapılacak karşılaştırmalı doğruluk ölçümlerine dayanacaktır. Bu aşamada öncelik doğruluktur; gecikme optimizasyonu daha sonra yapılacaktır.
+
+## Audio Metadata Inspection
+
+Özel çağrı merkezi kayıtları Git deposunun dışında kalmalıdır. Metadata aracı yalnızca konteyner ve ilk ses akışındaki teknik bilgileri okur; ses framelerini tamamen decode etmez, oynatmaz veya konuşmayı yazıya çevirmez. Dosya içeriğini ve tam özel dosya yolunu ekrana yazdırmaz.
+
+Windows PowerShell örneği:
+
+```powershell
+uv run python scripts/inspect_audio.py C:\CallMetricPrivate\audio\call_001.wav
+```
+
+Çıktı; dosya uzantısı, konteyner, codec, süre, örnekleme hızı, kanal bilgileri, örnek formatı ve varsa bit hızını gösterir.
+
+## Accuracy-focused Offline Experiments
+
+Uzun kayıtlardaki tekrar eden halüsinasyonları kontrollü biçimde incelemek için önce kısa bir WAV parçası çıkarabilirsiniz. Araç kaynak örnekleme hızını ve mono kanal düzenini korur; çıktıyı PCM signed 16-bit WAV olarak yazar:
+
+```powershell
+uv run python scripts/extract_audio_segment.py `
+  "C:\CallMetricPrivate\audio\call_001.wav" `
+  --start 30 `
+  --end 75 `
+  --output "C:\CallMetricPrivate\audio\call_001_0030_0115.wav"
+```
+
+Doğruluk deneylerinde VAD, önceki metne koşullama ve başlangıç prompt'u ayrı ayrı değiştirilebilir. Temiz transkripti harici bir UTF-8 dosyasına yazmak için:
+
+```powershell
+uv run python scripts/transcribe_file.py `
+  "C:\CallMetricPrivate\audio\call_001_0030_0115.wav" `
+  --model base `
+  --vad-filter `
+  --no-condition-on-previous-text `
+  --initial-prompt "Çağrı merkezi müşteri görüşmesi." `
+  --output-text "C:\CallMetricPrivate\hypotheses\call_001_base.txt"
+```
+
+`--output-text` dosyası yalnız temiz tam transkripti içerir; ölçümler ve terminal başlıkları eklenmez. Özel ses ve hipotez dosyaları Git deposunun dışında tutulmalıdır.

@@ -18,6 +18,7 @@ class TranscriptionEngine(Protocol):
 
 
 EngineFactory = Callable[..., TranscriptionEngine]
+TranscriptWriter = Callable[[Path, str], None]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,10 +32,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cpu-threads", type=int, default=4, help="Number of CPU threads"
     )
+    parser.add_argument("--vad-filter", action="store_true")
+    parser.add_argument(
+        "--no-condition-on-previous-text",
+        action="store_false",
+        dest="condition_on_previous_text",
+    )
+    parser.add_argument("--initial-prompt")
+    parser.add_argument("--output-text", type=Path)
     return parser
 
 
-def format_result(result: TranscriptionResult, model_name: str) -> str:
+def format_result(
+    result: TranscriptionResult,
+    model_name: str,
+    vad_filter: bool,
+    condition_on_previous_text: bool,
+    initial_prompt: str | None,
+) -> str:
     if result.duration_seconds > 0:
         real_time_factor = result.processing_time_seconds / result.duration_seconds
         real_time_factor_text = f"{real_time_factor:.3f}"
@@ -43,6 +58,9 @@ def format_result(result: TranscriptionResult, model_name: str) -> str:
 
     lines = [
         f"Model: {model_name}",
+        f"VAD filter: {vad_filter}",
+        f"Condition on previous text: {condition_on_previous_text}",
+        f"Initial prompt: {initial_prompt or 'None'}",
         "Transcript:",
         result.text,
         f"Language: {result.language or 'unknown'}",
@@ -59,9 +77,14 @@ def format_result(result: TranscriptionResult, model_name: str) -> str:
     return "\n".join(lines)
 
 
+def write_transcript(output_path: Path, transcript: str) -> None:
+    output_path.write_text(transcript, encoding="utf-8")
+
+
 def main(
     argv: Sequence[str] | None = None,
     engine_factory: EngineFactory = FasterWhisperEngine,
+    transcript_writer: TranscriptWriter = write_transcript,
 ) -> int:
     args = build_parser().parse_args(argv)
 
@@ -73,8 +96,13 @@ def main(
             language=args.language,
             beam_size=args.beam_size,
             cpu_threads=args.cpu_threads,
+            vad_filter=args.vad_filter,
+            condition_on_previous_text=args.condition_on_previous_text,
+            initial_prompt=args.initial_prompt,
         )
         result = engine.transcribe_file(args.audio_path)
+        if args.output_text is not None:
+            transcript_writer(args.output_text, result.text)
     except FileNotFoundError as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
@@ -85,7 +113,15 @@ def main(
         print(f"Model loading or transcription failed: {error}", file=sys.stderr)
         return 1
 
-    print(format_result(result, args.model))
+    print(
+        format_result(
+            result,
+            args.model,
+            args.vad_filter,
+            args.condition_on_previous_text,
+            args.initial_prompt,
+        )
+    )
     return 0
 
 
