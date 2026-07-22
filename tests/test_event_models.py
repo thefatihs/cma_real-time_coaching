@@ -66,6 +66,13 @@ def test_audio_bytes_are_hidden_from_repr() -> None:
     assert "audio_bytes" not in repr(make_audio_event())
 
 
+@pytest.mark.parametrize("codec_name", ["pcm_s16", "pcm_s16le"])
+def test_signed_16_bit_little_endian_pcm_names_are_canonical(codec_name: str) -> None:
+    event = make_audio_event(codec_name=codec_name)
+    assert event.codec_name == "pcm_s16le"
+    assert event.metadata_summary()["codec_name"] == "pcm_s16le"
+
+
 @pytest.mark.parametrize(
     "changes",
     [

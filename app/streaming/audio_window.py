@@ -2,6 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.events.models import canonical_audio_codec_name
 from app.streaming.rolling_buffer import RollingAudioBuffer
 
 
@@ -50,7 +51,8 @@ class AudioWindowBuilder:
             raise ValueError("Cannot build an ASR audio window from an empty buffer")
 
         first = events[0]
-        if first.codec_name != self._SUPPORTED_CODEC:
+        codec_name = canonical_audio_codec_name(first.codec_name)
+        if codec_name != self._SUPPORTED_CODEC:
             raise ValueError(
                 f"Unsupported audio codec {first.codec_name!r}; "
                 f"only {self._SUPPORTED_CODEC!r} is supported"
@@ -92,6 +94,6 @@ class AudioWindowBuilder:
             duration_seconds=duration_seconds,
             sample_rate_hz=first.sample_rate_hz,
             channel_count=first.channel_count,
-            codec_name=first.codec_name,
+            codec_name=codec_name,
             pcm_bytes=pcm_bytes,
         )

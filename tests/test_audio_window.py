@@ -96,6 +96,19 @@ def test_unsupported_codec_is_rejected() -> None:
         build([pcm_event(0, 0.0, 1.0, codec="pcm_f32le")])
 
 
+def test_pyav_pcm_s16_alias_builds_a_canonical_asr_window() -> None:
+    event = pcm_event(0, 0.0, 1.0, codec="pcm_s16")
+    window = build([event])
+    assert event.codec_name == "pcm_s16le"
+    assert window.codec_name == "pcm_s16le"
+
+
+@pytest.mark.parametrize("codec", ["pcm_s16be", "pcm_u16le", "pcm_f32le", "mp3"])
+def test_unrelated_codecs_remain_unsupported(codec: str) -> None:
+    with pytest.raises(ValueError, match="Unsupported audio codec"):
+        build([pcm_event(0, 0.0, 1.0, codec=codec)])
+
+
 def test_pcm_bytes_are_hidden_from_repr_and_metadata() -> None:
     window = build([pcm_event(0, 0.0, 1.0, marker=123)])
     assert "pcm_bytes" not in repr(window)

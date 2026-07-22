@@ -56,6 +56,7 @@ def test_generates_ordered_chunks_and_short_final_chunk(tmp_path: Path) -> None:
     assert all(event.channel_count == 1 for event in events)
     assert all(event.tenant_id == "tenant-a" for event in events)
     assert all(event.call_id == "call-a" for event in events)
+    assert all(event.codec_name == "pcm_s16le" for event in events)
     assert len(events[0].audio_bytes) == 16_000 * 2
     assert len(events[1].audio_bytes) == 2_000 * 2
 

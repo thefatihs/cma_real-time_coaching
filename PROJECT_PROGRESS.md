@@ -145,3 +145,17 @@ Tarih: 22 Temmuz 2026
   `tests/test_transcribe_streaming_file.py`, `PROJECT_PROGRESS.md`.
 - Testler: focused 45 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Gercek yerel sesle kontrollu manuel dogrulama.
+
+## 25. PCM Codec Name Canonicalization Fix
+
+Tarih: 22 Temmuz 2026
+
+- PyAV tarafindan uretilen `pcm_s16` codec adi event olusumunda canonical
+  `pcm_s16le` degerine normalize edildi; window builder kontrolu korundu.
+- Big-endian, unsigned, float ve compressed codec adlari destek kapsamina
+  alinmadi.
+- Degisen dosyalar: `app/events/models.py`, `app/streaming/audio_window.py`,
+  `tests/test_event_models.py`, `tests/test_chunk_generator.py`,
+  `tests/test_audio_window.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 37 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Yerel streaming ASR testini tekrar calistirmak.
