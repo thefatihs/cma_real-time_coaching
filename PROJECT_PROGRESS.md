@@ -118,3 +118,17 @@ Tarih: 22 Temmuz 2026
 - Testler: focused 37 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Reconciler'i gelecekteki streaming orchestration katmanina
   baglamak.
+
+## 23. Core File-Based Streaming ASR Pipeline
+
+Tarih: 22 Temmuz 2026
+
+- Tenant ASR ayarlariyla chunk generator, rolling buffer, exact audio window,
+  injectable transcriber ve transcript reconciler'i baglayan pipeline eklendi.
+- Her chunk icin immutable ve ham ses icermeyen snapshot uretilir; pending partial
+  metin dosya sonunda FINAL event olarak CallState'e uygulanir.
+- Degisen dosyalar: `app/streaming/pipeline.py`,
+  `tests/test_streaming_pipeline.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 42 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Pipeline icin ayri bir kullanici arayuzu gereksinimini
+  degerlendirmek.
