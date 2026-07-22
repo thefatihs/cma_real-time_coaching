@@ -76,3 +76,16 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Simulator ciktisini gelecekteki streaming ASR katmanina
   baglamak.
+
+## 20. Exact PCM ASR Audio Window
+
+Tarih: 22 Temmuz 2026
+
+- Rolling buffer iceriginden immutable, tenant-aware ve frame-aligned PCM ASR
+  penceresi olusturan builder eklendi.
+- `pcm_s16le` sesler kronolojik birlestirilir ve ilk kismi kesen pencere siniri
+  tam kanal frame'leri korunarak kirpilir; ham PCM guvenli metadata'ya eklenmez.
+- Degisen dosyalar: `app/streaming/audio_window.py`,
+  `tests/test_audio_window.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused ve full kalite kontrolleri tamamlandi.
+- Sonraki planli adim: PCM penceresini gelecekteki ASR inference katmanina baglamak.
