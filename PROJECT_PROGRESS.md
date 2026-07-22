@@ -159,3 +159,29 @@ Tarih: 22 Temmuz 2026
   `tests/test_audio_window.py`, `PROJECT_PROGRESS.md`.
 - Testler: focused 37 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Yerel streaming ASR testini tekrar calistirmak.
+
+## 26. Streaming Segment Timestamp Boundary Fix
+
+Tarih: 22 Temmuz 2026
+
+- Kisa ASR pencerelerinde decoder padding nedeniyle pencere disina tasan segment
+  zamanlari gercek pencere sinirlarina kirpiliyor.
+- Tamamen pencere disindaki segmentler ve metinleri atlanirken non-finite,
+  non-numeric ve ters zaman araliklari guvenli metadata hatasiyla reddediliyor.
+- Degisen dosyalar: `app/streaming/window_transcriber.py`,
+  `tests/test_window_transcriber.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 16 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Yerel streaming ASR testini tekrar calistirmak.
+
+## 27. In-Memory Whisper Sample-Rate Fix
+
+Tarih: 22 Temmuz 2026
+
+- ASR window PCM verisini mono normalized float32 waveform'e donusturen ve kaynak
+  hizi farkliysa PyAV ile 16000 Hz'e resample eden tek bir helper eklendi.
+- 8000 Hz call-center sesi artik sureyi koruyarak iki kat sample ile Whisper'a
+  aktarilir; 16000 Hz girdi gereksiz resample edilmez.
+- Degisen dosyalar: `app/streaming/window_transcriber.py`,
+  `tests/test_window_transcriber.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 43 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Yerel streaming ASR testini tekrar calistirmak.
