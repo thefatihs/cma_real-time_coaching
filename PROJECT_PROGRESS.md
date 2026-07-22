@@ -104,3 +104,17 @@ Tarih: 22 Temmuz 2026
 - Testler: focused 23 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Adapter'i gelecekteki rolling streaming orchestration
   katmanina baglamak.
+
+## 22. Deterministic Partial/Stable Transcript Reconciler
+
+Tarih: 22 Temmuz 2026
+
+- Overlapping ASR pencere sonuclarini tenant ve call kapsamini koruyan sirali
+  PARTIAL, STABLE ve FINAL transcript event'lerine donusturen reconciler eklendi.
+- Normalize edilmis kelime suffix/prefix overlap'i tekrar eden stable metni
+  engellerken secilen ozgun ASR yazimini korur; state tamamen resetlenebilir.
+- Degisen dosyalar: `app/streaming/transcript_reconciler.py`,
+  `tests/test_transcript_reconciler.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 37 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Reconciler'i gelecekteki streaming orchestration katmanina
+  baglamak.
