@@ -12,3 +12,7 @@ wheels/
 # Local audio samples
 samples/*
 !samples/.gitkeep
+
+# Generated benchmark results
+benchmark_results/*
+!benchmark_results/.gitkeep

@@ -127,3 +127,40 @@ uv run python scripts/transcribe_file.py `
 ```
 
 `--output-text` dosyası yalnız temiz tam transkripti içerir; ölçümler ve terminal başlıkları eklenmez. Özel ses ve hipotez dosyaları Git deposunun dışında tutulmalıdır.
+
+## Benchmark Result Recording
+
+İnsan onaylı referans ile mevcut ASR hipotezini karşılaştırıp gizlilik güvenli bir benchmark sonucu kaydetmek için:
+
+```powershell
+uv run python scripts/record_benchmark_result.py `
+  --reference "C:\CallMetricPrivate\references\call_001_0030_0115_reference.txt" `
+  --hypothesis "C:\CallMetricPrivate\hypotheses\call_001_large_v3_vad_noctx.txt" `
+  --results-dir "C:\CallMetricPrivate\results" `
+  --experiment-id "call001-large-v3-baseline" `
+  --recording-id "call_001" `
+  --segment-id "0030-0115" `
+  --start 30 --end 75 --model large-v3 --language tr --beam-size 5 `
+  --vad-filter --no-condition-on-previous-text `
+  --device cpu --compute-type int8 --cpu-threads 4
+```
+
+Her çalıştırma bir JSON dosyasına yazılır; `benchmark_runs.csv` bu JSON dosyalarından yeniden oluşturulur. Kalıcı sonuçlar yalnız metrikleri, mantıksal kimlikleri ve dosya adlarını içerir. Transkript metni ve mutlak özel dosya yolları kaydedilmez.
+
+Toplu WER, çalıştırma yüzdelerinin basit ortalaması değildir: toplam kelime hatası toplam referans kelime sayısına bölünür. CER de toplam karakter hatasının toplam referans karakter sayısına bölünmesiyle aynı şekilde ağırlıklı hesaplanır.
+
+## Accuracy Dashboard
+
+Harici sonuç klasörünü PowerShell oturumunda seçmek için:
+
+```powershell
+$env:CALLMETRIC_BENCHMARK_DIR = "C:\CallMetricPrivate\results"
+```
+
+Dashboard'u başlatın:
+
+```shell
+uv run streamlit run dashboard/app.py
+```
+
+Streamlit normalde yerel adres olarak `http://localhost:8501` gösterir. Dashboard ASR çalıştırmaz; mevcut JSON ve CSV metriklerini yerel olarak, salt-okunur biçimde gösterir. Özel kayıtlar ve transkriptler Git dışında kalmalıdır.

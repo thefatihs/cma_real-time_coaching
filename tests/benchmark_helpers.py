@@ -1,0 +1,46 @@
+from app.benchmark.models import BenchmarkRun
+
+
+def make_benchmark_run(**changes: object) -> BenchmarkRun:
+    values: dict[str, object] = {
+        "schema_version": 1,
+        "run_id": "run-001",
+        "experiment_id": "deney-1",
+        "recording_id": "call_001",
+        "segment_id": "0030-0115",
+        "created_at_utc": "2026-07-22T10:00:00+00:00",
+        "start_seconds": 30.0,
+        "end_seconds": 75.0,
+        "duration_seconds": 45.0,
+        "model_name": "large-v3",
+        "language": "tr",
+        "beam_size": 5,
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+        "initial_prompt": None,
+        "device": "cpu",
+        "compute_type": "int8",
+        "cpu_threads": 4,
+        "processing_time_seconds": 90.0,
+        "real_time_factor": 2.0,
+        "wer": 0.2,
+        "cer": 0.1,
+        "substitutions": 1,
+        "deletions": 1,
+        "insertions": 0,
+        "correct_words": 8,
+        "reference_word_count": 10,
+        "word_error_count": 2,
+        "character_error_count": 5,
+        "reference_character_count": 50,
+        "codec_name": "pcm_s16le",
+        "sample_rate_hz": 8_000,
+        "channel_count": 1,
+        "channel_layout": "mono",
+        "sample_format": "s16",
+        "bit_rate": 128_000,
+        "reference_filename": "çağrı_001_reference.txt",
+        "hypothesis_filename": "çağrı_001_hypothesis.txt",
+    }
+    values.update(changes)
+    return BenchmarkRun.from_dict(values)

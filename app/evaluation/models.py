@@ -14,3 +14,8 @@ class TranscriptEvaluationResult:
     insertions: int
     correct_words: int
     reference_word_count: int
+    character_substitutions: int = 0
+    character_deletions: int = 0
+    character_insertions: int = 0
+    character_error_count: int = 0
+    reference_character_count: int = 0

@@ -9,7 +9,9 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "jiwer>=4.0.0",
     "numpy>=2.5.1",
+    "pandas>=3.0.3",
     "pydantic-settings>=2.14.2",
+    "streamlit>=1.60.0",
     "uvicorn[standard]>=0.51.0",
 ]
 
