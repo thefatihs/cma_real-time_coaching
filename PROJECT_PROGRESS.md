@@ -185,3 +185,16 @@ Tarih: 22 Temmuz 2026
   `tests/test_window_transcriber.py`, `PROJECT_PROGRESS.md`.
 - Testler: focused 43 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Yerel streaming ASR testini tekrar calistirmak.
+
+## 28. Tenant-Aware Rule-Based Coaching Engine
+
+Tarih: 22 Temmuz 2026
+
+- Tenant label ve izinli action ayarlarina gore STABLE/FINAL transcript event'lerini
+  deterministik Unicode-aware kurallarla degerlendiren coaching engine eklendi.
+- Unique classification label'lari, en guclu action ve yalnizca template/escalation
+  kurallari icin deduplicate edilmis suggestion event'leri uretilir.
+- Degisen dosyalar: `app/coaching/__init__.py`, `app/coaching/rule_engine.py`,
+  `tests/test_rule_engine.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 48 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Coaching engine'i transcript event akisi ile baglamak.
