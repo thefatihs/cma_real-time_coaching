@@ -164,3 +164,17 @@ uv run streamlit run dashboard/app.py
 ```
 
 Streamlit normalde yerel adres olarak `http://localhost:8501` gösterir. Dashboard ASR çalıştırmaz; mevcut JSON ve CSV metriklerini yerel olarak, salt-okunur biçimde gösterir. Özel kayıtlar ve transkriptler Git dışında kalmalıdır.
+
+## Multi-Tenant Architecture Foundation
+
+Tenant, CallMetric'i kullanan bağımsız bir şirketi temsil eder. Her ses parçası, transkript, sınıflandırma sonucu, bilgi arama isteği ve koçluk önerisi hem `tenant_id` hem de ilgili şirket içindeki görüşmeyi belirleyen `call_id` taşır. Bu kimlikler farklı şirketlerin veya farklı çağrıların verilerinin yanlışlıkla birleştirilmesini engeller.
+
+Şirket bazında ASR modeli ve pencere süreleri, sınıflandırma etiketleri/eşikleri, RAG bilgi tabanı ve koçluk kuralları değiştirilebilir. Gelecekteki SetFit modelleri ile RAG bilgi tabanları da tenant bazında izole edilecektir.
+
+- `AudioChunkEvent`, teknik ses parçası bilgisini ve ham byte'ları taşır; güvenli özeti ham sesi içermez.
+- `TranscriptEvent`, partial, stable veya final transkript revizyonunu temsil eder.
+- `ClassificationResultEvent`, tenant'a özel modelin etiket ve aksiyon sonucunu taşır.
+- `RetrievalRequestEvent`, doğru tenant bilgi tabanına yöneltilecek sorguyu tanımlar.
+- `CoachingSuggestionEvent`, temsilciye gösterilecek öneri ve kanıt kimliklerini taşır.
+
+`CallState`, tek tenant ve tek çağrı için son ses sırasını, stable/partial transkripti, aktif etiketleri, gösterilen önerileri ve koçluk cooldown zamanını yalnız bellekte tutar. Bu temel sürümde authentication, kalıcı veri tabanı, AWS bağlantısı, SetFit/RAG çalıştırması ve gerçek streaming henüz uygulanmamıştır.
