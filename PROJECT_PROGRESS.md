@@ -212,3 +212,13 @@ Tarih: 22 Temmuz 2026
   `PROJECT_PROGRESS.md`.
 - Testler: focused 45 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Coordinator'i streaming transcript event akisi ile baglamak.
+
+## 30. Sentetik Canli Kocluk Dashboard Prototipi
+
+- Iki tenant icin izole sentetik Turkce senaryolarla Streamlit canli kocluk paneli eklendi.
+- Partial metinler yalnizca ekrani gunceller; stable/final olaylar gercek kural motoru ve coordinator uzerinden islenir.
+- Transkript, risk/niyet, oneri ve bastirma, demo gecikme, olay zaman cizelgesi ve mimari durum gorunumleri eklendi.
+- Degisen dosyalar: `live_dashboard/app.py`, `live_dashboard/demo_data.py`, `live_dashboard/view_models.py`, `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 9 passed; full 248 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Prototipi sentetik kullanici geri bildirimiyle degerlendirmek.
