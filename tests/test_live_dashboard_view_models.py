@@ -16,9 +16,12 @@ from live_dashboard.uploaded_audio import (
 )
 from live_dashboard.view_models import (
     advance_runtime,
-    create_runtime,
+    apply_feedback,
     create_local_execution,
+    create_runtime,
+    dashboard_tabs,
     execute_local_once,
+    intent_chips,
     ordered_suggestions,
     progress_view,
     reset_runtime,
@@ -359,3 +362,77 @@ def test_tenant_display_names_change_but_ids_do_not() -> None:
     assert demos["tenant_beta"].config.context.tenant_name == "Demo Yazılım"
     assert demos["tenant_alpha"].config.context.tenant_id == "tenant_alpha"
     assert demos["tenant_beta"].config.context.tenant_id == "tenant_beta"
+
+
+def test_three_tab_data_has_clear_presentation_boundaries() -> None:
+    subject = runtime("tenant_alpha", "price")
+    advance_runtime(subject)
+    advance_runtime(subject)
+    tabs = dashboard_tabs(subject)
+    assert tabs.representative.transcript.stable_text
+    assert not hasattr(tabs.representative, "pipeline_statuses")
+    assert tabs.technical.pipeline_statuses
+    assert tabs.result.waiting_message
+
+
+def test_coaching_card_includes_label_evidence_and_priority_symbol() -> None:
+    subject = runtime("tenant_alpha", "cancel")
+    advance_runtime(subject)
+    advance_runtime(subject)
+    card = dashboard_tabs(subject).representative.suggestions[0]
+    assert card.related_label == "İptal riski"
+    assert card.evidence_ids == ("synthetic-a-cancel",)
+    assert (card.priority_text, card.priority_symbol) == ("HIGH", "▲")
+
+
+def test_intent_chip_formatting_is_compact_and_readable() -> None:
+    subject = runtime("tenant_alpha", "critical")
+    advance_runtime(subject)
+    advance_runtime(subject)
+    chips = intent_chips(subject.latest_labels)
+    assert [(chip.text, chip.score, chip.is_risk, chip.symbol) for chip in chips] == [
+        ("Kritik risk", "%100", True, "⚠")
+    ]
+
+
+def test_latency_chart_input_is_ordered_by_chunk() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.asr_window_ms = [310.0, 120.0, 205.0]
+    chart = dashboard_tabs(state.runtime, state).technical.asr_chart
+    assert chart == ((1, 310.0), (2, 120.0), (3, 205.0))
+
+
+def test_completed_call_summary_contains_safe_product_data() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(state, FakePipeline(), Path("fake.wav"))
+    metadata = safe_upload_metadata("sentetik.wav", 2048)
+    result = dashboard_tabs(state.runtime, state, metadata).result
+    assert result.completed
+    assert result.final_transcript
+    assert result.model_name == "large-v3"
+    assert result.language == "tr"
+    assert result.audio_metadata == (
+        ("Dosya", "sentetik.wav"),
+        ("Biçim", "WAV"),
+        ("Boyut", "2.0 KB"),
+    )
+    assert "İptal riski" in {chip.text for chip in result.detected_labels}
+
+
+def test_feedback_is_session_only_and_does_not_change_coaching() -> None:
+    subject = runtime("tenant_alpha", "cancel")
+    advance_runtime(subject)
+    advance_runtime(subject)
+    before = tuple(subject.suggestions)
+    feedback = apply_feedback({}, "card-1", "Uygulandı")
+    assert feedback == {"card-1": "Uygulandı"}
+    assert tuple(subject.suggestions) == before
+
+
+def test_tab_models_expose_no_audio_bytes_or_private_paths() -> None:
+    subject = runtime("tenant_beta", "product")
+    advance_runtime(subject)
+    rendered = repr(dashboard_tabs(subject))
+    assert "audio_bytes" not in rendered
+    assert "CallMetricPrivate" not in rendered

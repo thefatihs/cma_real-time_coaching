@@ -244,3 +244,15 @@ Tarih: 22 Temmuz 2026
 - Testler: focused 30 passed; full 260 passed (1 dependency warning).
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Ilerleme gorunumunu sentetik kisa bir ses dosyasiyla manuel dogrulamak.
+
+## 33. Uc Gorunumlu Dashboard Sunumu
+
+- Dashboard sunumu Temsilci Gorunumu, Teknik Izleme ve Gorusme Sonucu sekmelerine ayrildi.
+- Temsilci ekrani kompakt durum/ilerleme, kesin/kismi transkript, intent-risk chip'leri ve zengin kocluk kartlariyla sadeleştirildi.
+- Teknik metrikler, ASR cizgisi, pipeline durumlari ve guvenli uyarilar yalnizca Teknik Izleme sekmesine tasindi.
+- Tamamlanan gorusmeler icin guvenli metadata, etiket ve oneri ozeti ile istege bagli transkript indirme sunuldu.
+- Sidebar Gorusme, Ses Kaynagi ve kapali Model Ayarlari gruplarina ayrildi; geri bildirim yalnizca session_state icinde tutulur.
+- Degisen dosyalar: `live_dashboard/app.py`, `live_dashboard/view_models.py`, `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 26 passed; full 267 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Uc gorunumu sentetik bir gorusmeyle manuel kullanilabilirlik testinden gecirmek.

@@ -24,6 +24,7 @@ from app.streaming.pipeline import (
     StreamingASRStep,
 )
 from live_dashboard.demo_data import DemoScenario, TenantDemo
+from live_dashboard.uploaded_audio import SafeUploadMetadata
 
 
 PRIORITY_RANK = {
@@ -43,6 +44,22 @@ ACTION_LABELS = {
     CoachingAction.TEMPLATE_ACTION: "Hazır öneri",
     CoachingAction.RAG_ACTION: "Bilgi arama",
     CoachingAction.ESCALATE: "Yetkiliye aktar",
+}
+INTENT_LABELS = {
+    "urun_bilgisi": "Ürün bilgisi",
+    "paket_sorusu": "Ürün bilgisi",
+    "fiyat_itirazi": "Fiyat itirazı",
+    "butce_endisesi": "Fiyat itirazı",
+    "iptal_riski": "İptal riski",
+    "ayrilma_talebi": "İptal riski",
+    "kritik_eskalasyon": "Kritik risk",
+    "yonetici_aktarimi": "Kritik risk",
+}
+PRIORITY_SYMBOLS = {
+    SuggestionPriority.LOW: "○",
+    SuggestionPriority.MEDIUM: "●",
+    SuggestionPriority.HIGH: "▲",
+    SuggestionPriority.CRITICAL: "◆",
 }
 
 
@@ -80,6 +97,17 @@ class SuggestionCardViewModel:
     suggestion: str
     action: str
     timestamp: str
+    related_label: str | None
+    evidence_ids: tuple[str, ...]
+    priority_symbol: str
+
+
+@dataclass(frozen=True, slots=True)
+class IntentChipViewModel:
+    text: str
+    score: str
+    is_risk: bool
+    symbol: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +147,50 @@ class ProgressViewModel:
     failed_chunk: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class RepresentativeTabViewModel:
+    status: tuple[StatusCardViewModel, ...]
+    progress: ProgressViewModel
+    transcript: TranscriptViewModel
+    suggestions: tuple[SuggestionCardViewModel, ...]
+    intent_chips: tuple[IntentChipViewModel, ...]
+    suppressed_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class TechnicalTabViewModel:
+    progress: ProgressViewModel
+    latency: LatencyViewModel | None
+    asr_chart: tuple[tuple[int, float], ...]
+    pipeline_statuses: tuple[tuple[str, str], ...]
+    total_processing: str
+    rtf: str
+    last_asr: str
+    warning: str | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CallResultTabViewModel:
+    completed: bool
+    waiting_message: str
+    final_transcript: str
+    metrics: tuple[StatusCardViewModel, ...]
+    detected_labels: tuple[IntentChipViewModel, ...]
+    suggestion_timeline: tuple[TimelineItem, ...]
+    suppressed_count: int
+    model_name: str
+    language: str
+    audio_metadata: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardTabsViewModel:
+    representative: RepresentativeTabViewModel
+    technical: TechnicalTabViewModel
+    result: CallResultTabViewModel
+
+
 @dataclass(slots=True)
 class DashboardRuntime:
     tenant: TenantDemo
@@ -134,6 +206,7 @@ class DashboardRuntime:
     timeline: list[TimelineItem] = field(default_factory=list)
     suppression_reasons: list[str] = field(default_factory=list)
     latency: LatencyViewModel | None = None
+    detected_label_names: list[str] = field(default_factory=list)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -325,7 +398,9 @@ def transcript_view(runtime: DashboardRuntime) -> TranscriptViewModel:
     )
 
 
-def suggestion_card(event: CoachingSuggestionEvent) -> SuggestionCardViewModel:
+def suggestion_card(
+    event: CoachingSuggestionEvent, related_label: str | None = None
+) -> SuggestionCardViewModel:
     return SuggestionCardViewModel(
         event.priority,
         event.priority.value,
@@ -333,6 +408,9 @@ def suggestion_card(event: CoachingSuggestionEvent) -> SuggestionCardViewModel:
         event.suggestion,
         action_display(event.action),
         event.created_at_utc.strftime("%H:%M:%S"),
+        intent_label(related_label) if related_label else None,
+        tuple(event.evidence_ids),
+        PRIORITY_SYMBOLS[event.priority],
     )
 
 
@@ -348,6 +426,31 @@ def suppression_reason_display(reason: str) -> str:
 
 def action_display(action: CoachingAction) -> str:
     return ACTION_LABELS[action]
+
+
+def intent_label(label: str) -> str:
+    return INTENT_LABELS.get(label, label.replace("_", " ").title())
+
+
+def intent_chips(labels: tuple[LabelViewModel, ...]) -> tuple[IntentChipViewModel, ...]:
+    return tuple(
+        IntentChipViewModel(
+            intent_label(label.name),
+            label.score_percent,
+            label.critical or "risk" in label.name.casefold(),
+            "⚠" if label.critical or "risk" in label.name.casefold() else "●",
+        )
+        for label in labels
+    )
+
+
+def apply_feedback(
+    feedback: dict[str, str], suggestion_key: str, value: str
+) -> dict[str, str]:
+    """Return session-only feedback without touching coaching state."""
+    if value not in {"Görüldü", "Uygulandı", "Uygun değil"}:
+        raise ValueError("Unknown feedback value")
+    return {**feedback, suggestion_key: value}
 
 
 def responsive_rows[T](
@@ -411,6 +514,167 @@ def progress_view(state: LocalExecutionState) -> ProgressViewModel:
             else f"Tahmini kalan süre: {_human_duration(eta_seconds)}"
         ),
         failed_chunk=state.failed_chunk,
+    )
+
+
+def dashboard_tabs(
+    runtime: DashboardRuntime,
+    local_state: LocalExecutionState | None = None,
+    audio_metadata: SafeUploadMetadata | None = None,
+) -> DashboardTabsViewModel:
+    """Build presentation-only data for the three product views."""
+    local_mode = local_state is not None
+    progress = (
+        progress_view(local_state)
+        if local_state is not None
+        else _synthetic_progress(runtime)
+    )
+    complete = local_state.status == "completed" if local_state else runtime.complete
+    call_status = (
+        "Tamamlandı"
+        if complete
+        else (local_state.stage if local_state else "Demo hazır")
+    )
+    status = (
+        StatusCardViewModel("Tenant", runtime.tenant.config.context.tenant_name),
+        StatusCardViewModel("Çağrı", runtime.call_id),
+        StatusCardViewModel("Durum", call_status),
+        StatusCardViewModel("Geçen süre", progress.elapsed),
+        StatusCardViewModel(
+            "Parça", f"{progress.completed_chunks}/{progress.total_chunks}"
+        ),
+        StatusCardViewModel("Tamamlanma", f"%{progress.percentage:.0f}"),
+    )
+    chips = intent_chips(runtime.latest_labels)
+    result_chips = intent_chips(
+        tuple(
+            LabelViewModel(
+                name,
+                "%100",
+                any(marker in name.casefold() for marker in CRITICAL_LABEL_MARKERS),
+            )
+            for name in runtime.detected_label_names
+        )
+    )
+    latency = runtime.latency or _synthetic_latency(runtime)
+    asr_values = local_state.asr_window_ms if local_state else []
+    total_processing = (
+        f"{local_state.processing_seconds:.2f} sn"
+        if local_state and local_state.processing_seconds is not None
+        else "—"
+    )
+    rtf = (
+        f"{local_state.real_time_factor:.2f}x"
+        if local_state and local_state.real_time_factor is not None
+        else "—"
+    )
+    metadata = (
+        (
+            ("Dosya", audio_metadata.filename),
+            ("Biçim", audio_metadata.format_name),
+            ("Boyut", f"{audio_metadata.size_bytes / 1024:.1f} KB"),
+        )
+        if audio_metadata is not None
+        else ()
+    )
+    audio_seconds = (
+        local_state.audio_duration_seconds
+        if local_state and local_state.audio_duration_seconds is not None
+        else runtime.elapsed_seconds
+    )
+    metrics = (
+        StatusCardViewModel("Ses süresi", f"{audio_seconds:.2f} sn"),
+        StatusCardViewModel("Toplam parça", str(progress.total_chunks)),
+        StatusCardViewModel("İşlem süresi", total_processing),
+        StatusCardViewModel(
+            "Ortalama ASR",
+            "—" if not asr_values else f"{sum(asr_values) / len(asr_values):.0f} ms",
+        ),
+        StatusCardViewModel("RTF", rtf),
+    )
+    return DashboardTabsViewModel(
+        representative=RepresentativeTabViewModel(
+            status=status,
+            progress=progress,
+            transcript=transcript_view(runtime),
+            suggestions=tuple(ordered_suggestions(runtime.suggestions)),
+            intent_chips=chips,
+            suppressed_count=len(runtime.suppression_reasons),
+        ),
+        technical=TechnicalTabViewModel(
+            progress=progress,
+            latency=latency,
+            asr_chart=tuple(enumerate(asr_values, start=1)),
+            pipeline_statuses=(
+                (
+                    "ASR",
+                    "failed"
+                    if local_state and local_state.status == "error"
+                    else "active"
+                    if local_mode
+                    else "simulated",
+                ),
+                ("Rule Engine", "active"),
+                ("SetFit", "not implemented"),
+                ("RAG", "not implemented"),
+                ("LLM", "not implemented"),
+            ),
+            total_processing=total_processing,
+            rtf=rtf,
+            last_asr="—" if not asr_values else f"{asr_values[-1]:.0f} ms",
+            warning=(
+                "CPU çıkarımı gerçek zamandan yavaş olabilir." if local_mode else None
+            ),
+            error=local_state.error_message if local_state else None,
+        ),
+        result=CallResultTabViewModel(
+            completed=complete,
+            waiting_message="Görüşme tamamlandığında sonuç özeti burada görünecek.",
+            final_transcript=runtime.call_state.stable_transcript if complete else "",
+            metrics=metrics,
+            detected_labels=result_chips,
+            suggestion_timeline=tuple(
+                item
+                for item in runtime.timeline
+                if item.event_type == "Öneri gösterildi"
+            ),
+            suppressed_count=len(runtime.suppression_reasons),
+            model_name=runtime.tenant.config.asr.model_name,
+            language=runtime.tenant.config.asr.language,
+            audio_metadata=metadata,
+        ),
+    )
+
+
+def _synthetic_progress(runtime: DashboardRuntime) -> ProgressViewModel:
+    total = len(runtime.scenario.events) if runtime.scenario else 0
+    completed = min(runtime.next_event_index, total)
+    percentage = completed / total * 100 if total else 0.0
+    return ProgressViewModel(
+        stage="Tamamlandı" if runtime.complete else "Sentetik oynatma",
+        completed_chunks=completed,
+        total_chunks=total,
+        percentage=percentage,
+        time_range=(
+            "Henüz başlanmadı"
+            if runtime.latest_event is None
+            else f"Ses {runtime.latest_event.start_seconds:.2f}–{runtime.latest_event.end_seconds:.2f} sn"
+        ),
+        elapsed=_human_duration(runtime.elapsed_seconds),
+        average_asr="Sentetik değer",
+        eta="Sentetik oynatma" if completed else "Tahmin hazırlanıyor",
+        failed_chunk=None,
+    )
+
+
+def _synthetic_latency(runtime: DashboardRuntime) -> LatencyViewModel:
+    tick = max(runtime.next_event_index, 1)
+    return LatencyViewModel(
+        chunk_duration_ms=38 + tick,
+        asr_ms=122 + tick * 3,
+        rule_ms=7 + tick,
+        coaching_ms=4 + tick,
+        total_ms=171 + tick * 5,
     )
 
 
@@ -486,6 +750,9 @@ def _apply_coaching_result(
             )
             for label in classification.labels
         )
+        for label in classification.labels:
+            if label.name not in runtime.detected_label_names:
+                runtime.detected_label_names.append(label.name)
         runtime.timeline.append(
             TimelineItem(
                 classification.created_at_utc,
@@ -496,8 +763,18 @@ def _apply_coaching_result(
     elif event.kind is not TranscriptKind.PARTIAL:
         runtime.latest_action = CoachingAction.NO_ACTION
         runtime.latest_labels = ()
-    for item in result.displayed_suggestions:
-        runtime.suggestions.append(suggestion_card(item))
+    classification_labels = (
+        [label.name for label in classification.labels] if classification else []
+    )
+    for index, item in enumerate(result.displayed_suggestions):
+        related_label = (
+            classification_labels[index]
+            if index < len(classification_labels)
+            else classification_labels[0]
+            if classification_labels
+            else None
+        )
+        runtime.suggestions.append(suggestion_card(item, related_label))
         runtime.timeline.append(
             TimelineItem(item.created_at_utc, "Öneri gösterildi", item.title)
         )
