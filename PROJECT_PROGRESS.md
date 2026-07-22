@@ -132,3 +132,16 @@ Tarih: 22 Temmuz 2026
 - Testler: focused 42 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Pipeline icin ayri bir kullanici arayuzu gereksinimini
   degerlendirmek.
+
+## 24. Local Streaming ASR CLI
+
+Tarih: 22 Temmuz 2026
+
+- Mevcut Faster-Whisper engine, in-memory window transcriber ve streaming
+  pipeline'i CPU/int8 ayarlariyla calistiran yerel dosya CLI'i eklendi.
+- Guvenli ayar ve ozet ciktisi, opsiyonel chunk snapshot'lari ve yalnizca acikca
+  istendiginde final transcript yazimi desteklenir.
+- Degisen dosyalar: `scripts/transcribe_streaming_file.py`,
+  `tests/test_transcribe_streaming_file.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 45 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Gercek yerel sesle kontrollu manuel dogrulama.
