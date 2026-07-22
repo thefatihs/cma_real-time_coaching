@@ -6,7 +6,7 @@ import pytest
 
 from app.events.models import AudioChunkEvent, TranscriptKind
 from app.streaming.audio_window import ASRAudioWindow
-from app.streaming.pipeline import StreamingASRPipeline
+from app.streaming.pipeline import StreamingASRPipeline, StreamingASRPlan
 from app.streaming.window_transcriber import (
     WindowTranscriptionResult,
     WindowTranscriptionSegment,
@@ -17,7 +17,9 @@ from app.tenancy.models import TenantASRConfig, TenantContext
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
 
 
-def chunk(sequence: int, start: float, duration: float) -> AudioChunkEvent:
+def chunk(
+    sequence: int, start: float, duration: float, sample_rate_hz: int = 10
+) -> AudioChunkEvent:
     return AudioChunkEvent(
         tenant_id="tenant_alpha",
         call_id="call_001",
@@ -25,10 +27,10 @@ def chunk(sequence: int, start: float, duration: float) -> AudioChunkEvent:
         received_at_utc=NOW,
         chunk_start_seconds=start,
         chunk_duration_seconds=duration,
-        sample_rate_hz=10,
+        sample_rate_hz=sample_rate_hz,
         channel_count=1,
         codec_name="pcm_s16le",
-        audio_bytes=bytes([sequence + 1, 0]) * round(duration * 10),
+        audio_bytes=bytes([sequence + 1, 0]) * round(duration * sample_rate_hz),
     )
 
 
@@ -111,7 +113,10 @@ def test_ordered_execution_one_transcription_per_chunk_and_short_final_chunk() -
     calls: list[object] = []
     fake = FakeTranscriber([[], [], []])
     result = pipeline(source, fake, calls).run(Path("synthetic.wav"), "call_001")
-    assert calls == [(Path("synthetic.wav"), "tenant_alpha", "call_001", 2.0)]
+    assert calls == [
+        (Path("synthetic.wav"), "tenant_alpha", "call_001", 2.0),
+        (Path("synthetic.wav"), "tenant_alpha", "call_001", 2.0),
+    ]
     assert [window.last_sequence for window in fake.windows] == [0, 1, 2]
     assert [step.sequence_number for step in result.steps] == [0, 1, 2]
     assert [step.window_duration_seconds for step in result.steps] == [2.0, 4.0, 4.5]
@@ -215,3 +220,32 @@ def test_binary_audio_is_absent_from_repr_and_steps_are_immutable() -> None:
     assert bytes([1, 0]) not in repr(result).encode()
     with pytest.raises(FrozenInstanceError):
         result.steps[0].raw_window_text = "changed"  # type: ignore[misc]
+
+
+def test_optional_step_callback_receives_each_safe_step() -> None:
+    source = [chunk(0, 0.0, 1.0), chunk(1, 1.0, 1.0)]
+    received: list[object] = []
+    result = pipeline(source, FakeTranscriber([[], []])).run(
+        Path("synthetic.wav"), "call_001", step_callback=received.append
+    )
+    assert received == list(result.steps)
+    assert "audio_bytes" not in repr(received)
+
+
+def test_plan_has_exact_total_and_short_final_chunk_before_inference() -> None:
+    source = [chunk(index, index * 2.0, 2.0, 100) for index in range(6)]
+    source.append(chunk(6, 12.0, 0.03, 100))
+    fake = FakeTranscriber([[] for _ in source])
+    observed: list[tuple[StreamingASRPlan, int]] = []
+    result = pipeline(source, fake).run(
+        Path("synthetic.wav"),
+        "call_001",
+        plan_callback=lambda plan: observed.append((plan, len(fake.windows))),
+    )
+    plan, inference_count_at_plan = observed[0]
+    assert inference_count_at_plan == 0
+    assert plan.total_chunks == result.total_chunks == 7
+    assert plan.audio_duration_seconds == result.audio_duration_seconds == 12.03
+    assert result.steps[-1].chunk_end_seconds - result.steps[
+        -1
+    ].chunk_start_seconds == (pytest.approx(0.03))

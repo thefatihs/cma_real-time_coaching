@@ -222,3 +222,25 @@ Tarih: 22 Temmuz 2026
 - Testler: focused 9 passed; full 248 passed (1 dependency warning).
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Prototipi sentetik kullanici geri bildirimiyle degerlendirmek.
+
+## 31. Yerel Dosya ve Guvenli Ses Yukleme Modu
+
+- Responsive durum ve mimari kartlari, Turkce aksiyon etiketleri ve baslangic yonlendirmesiyle dashboard yerlesimi iyilestirildi.
+- Acik Baslat kapisi ardinda mevcut streaming ASR pipeline ve coaching coordinator kullanan yerel dosya modu eklendi.
+- Kendi Sesimle Test bolumu yuklemeyi yalnizca gecici OS dosyasinda isler ve islem sonunda siler; ham ses veya transkript kalici tutulmaz.
+- Gercek ASR pencere gecikmeleri, toplam islem suresi, RTF, ilerleme ve istege bagli final transkript indirme gorunumleri eklendi.
+- Degisen dosyalar: `app/streaming/pipeline.py`, `live_dashboard/app.py`, `live_dashboard/uploaded_audio.py`, `live_dashboard/view_models.py`, `tests/test_live_dashboard_view_models.py`, `tests/test_streaming_pipeline.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 25 passed; full 255 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Yerel modun yalnizca sentetik bir ses dosyasiyla manuel kullanilabilirlik kontrolu.
+
+## 32. Yuklenen Ses Icin Kesin Ilerleme ve ETA
+
+- ASR baslamadan once gercek son kisa parcayi da iceren toplam parca sayisi ve ses suresi belirlenir.
+- Parca yuzdesi, zaman araligi, duvar saati, rolling ASR ortalamasi, guvenli ETA, asama ve hata durumu gorunumleri eklendi.
+- Tamamlanma ozeti toplam/tamamlanan parca, ses ve islem suresi, ortalama ASR ve RTF degerlerini gosterir.
+- Kullaniciya gorunen tenant adlari, ic ID'ler korunarak Demo Telekom ve Demo Yazilim olarak degistirildi.
+- Degisen dosyalar: `app/streaming/pipeline.py`, `live_dashboard/app.py`, `live_dashboard/demo_data.py`, `live_dashboard/view_models.py`, `tests/test_live_dashboard_view_models.py`, `tests/test_streaming_pipeline.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 30 passed; full 260 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Ilerleme gorunumunu sentetik kisa bir ses dosyasiyla manuel dogrulamak.

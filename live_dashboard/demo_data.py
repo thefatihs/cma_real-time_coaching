@@ -260,7 +260,7 @@ def tenant_demos() -> dict[str, TenantDemo]:
         alpha: TenantDemo(
             _config(
                 alpha,
-                "Sentetik Alfa",
+                "Demo Telekom",
                 ["urun_bilgisi", "fiyat_itirazi", "iptal_riski", "kritik_eskalasyon"],
             ),
             alpha_rules,
@@ -269,7 +269,7 @@ def tenant_demos() -> dict[str, TenantDemo]:
         beta: TenantDemo(
             _config(
                 beta,
-                "Sentetik Beta",
+                "Demo Yazılım",
                 [
                     "paket_sorusu",
                     "butce_endisesi",

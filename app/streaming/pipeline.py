@@ -44,11 +44,21 @@ class StreamingASRResult:
     audio_duration_seconds: float
 
 
+@dataclass(frozen=True, slots=True)
+class StreamingASRPlan:
+    tenant_id: str
+    call_id: str
+    total_chunks: int
+    audio_duration_seconds: float
+
+
 class WindowTranscriberProtocol(Protocol):
     def transcribe(self, window: ASRAudioWindow) -> WindowTranscriptionResult: ...
 
 
 ChunkGenerator = Callable[[Path, str, str, float], Iterable[AudioChunkEvent]]
+StepCallback = Callable[[StreamingASRStep], None]
+PlanCallback = Callable[[StreamingASRPlan], None]
 
 
 class StreamingASRPipeline:
@@ -65,7 +75,14 @@ class StreamingASRPipeline:
         self._window_transcriber = window_transcriber
         self._chunk_generator = chunk_generator
 
-    def run(self, audio_path: Path, call_id: str) -> StreamingASRResult:
+    def run(
+        self,
+        audio_path: Path,
+        call_id: str,
+        *,
+        step_callback: StepCallback | None = None,
+        plan_callback: PlanCallback | None = None,
+    ) -> StreamingASRResult:
         call_state = CallState(
             tenant_id=self._tenant_context.tenant_id,
             call_id=call_id,
@@ -78,6 +95,30 @@ class StreamingASRPipeline:
         steps: list[StreamingASRStep] = []
         audio_duration_seconds = 0.0
 
+        planning_chunks = self._chunk_generator(
+            audio_path,
+            self._tenant_context.tenant_id,
+            call_id,
+            self._asr_config.chunk_duration_seconds,
+        )
+        total_chunks = 0
+        for chunk in planning_chunks:
+            total_chunks += 1
+            audio_duration_seconds = max(
+                audio_duration_seconds,
+                chunk.chunk_start_seconds + chunk.chunk_duration_seconds,
+            )
+        if total_chunks == 0:
+            raise ValueError("Audio file generated no audio chunks")
+        if plan_callback is not None:
+            plan_callback(
+                StreamingASRPlan(
+                    tenant_id=self._tenant_context.tenant_id,
+                    call_id=call_id,
+                    total_chunks=total_chunks,
+                    audio_duration_seconds=audio_duration_seconds,
+                )
+            )
         chunks = self._chunk_generator(
             audio_path,
             self._tenant_context.tenant_id,
@@ -96,26 +137,24 @@ class StreamingASRPipeline:
 
             chunk_end_seconds = chunk.chunk_start_seconds + chunk.chunk_duration_seconds
             audio_duration_seconds = max(audio_duration_seconds, chunk_end_seconds)
-            steps.append(
-                StreamingASRStep(
-                    tenant_id=chunk.tenant_id,
-                    call_id=chunk.call_id,
-                    sequence_number=chunk.sequence_number,
-                    chunk_start_seconds=chunk.chunk_start_seconds,
-                    chunk_end_seconds=chunk_end_seconds,
-                    window_start_seconds=window.start_seconds,
-                    window_end_seconds=window.end_seconds,
-                    window_duration_seconds=window.duration_seconds,
-                    raw_window_text=transcription.text,
-                    transcript_events=transcript_events,
-                    stable_transcript=reconciler.stable_transcript,
-                    partial_transcript=reconciler.partial_transcript,
-                    transcription_time_seconds=(transcription.processing_time_seconds),
-                )
+            step = StreamingASRStep(
+                tenant_id=chunk.tenant_id,
+                call_id=chunk.call_id,
+                sequence_number=chunk.sequence_number,
+                chunk_start_seconds=chunk.chunk_start_seconds,
+                chunk_end_seconds=chunk_end_seconds,
+                window_start_seconds=window.start_seconds,
+                window_end_seconds=window.end_seconds,
+                window_duration_seconds=window.duration_seconds,
+                raw_window_text=transcription.text,
+                transcript_events=transcript_events,
+                stable_transcript=reconciler.stable_transcript,
+                partial_transcript=reconciler.partial_transcript,
+                transcription_time_seconds=(transcription.processing_time_seconds),
             )
-
-        if not steps:
-            raise ValueError("Audio file generated no audio chunks")
+            steps.append(step)
+            if step_callback is not None:
+                step_callback(step)
 
         final_event = reconciler.finalize()
         if final_event is not None:
