@@ -89,3 +89,18 @@ Tarih: 22 Temmuz 2026
   `tests/test_audio_window.py`, `PROJECT_PROGRESS.md`.
 - Testler: focused ve full kalite kontrolleri tamamlandi.
 - Sonraki planli adim: PCM penceresini gelecekteki ASR inference katmanina baglamak.
+
+## 21. In-Memory ASR Window Transcription Adapter
+
+Tarih: 22 Temmuz 2026
+
+- `pcm_s16le` ASR pencerelerini gecici dosya olusturmadan Faster-Whisper'in
+  mevcut model yasam dongusuyle transcribe eden injectable adapter eklendi.
+- Tenant/call kimlikleri, pencere metadata'si ve clamp edilmis mutlak segment
+  zamanlari immutable ve ham ses icermeyen sonuclarda korunur.
+- Degisen dosyalar: `app/asr/faster_whisper_engine.py`,
+  `app/streaming/window_transcriber.py`, `tests/test_window_transcriber.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused 23 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Adapter'i gelecekteki rolling streaming orchestration
+  katmanina baglamak.

@@ -1,7 +1,9 @@
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 from faster_whisper import WhisperModel
+from numpy.typing import NDArray
 
 from app.asr.models import TranscriptionResult, TranscriptionSegment
 
@@ -48,9 +50,16 @@ class FasterWhisperEngine:
     def transcribe_file(self, audio_path: Path) -> TranscriptionResult:
         self._validate_audio_path(audio_path)
 
+        return self._transcribe(str(audio_path))
+
+    def transcribe_audio(self, audio: NDArray[Any]) -> TranscriptionResult:
+        """Transcribe an in-memory mono waveform without persisting audio."""
+        return self._transcribe(audio)
+
+    def _transcribe(self, audio: str | NDArray[Any]) -> TranscriptionResult:
         started_at = perf_counter()
         raw_segments, info = self._get_model().transcribe(
-            str(audio_path),
+            audio,
             vad_filter=self.vad_filter,
             condition_on_previous_text=self.condition_on_previous_text,
             initial_prompt=self.initial_prompt,
