@@ -37,10 +37,15 @@ class AudioChunkEvent(BaseModel):
     codec_name: str
     audio_bytes: bytes = Field(repr=False)
 
-    @field_validator("tenant_id", "call_id", "codec_name")
+    @field_validator("tenant_id", "call_id")
     @classmethod
     def validate_identifiers(cls, value: str, info: object) -> str:
         return _required_text(value, getattr(info, "field_name", "value"))
+
+    @field_validator("codec_name")
+    @classmethod
+    def normalize_codec_name(cls, value: str) -> str:
+        return canonical_audio_codec_name(value)
 
     @field_validator("sequence_number", "chunk_start_seconds")
     @classmethod
@@ -269,6 +274,14 @@ def _required_text(value: str, field_name: str) -> str:
     cleaned = value.strip()
     if not cleaned:
         raise ValueError(f"{field_name} cannot be empty")
+    return cleaned
+
+
+def canonical_audio_codec_name(value: str) -> str:
+    """Normalize the two accepted names for little-endian signed 16-bit PCM."""
+    cleaned = _required_text(value, "codec_name")
+    if cleaned in {"pcm_s16", "pcm_s16le"}:
+        return "pcm_s16le"
     return cleaned
 
 
