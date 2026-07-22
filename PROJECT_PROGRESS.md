@@ -29,3 +29,50 @@ Audio Chunk
 → Gerekiyorsa RAG
 → Gerekiyorsa LLM
 → Live Coaching Dashboard
+## 18. Tenant-Safe Rolling Audio Buffer
+
+Tarih: 22 Temmuz 2026
+
+Amaç:
+
+Canlı sistemde gelen sıralı ses parçalarının yalnızca son belirli zaman
+aralığını bellek içinde güvenli şekilde tutmak.
+
+Eklenenler:
+
+- Varsayılan 20 saniyelik rolling audio buffer oluşturuldu.
+- İlk chunk ile tenant, call ve ses formatı buffer'a bağlanır.
+- Sonraki chunk'ların aynı tenant ve çağrıya ait olması zorunludur.
+- Sample rate, kanal sayısı ve codec değişiklikleri reddedilir.
+- Sequence numaralarının kesintisiz ve artan olması zorunludur.
+- Tekrarlanan, geriye giden veya eksik sequence numaraları reddedilir.
+- Üst üste binen veya geriye giden chunk zamanları reddedilir.
+- Rolling window dışında tamamen kalan eski chunk'lar otomatik çıkarılır.
+- Son kısa chunk desteklenir.
+- Buffer içeriği değiştirilemeyen tuple olarak alınır.
+- clear() sonrasında buffer başka tenant ve çağrı için yeniden kullanılabilir.
+- Ham audio byte'ları yazdırılmaz veya loglanmaz.
+
+Değişen dosyalar:
+
+```text
+app/streaming/rolling_buffer.py
+tests/test_rolling_buffer.py
+```
+
+## 19. Safe File-Based Audio Streaming Simulator
+
+Tarih: 22 Temmuz 2026
+
+- Yerel ses dosyalarini sirali, tenant ve call bilgilerini koruyan chunk event'leri
+  olarak rolling buffer'a aktaran guvenli simulator eklendi.
+- Hizli mod beklemeden calisir; gercek zamanli mod injectable sleep ile her
+  chunk'in gercek suresini bekler.
+- Ham ses verisi icermeyen immutable StreamStep ve JSON-lines CLI eklendi.
+- Degisen dosyalar: `app/streaming/simulator.py`,
+  `scripts/simulate_audio_stream.py`, `tests/test_streaming_simulator.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused 36 passed; full 129 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Simulator ciktisini gelecekteki streaming ASR katmanina
+  baglamak.
