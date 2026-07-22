@@ -112,6 +112,10 @@ class RuleBasedCoachingEngine:
         self._event_id_factory = event_id_factory or (lambda: str(uuid4()))
         self._utc_datetime_factory = utc_datetime_factory or (lambda: datetime.now(UTC))
 
+    @property
+    def tenant_id(self) -> str:
+        return self._tenant_config.context.tenant_id
+
     def evaluate(self, event: TranscriptEvent) -> RuleEvaluationResult:
         ensure_same_tenant(self._tenant_config.context, event)
         if event.kind is TranscriptKind.PARTIAL:

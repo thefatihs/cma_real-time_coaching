@@ -198,3 +198,17 @@ Tarih: 22 Temmuz 2026
   `tests/test_rule_engine.py`, `PROJECT_PROGRESS.md`.
 - Testler: focused 48 passed; focused Ruff ve Pyright basarili.
 - Sonraki planli adim: Coaching engine'i transcript event akisi ile baglamak.
+
+## 29. In-Memory Coaching Coordinator
+
+Tarih: 22 Temmuz 2026
+
+- Rule-based coaching sonucunu CallState ile baglayan tenant/call-aware coordinator
+  eklendi.
+- Suggestion content fingerprint deduplication, cooldown ve processing basina
+  maksimum suggestion siniri uygulanirken classification sonuclari korunur.
+- Degisen dosyalar: `app/coaching/rule_engine.py`,
+  `app/coaching/coordinator.py`, `tests/test_coaching_coordinator.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused 45 passed; focused Ruff ve Pyright basarili.
+- Sonraki planli adim: Coordinator'i streaming transcript event akisi ile baglamak.
