@@ -339,3 +339,24 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Egitilmis v2 artifact ile yalnizca validation
   kalibrasyonunu ayrica onaylanan bir calismada calistirmak.
+
+## 38. Versioned Calibrated Threshold Profili
+
+- `common_turkish_setfit_v2` icin schema v1, validation kaynakli ve calibration
+  report checksum'larini tasiyan guvenli threshold profili eklendi.
+- Profil taxonomy label'larini birebir, threshold araligini, model ID ve
+  model/dataset/taxonomy checksum uyumlulugunu dogrular; stale profiller reddedilir.
+- Evaluation CLI'e opsiyonel `--threshold-profile` eklendi; verilmezse mevcut
+  taxonomy default threshold davranisi aynen korunur.
+- Evaluation raporuna metin veya tekil tahmin eklemeden `threshold_source` ve
+  `threshold_profile_id` provenance alanlari eklendi.
+- `no_action` dislayicilik davranisi degistirilmedi; model inference, validation
+  veya test evaluation calistirilmadi.
+- Degisen dosyalar: `app/classification/threshold_profiles.py`,
+  `app/classification/artifacts.py`, `scripts/evaluate_setfit_model.py`,
+  `config/classification_thresholds/common_turkish_setfit_v2.json`, ilgili
+  classification testleri ve `PROJECT_PROGRESS.md`.
+- Testler: focused 25 passed; full 318 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Profil destekli evaluation'i ayrica onaylanan bir
+  validation veya test calismasinda kullanmak.

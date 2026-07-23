@@ -109,6 +109,8 @@ def save_evaluation_report(
     split: str,
     thresholds: dict[str, float],
     metrics: EvaluationMetrics,
+    threshold_source: str = "taxonomy_defaults",
+    threshold_profile_id: str | None = None,
 ) -> None:
     if split not in {"validation", "test"}:
         raise ValueError("evaluation split must be validation or test")
@@ -120,6 +122,8 @@ def save_evaluation_report(
         "dataset_checksum": metadata.dataset_checksum,
         "split": split,
         "thresholds": thresholds,
+        "threshold_source": threshold_source,
+        "threshold_profile_id": threshold_profile_id,
         "metrics": metrics.as_dict(),
     }
     _write_json(Path(path), report)

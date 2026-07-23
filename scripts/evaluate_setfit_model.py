@@ -13,17 +13,19 @@ from app.classification.artifacts import (  # noqa: E402
     save_evaluation_report,
     sha256_file,
 )
+from app.classification.calibration import sha256_directory  # noqa: E402
 from app.classification.dataset import (  # noqa: E402
     load_classification_dataset,
     load_classification_taxonomy,
 )
-from app.classification.encoding import (  # noqa: E402
-    MultiLabelEncoder,
-    taxonomy_thresholds,
-)
+from app.classification.encoding import MultiLabelEncoder  # noqa: E402
 from app.classification.evaluation import evaluate_model  # noqa: E402
 from app.classification.models import DatasetSplit  # noqa: E402
 from app.classification.training import examples_for_split  # noqa: E402
+from app.classification.threshold_profiles import (  # noqa: E402
+    load_threshold_profile,
+    resolve_evaluation_thresholds,
+)
 
 
 def main() -> int:
@@ -33,6 +35,7 @@ def main() -> int:
     parser.add_argument("--taxonomy", type=Path, required=True)
     parser.add_argument("--split", choices=("validation", "test"), required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--threshold-profile", type=Path)
     arguments = parser.parse_args()
 
     from setfit import SetFitModel
@@ -47,6 +50,17 @@ def main() -> int:
     encoder = MultiLabelEncoder.from_taxonomy(taxonomy)
     if encoder.label_order != metadata.label_order:
         raise ValueError("model label order does not match taxonomy")
+    profile = None
+    if arguments.threshold_profile is not None:
+        profile = load_threshold_profile(
+            arguments.threshold_profile,
+            taxonomy=taxonomy,
+            metadata=metadata,
+            dataset_checksum=sha256_file(arguments.dataset),
+            taxonomy_checksum=sha256_file(arguments.taxonomy),
+            model_checksum=sha256_directory(arguments.model_dir),
+        )
+    threshold_resolution = resolve_evaluation_thresholds(taxonomy, profile)
     split = DatasetSplit(arguments.split)
     examples = examples_for_split(dataset, split)
     model = SetFitModel.from_pretrained(arguments.model_dir, device="cpu")
@@ -54,14 +68,16 @@ def main() -> int:
         model,
         examples,
         encoder,
-        taxonomy_thresholds(taxonomy),
+        threshold_resolution.thresholds,
     )
     save_evaluation_report(
         arguments.report,
         metadata=metadata,
         split=arguments.split,
-        thresholds=taxonomy_thresholds(taxonomy),
+        thresholds=dict(threshold_resolution.thresholds),
         metrics=metrics,
+        threshold_source=threshold_resolution.threshold_source,
+        threshold_profile_id=threshold_resolution.threshold_profile_id,
     )
     print(f"evaluation split: {arguments.split}")
     print(f"evaluated examples: {metrics.example_count}")

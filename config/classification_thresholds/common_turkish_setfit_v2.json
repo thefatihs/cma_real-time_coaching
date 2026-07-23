@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "model_id": "common_turkish_setfit_v2",
+  "source_split": "validation",
+  "calibrated_thresholds": {
+    "product_information": 0.90,
+    "price_objection": 0.35,
+    "cancellation_request": 0.70,
+    "technical_issue": 0.75,
+    "complaint": 0.45,
+    "renewal_interest": 0.65,
+    "churn_risk": 0.35,
+    "no_action": 0.30
+  },
+  "model_checksum": "78b82e686046308cb428c77a852761b66ef6474751af1df301e367f9357758bb",
+  "dataset_checksum": "f045635e83bb3d724fc9a6d2969d1600736bdd3342095e6a4eae2c470375db35",
+  "taxonomy_checksum": "2afc2d711215a287696ac7c1fe90140256e5483f49109c00a0d8e2925088794a",
+  "critical_recall_target": 0.70
+}

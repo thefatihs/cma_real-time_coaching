@@ -75,6 +75,8 @@ def test_evaluation_report_contains_no_transcript_text(tmp_path: Path) -> None:
         "dataset_checksum",
         "split",
         "thresholds",
+        "threshold_source",
+        "threshold_profile_id",
         "metrics",
     }
 
