@@ -16,3 +16,5 @@ samples/*
 # Generated benchmark results
 benchmark_results/*
 !benchmark_results/.gitkeep
+
+/local_artifacts/
