@@ -382,3 +382,25 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Adapter'i ayri bir gorevde canli akisa baglamadan once
   sentetik contract-level kullanimla dogrulamak.
+
+## 40. Stable Transcript Runtime Classification Entegrasyonu
+
+- Opsiyonel classification stage, yalnizca cumulative stable transcript gercekten
+  degistiginde runtime classifier'i cagiracak sekilde ASR pipeline'a eklendi.
+- PARTIAL, bos, degismeyen ve duplicate revision event'leri siniflandirilmaz;
+  yeni STABLE ve finalize edilen stable metinler tenant/call kapsamiyla islenir.
+- Basarili sonuc mevcut `ClassificationResultEvent` olarak doner ve CallState'te
+  yalnizca aktif label, model/profile ID, revision/sequence ve inference suresi
+  tutulur; probability, threshold veya transcript kopyasi classification
+  metadata'sina yazilmaz.
+- Classification hatalari guvenli type/code outcome ve metinsiz log uretir,
+  ASR akisini durdurmaz; classifier verilmezse mevcut ASR-only davranis korunur.
+- Degisen dosyalar: `app/classification/streaming.py`,
+  `app/classification/__init__.py`, `app/calls/models.py`,
+  `app/streaming/pipeline.py`, `tests/test_streaming_pipeline.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused 45 passed; full 332 passed (1 dependency warning);
+  classifier tamamen mock'ludur.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Classification outcome'larini ayri bir gorevde coaching
+  karar katmanina guvenli contract ile baglamak.

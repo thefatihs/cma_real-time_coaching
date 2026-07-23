@@ -1,6 +1,11 @@
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.events.models import AudioChunkEvent, TranscriptEvent, TranscriptKind
+from app.events.models import (
+    AudioChunkEvent,
+    ClassificationResultEvent,
+    TranscriptEvent,
+    TranscriptKind,
+)
 from app.events.validation import ensure_same_call, ensure_same_tenant
 
 
@@ -16,6 +21,11 @@ class CallState(BaseModel):
     shown_suggestion_ids: list[str] = Field(default_factory=list)
     last_coaching_trigger_seconds: float | None = None
     transcript_revision: int = 0
+    classification_model_id: str | None = None
+    classification_threshold_profile_id: str | None = None
+    classification_transcript_revision: int | None = None
+    classification_source_sequence: int | None = None
+    classification_inference_time_ms: float | None = None
 
     @field_validator("tenant_id", "call_id")
     @classmethod
@@ -40,6 +50,34 @@ class CallState(BaseModel):
         if value < 0:
             raise ValueError("transcript_revision cannot be negative")
         return value
+
+    @field_validator(
+        "classification_transcript_revision", "classification_source_sequence"
+    )
+    @classmethod
+    def validate_optional_sequence(cls, value: int | None, info: object) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError(
+                f"{getattr(info, 'field_name', 'sequence')} cannot be negative"
+            )
+        return value
+
+    @field_validator("classification_inference_time_ms")
+    @classmethod
+    def validate_classification_time(cls, value: float | None) -> float | None:
+        if value is not None and value < 0:
+            raise ValueError("classification_inference_time_ms cannot be negative")
+        return value
+
+    @field_validator("classification_model_id", "classification_threshold_profile_id")
+    @classmethod
+    def validate_optional_text(cls, value: str | None, info: object) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError(f"{getattr(info, 'field_name', 'value')} cannot be empty")
+        return cleaned
 
     @field_validator("active_labels", "shown_suggestion_ids")
     @classmethod
@@ -70,6 +108,40 @@ class CallState(BaseModel):
 
     def update_active_labels(self, labels: list[str]) -> None:
         self.active_labels = _clean_unique(labels)
+
+    def mark_classification_attempt(
+        self, transcript_revision: int, source_sequence: int | None
+    ) -> None:
+        if transcript_revision < 0:
+            raise ValueError("transcript_revision cannot be negative")
+        if source_sequence is not None and source_sequence < 0:
+            raise ValueError("source_sequence cannot be negative")
+        self.classification_transcript_revision = transcript_revision
+        self.classification_source_sequence = source_sequence
+
+    def apply_classification(
+        self,
+        event: ClassificationResultEvent,
+        *,
+        transcript_revision: int,
+        source_sequence: int | None,
+    ) -> None:
+        self._ensure_same_scope(event)
+        self.mark_classification_attempt(transcript_revision, source_sequence)
+        self.update_active_labels([label.name for label in event.labels])
+        self.classification_model_id = event.model_id
+        self.classification_threshold_profile_id = event.threshold_profile_id
+        self.classification_inference_time_ms = event.processing_time_ms
+
+    def classification_metadata(self) -> "CallClassificationMetadata":
+        return CallClassificationMetadata(
+            active_labels=tuple(self.active_labels),
+            model_id=self.classification_model_id,
+            threshold_profile_id=self.classification_threshold_profile_id,
+            transcript_revision=self.classification_transcript_revision,
+            source_sequence=self.classification_source_sequence,
+            inference_time_ms=self.classification_inference_time_ms,
+        )
 
     def mark_suggestion_shown(self, suggestion_id: str) -> None:
         cleaned = suggestion_id.strip()
@@ -116,3 +188,14 @@ def _clean_unique(values: list[str]) -> list[str]:
             seen.add(item)
             cleaned.append(item)
     return cleaned
+
+
+class CallClassificationMetadata(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    active_labels: tuple[str, ...] = ()
+    model_id: str | None = None
+    threshold_profile_id: str | None = None
+    transcript_revision: int | None = None
+    source_sequence: int | None = None
+    inference_time_ms: float | None = None

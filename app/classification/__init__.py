@@ -19,17 +19,27 @@ from app.classification.runtime import (
     RuntimeClassifierConfig,
     RuntimeSetFitClassifier,
 )
+from app.classification.streaming import (
+    ClassificationProcessingStatus,
+    SafeClassificationError,
+    StableClassificationOutcome,
+    StableTranscriptClassificationStage,
+)
 
 __all__ = [
     "ClassificationDataset",
     "ClassificationExample",
     "ClassificationLabelDefinition",
     "ClassificationTaxonomy",
+    "ClassificationProcessingStatus",
     "DatasetSplit",
     "MultiLabelEncoder",
     "RuntimeArtifactPaths",
     "RuntimeClassifierConfig",
     "RuntimeSetFitClassifier",
+    "SafeClassificationError",
+    "StableClassificationOutcome",
+    "StableTranscriptClassificationStage",
     "load_classification_dataset",
     "load_classification_taxonomy",
     "normalize_example_text",

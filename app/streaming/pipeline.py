@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from app.calls.models import CallState
+from app.calls.models import CallClassificationMetadata, CallState
+from app.classification.streaming import (
+    RuntimeClassifierProtocol,
+    StableClassificationOutcome,
+    StableTranscriptClassificationStage,
+)
 from app.events.models import AudioChunkEvent, TranscriptEvent
 from app.streaming.audio_window import ASRAudioWindow, AudioWindowBuilder
 from app.streaming.chunk_generator import generate_audio_chunks
@@ -30,6 +35,7 @@ class StreamingASRStep:
     stable_transcript: str
     partial_transcript: str
     transcription_time_seconds: float
+    classification_outcomes: tuple[StableClassificationOutcome, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +48,8 @@ class StreamingASRResult:
     partial_transcript: str
     total_chunks: int
     audio_duration_seconds: float
+    classification_outcomes: tuple[StableClassificationOutcome, ...] = ()
+    classification_metadata: CallClassificationMetadata = CallClassificationMetadata()
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,11 +77,15 @@ class StreamingASRPipeline:
         window_transcriber: WindowTranscriberProtocol,
         *,
         chunk_generator: ChunkGenerator = generate_audio_chunks,
+        runtime_classifier: RuntimeClassifierProtocol | None = None,
     ) -> None:
         self._tenant_context = tenant_context
         self._asr_config = asr_config
         self._window_transcriber = window_transcriber
         self._chunk_generator = chunk_generator
+        self._classification_stage = StableTranscriptClassificationStage(
+            runtime_classifier
+        )
 
     def run(
         self,
@@ -93,6 +105,7 @@ class StreamingASRPipeline:
             stable_region_seconds=self._asr_config.stable_region_seconds
         )
         steps: list[StreamingASRStep] = []
+        all_classification_outcomes: list[StableClassificationOutcome] = []
         audio_duration_seconds = 0.0
 
         planning_chunks = self._chunk_generator(
@@ -132,8 +145,18 @@ class StreamingASRPipeline:
             transcription = self._window_transcriber.transcribe(window)
             self._validate_transcription_scope(transcription, call_id)
             transcript_events = reconciler.ingest(transcription)
+            step_classification_outcomes: list[StableClassificationOutcome] = []
             for event in transcript_events:
+                previous_stable = call_state.stable_transcript
                 call_state.apply_transcript(event)
+                outcome = self._classification_stage.process(
+                    event,
+                    cumulative_stable_transcript=call_state.stable_transcript,
+                    stable_changed=(call_state.stable_transcript != previous_stable),
+                    call_state=call_state,
+                )
+                step_classification_outcomes.append(outcome)
+                all_classification_outcomes.append(outcome)
 
             chunk_end_seconds = chunk.chunk_start_seconds + chunk.chunk_duration_seconds
             audio_duration_seconds = max(audio_duration_seconds, chunk_end_seconds)
@@ -148,6 +171,7 @@ class StreamingASRPipeline:
                 window_duration_seconds=window.duration_seconds,
                 raw_window_text=transcription.text,
                 transcript_events=transcript_events,
+                classification_outcomes=tuple(step_classification_outcomes),
                 stable_transcript=reconciler.stable_transcript,
                 partial_transcript=reconciler.partial_transcript,
                 transcription_time_seconds=(transcription.processing_time_seconds),
@@ -158,13 +182,24 @@ class StreamingASRPipeline:
 
         final_event = reconciler.finalize()
         if final_event is not None:
+            previous_stable = call_state.stable_transcript
             call_state.apply_transcript(final_event)
+            all_classification_outcomes.append(
+                self._classification_stage.process(
+                    final_event,
+                    cumulative_stable_transcript=call_state.stable_transcript,
+                    stable_changed=(call_state.stable_transcript != previous_stable),
+                    call_state=call_state,
+                )
+            )
 
         return StreamingASRResult(
             tenant_id=call_state.tenant_id,
             call_id=call_state.call_id,
             steps=tuple(steps),
             final_event=final_event,
+            classification_outcomes=tuple(all_classification_outcomes),
+            classification_metadata=call_state.classification_metadata(),
             stable_transcript=reconciler.stable_transcript,
             partial_transcript=reconciler.partial_transcript,
             total_chunks=len(steps),

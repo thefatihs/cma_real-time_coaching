@@ -4,7 +4,20 @@ from pathlib import Path
 
 import pytest
 
-from app.events.models import AudioChunkEvent, TranscriptKind
+from app.classification.streaming import (
+    ClassificationProcessingStatus,
+    RuntimeClassifierProtocol,
+    StableTranscriptClassificationStage,
+)
+from app.calls.models import CallState
+from app.events.models import (
+    AudioChunkEvent,
+    ClassificationLabel,
+    ClassificationResultEvent,
+    CoachingAction,
+    TranscriptEvent,
+    TranscriptKind,
+)
 from app.streaming.audio_window import ASRAudioWindow
 from app.streaming.pipeline import StreamingASRPipeline, StreamingASRPlan
 from app.streaming.window_transcriber import (
@@ -99,13 +112,57 @@ def pipeline(
     source: list[AudioChunkEvent],
     transcriber: FakeTranscriber,
     calls: list[object] | None = None,
+    runtime_classifier: RuntimeClassifierProtocol | None = None,
 ) -> StreamingASRPipeline:
     return StreamingASRPipeline(
         context(),
         config(),
         transcriber,
         chunk_generator=generator_for(source, calls),
+        runtime_classifier=runtime_classifier,
     )
+
+
+class FakeRuntimeClassifier:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[dict[str, object]] = []
+
+    def classify(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        text: str,
+        transcript_event_id: str | None = None,
+        revision: int | None = None,
+        sequence_number: int | None = None,
+    ) -> ClassificationResultEvent:
+        self.calls.append(
+            {
+                "tenant_id": tenant_id,
+                "call_id": call_id,
+                "text": text,
+                "transcript_event_id": transcript_event_id,
+                "revision": revision,
+                "sequence_number": sequence_number,
+            }
+        )
+        if self.fail:
+            raise RuntimeError("synthetic classifier failure")
+        return ClassificationResultEvent(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            transcript_event_id=transcript_event_id or "runtime",
+            labels=[ClassificationLabel(name="complaint", score=0.8)],
+            action=CoachingAction.TEMPLATE_ACTION,
+            model_id="common_turkish_setfit_v2",
+            threshold_profile_id="common_turkish_setfit_v2:calibrated:v1",
+            probabilities={"complaint": 0.8},
+            thresholds={"complaint": 0.45},
+            processing_time_ms=4.0,
+            created_at_utc=NOW,
+        )
 
 
 def test_ordered_execution_one_transcription_per_chunk_and_short_final_chunk() -> None:
@@ -249,3 +306,154 @@ def test_plan_has_exact_total_and_short_final_chunk_before_inference() -> None:
     assert result.steps[-1].chunk_end_seconds - result.steps[
         -1
     ].chunk_start_seconds == (pytest.approx(0.03))
+
+
+def test_only_stable_changes_are_classified_with_cumulative_context() -> None:
+    source = [chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0), chunk(2, 4.0, 2.0)]
+    transcriber = FakeTranscriber(
+        [
+            [("first", 0.0, 1.0), ("draft", 1.5, 2.0)],
+            [
+                ("first", 0.0, 1.0),
+                ("second", 1.0, 2.0),
+                ("new draft", 3.0, 4.0),
+            ],
+            [("first second", 0.0, 2.0), ("ending", 5.0, 6.0)],
+        ]
+    )
+    classifier = FakeRuntimeClassifier()
+    result = pipeline(source, transcriber, runtime_classifier=classifier).run(
+        Path("synthetic.wav"), "call_001"
+    )
+    assert [call["text"] for call in classifier.calls] == [
+        "first second",
+        "first second ending",
+    ]
+    assert all(
+        (call["tenant_id"], call["call_id"]) == ("tenant_alpha", "call_001")
+        for call in classifier.calls
+    )
+    partial_outcomes = [
+        outcome
+        for outcome in result.classification_outcomes
+        if outcome.status is ClassificationProcessingStatus.PARTIAL_SKIPPED
+    ]
+    assert partial_outcomes
+    assert result.classification_metadata.active_labels == ("complaint",)
+    assert result.classification_metadata.model_id == "common_turkish_setfit_v2"
+    assert result.classification_metadata.inference_time_ms == 4.0
+    assert not hasattr(result.classification_metadata, "probabilities")
+
+
+def test_classification_failure_does_not_stop_streaming_or_log_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "PRIVATE_SYNTHETIC_TRANSCRIPT"
+    caplog.set_level("ERROR")
+    classifier = FakeRuntimeClassifier(fail=True)
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(secret, 0.0, 1.0)]]),
+        runtime_classifier=classifier,
+    ).run(Path("synthetic.wav"), "call_001")
+    assert result.final_event is not None
+    assert result.classification_outcomes[-1].status is (
+        ClassificationProcessingStatus.FAILED
+    )
+    assert result.classification_outcomes[-1].error is not None
+    assert result.classification_outcomes[-1].error.error_type == "RuntimeError"
+    assert secret not in caplog.text
+    assert result.classification_metadata.active_labels == ()
+
+
+def test_classifier_disabled_preserves_asr_only_behavior() -> None:
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("final words", 0.0, 1.0)]]),
+    ).run(Path("synthetic.wav"), "call_001")
+    assert result.stable_transcript == "final words"
+    assert result.classification_outcomes[-1].status is (
+        ClassificationProcessingStatus.DISABLED
+    )
+    assert result.classification_metadata.active_labels == ()
+    assert result.classification_metadata.model_id is None
+
+
+def test_duplicate_revision_skipped_and_newer_revision_classified() -> None:
+    classifier = FakeRuntimeClassifier()
+    stage = StableTranscriptClassificationStage(classifier)
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    first = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        event_id="stable-1",
+        kind=TranscriptKind.STABLE,
+        text="first stable",
+        start_seconds=0.0,
+        end_seconds=1.0,
+        revision=1,
+        created_at_utc=NOW,
+        source_chunk_sequence=1,
+    )
+    state.apply_transcript(first)
+    first_outcome = stage.process(
+        first,
+        cumulative_stable_transcript=state.stable_transcript,
+        stable_changed=True,
+        call_state=state,
+    )
+    duplicate_outcome = stage.process(
+        first,
+        cumulative_stable_transcript=state.stable_transcript,
+        stable_changed=True,
+        call_state=state,
+    )
+    second = first.model_copy(
+        update={
+            "event_id": "stable-2",
+            "text": "second stable",
+            "revision": 2,
+            "source_chunk_sequence": 2,
+        }
+    )
+    state.apply_transcript(second)
+    second_outcome = stage.process(
+        second,
+        cumulative_stable_transcript=state.stable_transcript,
+        stable_changed=True,
+        call_state=state,
+    )
+    assert first_outcome.status is ClassificationProcessingStatus.CLASSIFIED
+    assert duplicate_outcome.status is (
+        ClassificationProcessingStatus.DUPLICATE_REVISION_SKIPPED
+    )
+    assert second_outcome.status is ClassificationProcessingStatus.CLASSIFIED
+    assert [call["text"] for call in classifier.calls] == [
+        "first stable",
+        "first stable second stable",
+    ]
+
+
+def test_empty_cumulative_stable_transcript_is_skipped() -> None:
+    classifier = FakeRuntimeClassifier()
+    stage = StableTranscriptClassificationStage(classifier)
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    event = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        event_id="stable-empty",
+        kind=TranscriptKind.STABLE,
+        text="synthetic",
+        start_seconds=0.0,
+        end_seconds=1.0,
+        revision=1,
+        created_at_utc=NOW,
+    )
+    outcome = stage.process(
+        event,
+        cumulative_stable_transcript=" \t ",
+        stable_changed=True,
+        call_state=state,
+    )
+    assert outcome.status is ClassificationProcessingStatus.EMPTY_SKIPPED
+    assert classifier.calls == []
