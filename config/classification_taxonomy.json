@@ -1,0 +1,84 @@
+{
+  "labels": [
+    {
+      "id": "product_information",
+      "display_name": "Ürün Bilgisi",
+      "definition": "Müşterinin bir ürünün, hizmetin, paketin veya özelliğin kapsamı ve kullanımı hakkında bilgi istemesi.",
+      "positive_guidance": "Özellik, kapsam, uygunluk, kullanım veya paket içeriği sorularını bu etiketle işaretleyin.",
+      "negative_guidance": "Yalnızca fiyat itirazı, teknik arıza veya iptal talebi içeren metinleri ürün bilgisi saymayın.",
+      "default_threshold": 0.65,
+      "default_coaching_action": "TEMPLATE_ACTION",
+      "critical": false
+    },
+    {
+      "id": "price_objection",
+      "display_name": "Fiyat İtirazı",
+      "definition": "Müşterinin fiyatı, ücreti veya zam oranını yüksek, uygunsuz ya da kabul edilemez bulduğunu belirtmesi.",
+      "positive_guidance": "Pahalılık, ücret indirimi beklentisi veya fiyat nedeniyle satın almama ifadelerini işaretleyin.",
+      "negative_guidance": "Tarafsız fiyat sorma veya yalnızca ücret bilgisini merak etme ifadelerini işaretlemeyin.",
+      "default_threshold": 0.70,
+      "default_coaching_action": "TEMPLATE_ACTION",
+      "critical": false
+    },
+    {
+      "id": "cancellation_request",
+      "display_name": "İptal Talebi",
+      "definition": "Müşterinin hizmeti iptal etmek için açık bir talepte bulunması veya yakın ve net iptal niyeti göstermesi.",
+      "positive_guidance": "Hemen iptal, aboneliği kapatma veya iptal işlemini başlatma gibi açık ifadeleri işaretleyin.",
+      "negative_guidance": "Kararsızlık, gelecekte yenilememe veya başka sağlayıcıyı düşünme tek başına iptal talebi değildir.",
+      "default_threshold": 0.78,
+      "default_coaching_action": "ESCALATE",
+      "critical": true
+    },
+    {
+      "id": "technical_issue",
+      "display_name": "Teknik Sorun",
+      "definition": "Müşterinin ürün veya hizmetin çalışması, erişimi, bağlantısı ya da performansıyla ilgili sorun bildirmesi.",
+      "positive_guidance": "Kesinti, hata, bağlantı, kurulum veya işlev bozukluğu bildirimlerini işaretleyin.",
+      "negative_guidance": "Nasıl kullanılır türündeki bilgi sorularını veya fiyat şikayetlerini teknik sorun saymayın.",
+      "default_threshold": 0.68,
+      "default_coaching_action": "TEMPLATE_ACTION",
+      "critical": false
+    },
+    {
+      "id": "complaint",
+      "display_name": "Şikayet",
+      "definition": "Müşterinin deneyim, hizmet, süreç veya davranış hakkında belirgin memnuniyetsizlik bildirmesi.",
+      "positive_guidance": "Kötü deneyim, çözülmeyen sorun veya hizmet kalitesi memnuniyetsizliğini işaretleyin.",
+      "negative_guidance": "Nötr bilgi taleplerini ve açıkça şikayeti olmadığını söyleyen ifadeleri işaretlemeyin.",
+      "default_threshold": 0.70,
+      "default_coaching_action": "TEMPLATE_ACTION",
+      "critical": false
+    },
+    {
+      "id": "renewal_interest",
+      "display_name": "Yenileme İlgisi",
+      "definition": "Müşterinin sözleşme, paket veya aboneliğini sürdürme ya da yenileme konusunda olumlu ilgi göstermesi.",
+      "positive_guidance": "Yenileme koşulu sorma, devam etme isteği veya uygun teklifle yenileme niyetini işaretleyin.",
+      "negative_guidance": "Yenilememe, kararsızlık veya sağlayıcı değiştirme eğilimini yenileme ilgisi saymayın.",
+      "default_threshold": 0.67,
+      "default_coaching_action": "TEMPLATE_ACTION",
+      "critical": false
+    },
+    {
+      "id": "churn_risk",
+      "display_name": "Müşteri Kaybı Riski",
+      "definition": "Müşterinin hemen iptal talebi vermeden ayrılma, yenilememe, tereddüt etme veya başka sağlayıcıyı değerlendirme olasılığı göstermesi.",
+      "positive_guidance": "Rakibe geçmeyi düşünme, yenilememe ihtimali, devam konusunda tereddüt veya kayıp sinyallerini işaretleyin.",
+      "negative_guidance": "Açık ve yakın iptal talebini yalnızca churn riski olarak bırakmayın; cancellation_request etiketini de kullanın.",
+      "default_threshold": 0.72,
+      "default_coaching_action": "ESCALATE",
+      "critical": true
+    },
+    {
+      "id": "no_action",
+      "display_name": "Aksiyon Gerektirmiyor",
+      "definition": "Metnin diğer sınıflardan hiçbirini taşımadığı ve temsilci için sınıflandırmaya dayalı bir aksiyon gerektirmediği durum.",
+      "positive_guidance": "Nötr selamlama, teyit, zorlayıcı negatif örnek veya kapsam dışı konuşmaları tek başına bu etiketle işaretleyin.",
+      "negative_guidance": "Başka herhangi bir etiket geçerliyse no_action kullanmayın; bu etiket tüm diğerleriyle karşılıklı dışlayıcıdır.",
+      "default_threshold": 0.75,
+      "default_coaching_action": "NO_ACTION",
+      "critical": false
+    }
+  ]
+}

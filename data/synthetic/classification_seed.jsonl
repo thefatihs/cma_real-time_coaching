@@ -1,0 +1,48 @@
+{"example_id":"synthetic_pi_001","text":"Yeni paketin içinde hangi hizmetler bulunuyor?","labels":["product_information"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_pi_002","text":"Uygulamadaki aile özelliğinin nasıl çalıştığını anlatır mısınız?","labels":["product_information"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_pi_003","text":"Bu hizmet yurt dışında da kullanılabiliyor mu?","labels":["product_information"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_pi_004","text":"Kurumsal paket kaç kullanıcıyı destekliyor?","labels":["product_information"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_pi_005","text":"Ek güvenlik seçeneğinin kapsamını öğrenmek istiyorum.","labels":["product_information"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_pi_006","text":"Taahhütsüz planın içerdiği özellikler nelerdir?","labels":["product_information"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_po_001","text":"Aylık ücret bütçeme göre çok yüksek kaldı.","labels":["price_objection"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_po_002","text":"Bu kadar zamlı bir tarifeyi kabul edemem.","labels":["price_objection","churn_risk"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_po_003","text":"Aynı özellikler için istenen bedel bana pahalı geliyor.","labels":["price_objection"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_po_004","text":"Daha uygun bir ücret sunulmazsa devam etmeyi düşünmüyorum.","labels":["price_objection","churn_risk"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_po_005","text":"Kurulum ücretinin bu seviyede olması makul değil.","labels":["price_objection"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_po_006","text":"İndirim olmadan bu paketi satın almak istemem.","labels":["price_objection"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_cr_001","text":"Aboneliğimi bugün iptal edin lütfen.","labels":["cancellation_request"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_cr_002","text":"Hizmeti kapatmak istiyorum, iptal işlemini başlatın.","labels":["cancellation_request"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_cr_003","text":"Sözleşmemi sona erdirme talebimi şimdi kaydedin.","labels":["cancellation_request"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_cr_004","text":"Artık kullanmayacağım; üyeliğimi kesin olarak kapatacağım.","labels":["cancellation_request","churn_risk"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_cr_005","text":"Paketimin derhal iptal edilmesini talep ediyorum.","labels":["cancellation_request"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_cr_006","text":"Bu görüşmede abonelik iptalimi tamamlamak istiyorum.","labels":["cancellation_request"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_ti_001","text":"Bağlantı her akşam kesiliyor ve yeniden kurulmuyor.","labels":["technical_issue"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_ti_002","text":"Uygulamaya giriş yapınca sürekli hata kodu görüyorum.","labels":["technical_issue"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_ti_003","text":"Cihaz güncellemeden sonra ağa bağlanamıyor.","labels":["technical_issue"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_ti_004","text":"Sesli görüşmelerde karşı tarafın sesi kesik geliyor.","labels":["technical_issue","complaint"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_ti_005","text":"Şifre sıfırlama bağlantısı açılmadan kapanıyor.","labels":["technical_issue"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_ti_006","text":"Modem açık görünse de hiçbir cihaz internete çıkamıyor.","labels":["technical_issue"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_co_001","text":"Son destek görüşmesinde hiç yardımcı olunmadı.","labels":["complaint"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_co_002","text":"Üç gündür çözüm beklemekten çok rahatsızım.","labels":["complaint"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_co_003","text":"Teslimat sürecindeki bilgilendirme gerçekten yetersizdi.","labels":["complaint"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_co_004","text":"Verilen sözlerin tutulmamasından şikayetçiyim.","labels":["complaint"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_co_005","text":"Destek ekibinin yaklaşımı beni ciddi biçimde memnun etmedi.","labels":["complaint"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_co_006","text":"Aynı arızayı tekrar tekrar bildirmek zorunda kalmam kabul edilemez.","labels":["complaint","technical_issue"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_ri_001","text":"Sözleşmem bitince aynı paketle devam etmek istiyorum.","labels":["renewal_interest"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_ri_002","text":"Yenileme için sunabileceğiniz seçenekleri öğrenebilir miyim?","labels":["renewal_interest","product_information"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_ri_003","text":"Uygun koşullar varsa üyeliğimi bir yıl daha uzatacağım.","labels":["renewal_interest"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_ri_004","text":"Mevcut planımı yenilemek için hangi adımları izlemeliyim?","labels":["renewal_interest"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_ri_005","text":"Yeni dönem teklifini görüp aboneliğimi sürdürmek isterim.","labels":["renewal_interest"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_ri_006","text":"Hizmetten memnunum, yenileme tarihini teyit eder misiniz?","labels":["renewal_interest"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_ch_001","text":"Taahhüt bitince başka bir sağlayıcıya geçmeyi düşünüyorum.","labels":["churn_risk"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_ch_002","text":"Gelecek dönem devam edip etmeyeceğimden emin değilim.","labels":["churn_risk"],"split":"train","source":"synthetic"}
+{"example_id":"synthetic_ch_003","text":"Arkadaşımın kullandığı alternatif hizmeti değerlendirebilirim.","labels":["churn_risk"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_ch_004","text":"Bu şartlarla sözleşmeyi yenilemem zor görünüyor.","labels":["churn_risk"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_ch_005","text":"Bir süre daha bakacağım ama kalmaya pek sıcak değilim.","labels":["churn_risk"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_ch_006","text":"Rakiplerin tekliflerini karşılaştırmadan karar vermeyeceğim.","labels":["churn_risk"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_na_001","text":"İptal etmek istemiyorum.","labels":["no_action"],"split":"train","source":"synthetic","notes":"Zor negatif: iptal sözcüğü açık olumsuzluk içinde."}
+{"example_id":"synthetic_na_002","text":"Fiyatı sadece merak ettim.","labels":["no_action"],"split":"train","source":"synthetic","notes":"Zor negatif: tarafsız fiyat sorusu."}
+{"example_id":"synthetic_na_003","text":"Şu anda herhangi bir şikayetim yok.","labels":["no_action"],"split":"validation","source":"synthetic","notes":"Zor negatif: şikayet olmadığını belirtiyor."}
+{"example_id":"synthetic_na_004","text":"Verdiğiniz bilgiyi not aldım, teşekkür ederim.","labels":["no_action"],"split":"validation","source":"synthetic"}
+{"example_id":"synthetic_na_005","text":"Bugünkü görüşme saatimizi teyit etmek için aradım.","labels":["no_action"],"split":"test","source":"synthetic"}
+{"example_id":"synthetic_na_006","text":"Şimdilik başka bir sorum bulunmuyor.","labels":["no_action"],"split":"test","source":"synthetic"}

@@ -256,3 +256,23 @@ Tarih: 22 Temmuz 2026
 - Testler: focused 26 passed; full 267 passed (1 dependency warning).
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Uc gorunumu sentetik bir gorusmeyle manuel kullanilabilirlik testinden gecirmek.
+
+## 34. SetFit Siniflandirma Taksonomisi ve Veri Seti Temeli
+
+- Sekiz etiketli Turkce taksonomi, immutable siniflandirma ornek modeli ve
+  guvenli JSONL veri seti yukleyicisi eklendi.
+- Duplicate ID, normalize metin tekrari, split sizintisi, bilinmeyen etiket ve
+  `no_action` birlikteligi dogrulamalari eklendi.
+- Her etiket icin en az alti ornek iceren 48 satirlik, yalnizca sentetik Turkce
+  seed veri seti ve metin yazdirmayan guvenli sayim CLI'i eklendi.
+- Degisen dosyalar: `app/classification/__init__.py`,
+  `app/classification/models.py`, `app/classification/dataset.py`,
+  `config/classification_taxonomy.json`,
+  `data/synthetic/classification_seed.jsonl`,
+  `scripts/validate_classification_dataset.py`,
+  `tests/test_classification_models.py`,
+  `tests/test_classification_dataset.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 16 passed; full 283 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gelecek ayri bir gorevde SetFit egitim ve degerlendirme
+  akisinin tasarlanmasi.
