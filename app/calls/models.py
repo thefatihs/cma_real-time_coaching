@@ -1,8 +1,14 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.events.models import (
     AudioChunkEvent,
     ClassificationResultEvent,
+    CoachingAction,
+    CoachingSuggestionEvent,
+    CoachingSuggestionSource,
+    SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
 )
@@ -26,6 +32,8 @@ class CallState(BaseModel):
     classification_transcript_revision: int | None = None
     classification_source_sequence: int | None = None
     classification_inference_time_ms: float | None = None
+    coaching_suggestions: list["CallCoachingMetadata"] = Field(default_factory=list)
+    coaching_transcript_revision: int | None = None
 
     @field_validator("tenant_id", "call_id")
     @classmethod
@@ -143,6 +151,33 @@ class CallState(BaseModel):
             inference_time_ms=self.classification_inference_time_ms,
         )
 
+    def apply_coaching_suggestion(
+        self,
+        event: CoachingSuggestionEvent,
+        *,
+        transcript_revision: int,
+        model_id: str | None,
+        threshold_profile_id: str | None,
+    ) -> None:
+        self._ensure_same_scope(event)
+        metadata = CallCoachingMetadata(
+            suggestion_id=event.suggestion_id,
+            action=event.action,
+            priority=event.priority,
+            source=event.source,
+            transcript_revision=transcript_revision,
+            created_at_utc=event.created_at_utc,
+            model_id=model_id if event.source.value != "rule" else None,
+            threshold_profile_id=(
+                threshold_profile_id if event.source.value != "rule" else None
+            ),
+        )
+        if metadata.suggestion_id not in {
+            item.suggestion_id for item in self.coaching_suggestions
+        }:
+            self.coaching_suggestions = [*self.coaching_suggestions, metadata]
+        self.coaching_transcript_revision = transcript_revision
+
     def mark_suggestion_shown(self, suggestion_id: str) -> None:
         cleaned = suggestion_id.strip()
         if not cleaned:
@@ -199,3 +234,16 @@ class CallClassificationMetadata(BaseModel):
     transcript_revision: int | None = None
     source_sequence: int | None = None
     inference_time_ms: float | None = None
+
+
+class CallCoachingMetadata(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    suggestion_id: str
+    action: CoachingAction
+    priority: SuggestionPriority
+    source: CoachingSuggestionSource
+    transcript_revision: int
+    created_at_utc: datetime
+    model_id: str | None = None
+    threshold_profile_id: str | None = None

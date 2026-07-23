@@ -11,6 +11,7 @@ from app.classification.streaming import (
     StableClassificationOutcome,
     StableTranscriptClassificationStage,
 )
+from app.coaching.coordinator import CoachingCoordinator, StableCoachingOutcome
 from app.events.models import AudioChunkEvent, TranscriptEvent
 from app.streaming.audio_window import ASRAudioWindow, AudioWindowBuilder
 from app.streaming.chunk_generator import generate_audio_chunks
@@ -36,6 +37,7 @@ class StreamingASRStep:
     partial_transcript: str
     transcription_time_seconds: float
     classification_outcomes: tuple[StableClassificationOutcome, ...] = ()
+    coaching_outcomes: tuple[StableCoachingOutcome, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,7 @@ class StreamingASRResult:
     audio_duration_seconds: float
     classification_outcomes: tuple[StableClassificationOutcome, ...] = ()
     classification_metadata: CallClassificationMetadata = CallClassificationMetadata()
+    coaching_outcomes: tuple[StableCoachingOutcome, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,7 @@ class WindowTranscriberProtocol(Protocol):
 ChunkGenerator = Callable[[Path, str, str, float], Iterable[AudioChunkEvent]]
 StepCallback = Callable[[StreamingASRStep], None]
 PlanCallback = Callable[[StreamingASRPlan], None]
+CoachingCoordinatorFactory = Callable[[CallState], CoachingCoordinator]
 
 
 class StreamingASRPipeline:
@@ -78,6 +82,7 @@ class StreamingASRPipeline:
         *,
         chunk_generator: ChunkGenerator = generate_audio_chunks,
         runtime_classifier: RuntimeClassifierProtocol | None = None,
+        coaching_coordinator_factory: CoachingCoordinatorFactory | None = None,
     ) -> None:
         self._tenant_context = tenant_context
         self._asr_config = asr_config
@@ -86,6 +91,7 @@ class StreamingASRPipeline:
         self._classification_stage = StableTranscriptClassificationStage(
             runtime_classifier
         )
+        self._coaching_coordinator_factory = coaching_coordinator_factory
 
     def run(
         self,
@@ -106,6 +112,12 @@ class StreamingASRPipeline:
         )
         steps: list[StreamingASRStep] = []
         all_classification_outcomes: list[StableClassificationOutcome] = []
+        all_coaching_outcomes: list[StableCoachingOutcome] = []
+        coaching_coordinator = (
+            self._coaching_coordinator_factory(call_state)
+            if self._coaching_coordinator_factory is not None
+            else None
+        )
         audio_duration_seconds = 0.0
 
         planning_chunks = self._chunk_generator(
@@ -146,6 +158,7 @@ class StreamingASRPipeline:
             self._validate_transcription_scope(transcription, call_id)
             transcript_events = reconciler.ingest(transcription)
             step_classification_outcomes: list[StableClassificationOutcome] = []
+            step_coaching_outcomes: list[StableCoachingOutcome] = []
             for event in transcript_events:
                 previous_stable = call_state.stable_transcript
                 call_state.apply_transcript(event)
@@ -157,6 +170,16 @@ class StreamingASRPipeline:
                 )
                 step_classification_outcomes.append(outcome)
                 all_classification_outcomes.append(outcome)
+                coaching_outcome = self._process_coaching(
+                    coordinator=coaching_coordinator,
+                    event=event,
+                    stable_changed=(call_state.stable_transcript != previous_stable),
+                    cumulative_stable_transcript=call_state.stable_transcript,
+                    classification_outcome=outcome,
+                )
+                if coaching_outcome is not None:
+                    step_coaching_outcomes.append(coaching_outcome)
+                    all_coaching_outcomes.append(coaching_outcome)
 
             chunk_end_seconds = chunk.chunk_start_seconds + chunk.chunk_duration_seconds
             audio_duration_seconds = max(audio_duration_seconds, chunk_end_seconds)
@@ -172,6 +195,7 @@ class StreamingASRPipeline:
                 raw_window_text=transcription.text,
                 transcript_events=transcript_events,
                 classification_outcomes=tuple(step_classification_outcomes),
+                coaching_outcomes=tuple(step_coaching_outcomes),
                 stable_transcript=reconciler.stable_transcript,
                 partial_transcript=reconciler.partial_transcript,
                 transcription_time_seconds=(transcription.processing_time_seconds),
@@ -184,14 +208,22 @@ class StreamingASRPipeline:
         if final_event is not None:
             previous_stable = call_state.stable_transcript
             call_state.apply_transcript(final_event)
-            all_classification_outcomes.append(
-                self._classification_stage.process(
-                    final_event,
-                    cumulative_stable_transcript=call_state.stable_transcript,
-                    stable_changed=(call_state.stable_transcript != previous_stable),
-                    call_state=call_state,
-                )
+            final_classification = self._classification_stage.process(
+                final_event,
+                cumulative_stable_transcript=call_state.stable_transcript,
+                stable_changed=(call_state.stable_transcript != previous_stable),
+                call_state=call_state,
             )
+            all_classification_outcomes.append(final_classification)
+            final_coaching = self._process_coaching(
+                coordinator=coaching_coordinator,
+                event=final_event,
+                stable_changed=(call_state.stable_transcript != previous_stable),
+                cumulative_stable_transcript=call_state.stable_transcript,
+                classification_outcome=final_classification,
+            )
+            if final_coaching is not None:
+                all_coaching_outcomes.append(final_coaching)
 
         return StreamingASRResult(
             tenant_id=call_state.tenant_id,
@@ -200,10 +232,43 @@ class StreamingASRPipeline:
             final_event=final_event,
             classification_outcomes=tuple(all_classification_outcomes),
             classification_metadata=call_state.classification_metadata(),
+            coaching_outcomes=tuple(all_coaching_outcomes),
             stable_transcript=reconciler.stable_transcript,
             partial_transcript=reconciler.partial_transcript,
             total_chunks=len(steps),
             audio_duration_seconds=audio_duration_seconds,
+        )
+
+    @staticmethod
+    def _process_coaching(
+        *,
+        coordinator: CoachingCoordinator | None,
+        event: TranscriptEvent,
+        stable_changed: bool,
+        cumulative_stable_transcript: str,
+        classification_outcome: StableClassificationOutcome,
+    ) -> StableCoachingOutcome | None:
+        if (
+            coordinator is None
+            or event.kind.value == "PARTIAL"
+            or not stable_changed
+            or not cumulative_stable_transcript.strip()
+        ):
+            return None
+        cumulative_event = event.model_copy(
+            update={"text": cumulative_stable_transcript}
+        )
+        classification_event = classification_outcome.classification_event
+        active_labels = (
+            tuple(label.name for label in classification_event.labels)
+            if classification_event is not None
+            else ()
+        )
+        return coordinator.process_safely(
+            cumulative_event,
+            event.end_seconds,
+            classification_event=classification_event,
+            active_labels=active_labels,
         )
 
     def _validate_transcription_scope(

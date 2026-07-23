@@ -404,3 +404,25 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Classification outcome'larini ayri bir gorevde coaching
   karar katmanina guvenli contract ile baglamak.
+
+## 41. Stable Classification ve Deterministik Coaching Entegrasyonu
+
+- Opsiyonel coaching coordinator factory, her cagri icin pipeline CallState'ini
+  kullanarak yalnizca yeni cumulative stable revision'lari isler; PARTIAL,
+  degismeyen ve duplicate revision'lar coaching'e girmez.
+- Deterministik rule eslesmeleri ve SetFit aktif label'lari tenant kurallari
+  uzerinden birlestirilir; suggestion provenance `rule`, `classification` veya
+  `both` olarak korunur ve kritik acik kurallar classification kacirsa da calisir.
+- Classification hatasi rule-only coaching'i engellemez; coaching hatasi guvenli
+  outcome ve metinsiz log uretir, ASR streaming devam eder.
+- CallState yalnizca suggestion ID, action, priority, provenance, revision,
+  timestamp ve classification katkisi varsa model/profile ID saklar.
+- Degisen dosyalar: `app/events/models.py`, `app/coaching/rule_engine.py`,
+  `app/coaching/coordinator.py`, `app/calls/models.py`,
+  `app/streaming/pipeline.py`, `tests/test_coaching_coordinator.py`,
+  `tests/test_streaming_pipeline.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 78 passed; full 339 passed (1 dependency warning); SetFit
+  tamamen mock'ludur.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Coaching metadata'sini ayri bir gorevde sunum katmanina
+  guvenli bir view-model ile aktarmak.

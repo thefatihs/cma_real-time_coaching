@@ -7,7 +7,10 @@ from app.calls.models import CallState
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.rule_engine import CoachingRule, RuleBasedCoachingEngine
 from app.events.models import (
+    ClassificationLabel,
+    ClassificationResultEvent,
     CoachingAction,
+    CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
@@ -96,6 +99,19 @@ def coordinator(
         utc_datetime_factory=lambda: NOW,
     )
     return CoachingCoordinator(tenant, state, engine), state
+
+
+def classification(*labels: str) -> ClassificationResultEvent:
+    return ClassificationResultEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        transcript_event_id="transcript_1",
+        labels=[ClassificationLabel(name=label, score=0.8) for label in labels],
+        action=CoachingAction.TEMPLATE_ACTION,
+        model_id="common_turkish_setfit_v2",
+        threshold_profile_id="common_turkish_setfit_v2:calibrated:v1",
+        created_at_utc=NOW,
+    )
 
 
 def test_partial_is_ignored() -> None:
@@ -238,3 +254,54 @@ def test_source_event_and_rule_remain_unchanged() -> None:
     subject, _ = coordinator(source_rule)
     subject.process(source_event, 1.0)
     assert before == (source_rule.model_dump(), source_event.model_dump())
+
+
+def test_classification_only_and_agreement_preserve_provenance() -> None:
+    subject, _ = coordinator(rule())
+    classification_only = subject.process(
+        event(text="farkli bir ifade"),
+        1.0,
+        classification_event=classification("iade"),
+        active_labels=("iade",),
+    )
+    assert classification_only.displayed_suggestions[0].source is (
+        CoachingSuggestionSource.CLASSIFICATION
+    )
+
+    second, _ = coordinator(rule())
+    agreement = second.process(
+        event(text="iade"),
+        1.0,
+        classification_event=classification("iade"),
+        active_labels=("iade",),
+    )
+    assert agreement.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
+
+
+def test_explicit_rule_survives_missed_classification_and_stores_safe_metadata() -> (
+    None
+):
+    subject, state = coordinator(rule(action=CoachingAction.ESCALATE))
+    result = subject.process(
+        event(text="iade"),
+        1.0,
+        classification_event=classification(),
+        active_labels=(),
+    )
+    suggestion = result.displayed_suggestions[0]
+    assert suggestion.source is CoachingSuggestionSource.RULE
+    assert suggestion.action is CoachingAction.ESCALATE
+    assert state.coaching_suggestions[0].suggestion_id == suggestion.suggestion_id
+    assert state.coaching_suggestions[0].transcript_revision == 1
+    assert state.coaching_suggestions[0].model_id is None
+    assert not hasattr(state.coaching_suggestions[0], "text")
+    assert not hasattr(state.coaching_suggestions[0], "probabilities")
+
+
+def test_same_revision_is_processed_only_once() -> None:
+    subject, _ = coordinator(rule(), tenant=config(cooldown=0))
+    first = subject.process(event(text="iade"), 1.0)
+    duplicate = subject.process(event(text="iade"), 2.0)
+    assert len(first.displayed_suggestions) == 1
+    assert duplicate.displayed_suggestions == ()
+    assert duplicate.suppression_reasons == ("duplicate_revision",)

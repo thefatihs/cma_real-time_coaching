@@ -10,21 +10,39 @@ from app.classification.streaming import (
     StableTranscriptClassificationStage,
 )
 from app.calls.models import CallState
+from app.coaching.coordinator import (
+    CoachingCoordinator,
+    CoachingProcessingStatus,
+)
+from app.coaching.rule_engine import CoachingRule, RuleBasedCoachingEngine
 from app.events.models import (
     AudioChunkEvent,
     ClassificationLabel,
     ClassificationResultEvent,
     CoachingAction,
+    CoachingSuggestionSource,
+    SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
 )
 from app.streaming.audio_window import ASRAudioWindow
-from app.streaming.pipeline import StreamingASRPipeline, StreamingASRPlan
+from app.streaming.pipeline import (
+    CoachingCoordinatorFactory,
+    StreamingASRPipeline,
+    StreamingASRPlan,
+)
 from app.streaming.window_transcriber import (
     WindowTranscriptionResult,
     WindowTranscriptionSegment,
 )
-from app.tenancy.models import TenantASRConfig, TenantContext
+from app.tenancy.models import (
+    TenantASRConfig,
+    TenantClassificationConfig,
+    TenantCoachingConfig,
+    TenantConfig,
+    TenantContext,
+    TenantRAGConfig,
+)
 
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
@@ -113,6 +131,7 @@ def pipeline(
     transcriber: FakeTranscriber,
     calls: list[object] | None = None,
     runtime_classifier: RuntimeClassifierProtocol | None = None,
+    coaching_factory: CoachingCoordinatorFactory | None = None,
 ) -> StreamingASRPipeline:
     return StreamingASRPipeline(
         context(),
@@ -120,7 +139,52 @@ def pipeline(
         transcriber,
         chunk_generator=generator_for(source, calls),
         runtime_classifier=runtime_classifier,
+        coaching_coordinator_factory=coaching_factory,
     )
+
+
+def coaching_factory(
+    *,
+    phrase: str = "first",
+    label: str = "complaint",
+) -> CoachingCoordinatorFactory:
+    tenant = TenantConfig(
+        context=context(),
+        asr=config(),
+        classification=TenantClassificationConfig(
+            model_id="common_turkish_setfit_v2",
+            labels=["complaint"],
+        ),
+        rag=TenantRAGConfig(enabled=False),
+        coaching=TenantCoachingConfig(
+            cooldown_seconds=0,
+            max_active_suggestions=2,
+            allowed_actions=[action.value for action in CoachingAction],
+        ),
+    )
+    rule = CoachingRule(
+        rule_id="safe_rule",
+        label=label,
+        include_any=(phrase,),
+        action=CoachingAction.TEMPLATE_ACTION,
+        priority=SuggestionPriority.HIGH,
+        title="Synthetic guidance",
+        suggestion="Apply the synthetic guidance.",
+    )
+
+    def create(state: CallState) -> CoachingCoordinator:
+        return CoachingCoordinator(
+            tenant,
+            state,
+            RuleBasedCoachingEngine(
+                tenant,
+                (rule,),
+                event_id_factory=lambda: f"suggestion-{state.transcript_revision}",
+                utc_datetime_factory=lambda: NOW,
+            ),
+        )
+
+    return create
 
 
 class FakeRuntimeClassifier:
@@ -457,3 +521,95 @@ def test_empty_cumulative_stable_transcript_is_skipped() -> None:
     )
     assert outcome.status is ClassificationProcessingStatus.EMPTY_SKIPPED
     assert classifier.calls == []
+
+
+def test_stable_pipeline_combines_rule_and_classification_coaching() -> None:
+    classifier = FakeRuntimeClassifier()
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("first complaint", 0.0, 1.0)]]),
+        runtime_classifier=classifier,
+        coaching_factory=coaching_factory(phrase="first"),
+    ).run(Path("synthetic.wav"), "call_001")
+    assert len(result.coaching_outcomes) == 1
+    outcome = result.coaching_outcomes[0]
+    assert outcome.status is CoachingProcessingStatus.PROCESSED
+    assert outcome.result is not None
+    suggestion = outcome.result.displayed_suggestions[0]
+    assert suggestion.source is CoachingSuggestionSource.BOTH
+    assert (suggestion.tenant_id, suggestion.call_id) == (
+        "tenant_alpha",
+        "call_001",
+    )
+    assert outcome.transcript_revision == result.final_event.revision  # type: ignore[union-attr]
+
+
+def test_classifier_failure_still_allows_rule_only_coaching() -> None:
+    secret = "PRIVATE_SYNTHETIC first"
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(secret, 0.0, 1.0)]]),
+        runtime_classifier=FakeRuntimeClassifier(fail=True),
+        coaching_factory=coaching_factory(phrase="first"),
+    ).run(Path("synthetic.wav"), "call_001")
+    assert result.classification_outcomes[-1].status is (
+        ClassificationProcessingStatus.FAILED
+    )
+    coaching = result.coaching_outcomes[-1]
+    assert coaching.result is not None
+    assert coaching.result.displayed_suggestions[0].source is (
+        CoachingSuggestionSource.RULE
+    )
+
+
+def test_coaching_disabled_preserves_classification_only_operation() -> None:
+    classifier = FakeRuntimeClassifier()
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("final words", 0.0, 1.0)]]),
+        runtime_classifier=classifier,
+    ).run(Path("synthetic.wav"), "call_001")
+    assert result.classification_outcomes[-1].status is (
+        ClassificationProcessingStatus.CLASSIFIED
+    )
+    assert result.coaching_outcomes == ()
+
+
+def test_coaching_failure_is_safe_and_does_not_log_transcript(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "PRIVATE_COACHING_TRANSCRIPT"
+    tenant = TenantConfig(
+        context=context(),
+        asr=config(),
+        classification=TenantClassificationConfig(
+            model_id="rules", labels=["complaint"]
+        ),
+        rag=TenantRAGConfig(enabled=False),
+        coaching=TenantCoachingConfig(
+            allowed_actions=[action.value for action in CoachingAction]
+        ),
+    )
+
+    class BrokenEngine:
+        tenant_id = "tenant_alpha"
+
+        def evaluate(
+            self,
+            event: TranscriptEvent,
+            classification_labels: tuple[str, ...] = (),
+        ) -> object:
+            raise RuntimeError("synthetic coaching failure")
+
+    def factory(state: CallState) -> CoachingCoordinator:
+        return CoachingCoordinator(tenant, state, BrokenEngine())  # type: ignore[arg-type]
+
+    caplog.set_level("ERROR")
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(secret, 0.0, 1.0)]]),
+        coaching_factory=factory,
+    ).run(Path("synthetic.wav"), "call_001")
+    assert result.stable_transcript == secret
+    assert result.coaching_outcomes[-1].status is CoachingProcessingStatus.FAILED
+    assert secret not in caplog.text

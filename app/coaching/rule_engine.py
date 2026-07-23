@@ -14,6 +14,7 @@ from app.events.models import (
     ClassificationResultEvent,
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
@@ -116,17 +117,31 @@ class RuleBasedCoachingEngine:
     def tenant_id(self) -> str:
         return self._tenant_config.context.tenant_id
 
-    def evaluate(self, event: TranscriptEvent) -> RuleEvaluationResult:
+    def evaluate(
+        self,
+        event: TranscriptEvent,
+        classification_labels: tuple[str, ...] = (),
+    ) -> RuleEvaluationResult:
         ensure_same_tenant(self._tenant_config.context, event)
         if event.kind is TranscriptKind.PARTIAL:
             return RuleEvaluationResult(None, (), ())
 
         transcript_tokens = _tokens(event.text)
-        matched = tuple(
+        rule_matches = tuple(
             rule
             for rule in self._rules
             if rule.enabled and _matches(rule, transcript_tokens)
         )
+        classification_label_set = set(classification_labels)
+        classification_matches = tuple(
+            rule
+            for rule in self._rules
+            if rule.enabled and rule.label in classification_label_set
+        )
+        matched_by_id = {
+            rule.rule_id: rule for rule in (*rule_matches, *classification_matches)
+        }
+        matched = tuple(matched_by_id.values())
         if not matched:
             return RuleEvaluationResult(None, (), ())
 
@@ -158,7 +173,12 @@ class RuleBasedCoachingEngine:
                 suggestion_rules[rule.label] = rule
 
         suggestions = tuple(
-            self._suggestion_event(event, rule) for rule in suggestion_rules.values()
+            self._suggestion_event(
+                event,
+                rule,
+                source=_source_for_rule(rule, rule_matches, classification_matches),
+            )
+            for rule in suggestion_rules.values()
         )
         return RuleEvaluationResult(
             classification_event=classification,
@@ -173,7 +193,11 @@ class RuleBasedCoachingEngine:
         )
 
     def _suggestion_event(
-        self, event: TranscriptEvent, rule: CoachingRule
+        self,
+        event: TranscriptEvent,
+        rule: CoachingRule,
+        *,
+        source: CoachingSuggestionSource,
     ) -> CoachingSuggestionEvent:
         return CoachingSuggestionEvent(
             tenant_id=event.tenant_id,
@@ -182,11 +206,26 @@ class RuleBasedCoachingEngine:
             source_transcript_event_id=event.event_id,
             action=rule.action,
             priority=rule.priority,
+            source=source,
             title=rule.title,
             suggestion=rule.suggestion,
             evidence_ids=list(rule.evidence_ids),
             created_at_utc=self._utc_datetime_factory(),
         )
+
+
+def _source_for_rule(
+    rule: CoachingRule,
+    rule_matches: tuple[CoachingRule, ...],
+    classification_matches: tuple[CoachingRule, ...],
+) -> CoachingSuggestionSource:
+    matched_rule = rule in rule_matches
+    matched_classification = rule in classification_matches
+    if matched_rule and matched_classification:
+        return CoachingSuggestionSource.BOTH
+    if matched_classification:
+        return CoachingSuggestionSource.CLASSIFICATION
+    return CoachingSuggestionSource.RULE
 
 
 def _validated_unique(
