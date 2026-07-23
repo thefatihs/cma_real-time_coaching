@@ -25,6 +25,12 @@ class SuggestionPriority(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+class CoachingSuggestionSource(str, Enum):
+    RULE = "rule"
+    CLASSIFICATION = "classification"
+    BOTH = "both"
+
+
 class AudioChunkEvent(BaseModel):
     tenant_id: str
     call_id: str
@@ -262,6 +268,7 @@ class CoachingSuggestionEvent(BaseModel):
     source_transcript_event_id: str
     action: CoachingAction
     priority: SuggestionPriority
+    source: CoachingSuggestionSource = CoachingSuggestionSource.RULE
     title: str
     suggestion: str
     evidence_ids: list[str] = Field(default_factory=list)
