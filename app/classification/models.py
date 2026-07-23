@@ -80,6 +80,7 @@ class ClassificationExample(BaseModel):
     text: str
     labels: tuple[str, ...]
     split: DatasetSplit
+    conversation_id: str | None = None
     tenant_id: str | None = None
     source: Literal["synthetic"] = "synthetic"
     notes: str | None = None
@@ -92,14 +93,18 @@ class ClassificationExample(BaseModel):
             raise ValueError(f"{getattr(info, 'field_name', 'value')} cannot be empty")
         return cleaned
 
-    @field_validator("tenant_id")
+    @field_validator("conversation_id", "tenant_id")
     @classmethod
-    def validate_tenant_id(cls, value: str | None) -> str | None:
+    def validate_optional_identifier(
+        cls, value: str | None, info: object
+    ) -> str | None:
         if value is None:
             return None
         cleaned = value.strip()
         if not cleaned:
-            raise ValueError("tenant_id cannot be whitespace")
+            raise ValueError(
+                f"{getattr(info, 'field_name', 'identifier')} cannot be whitespace"
+            )
         return cleaned
 
     @field_validator("notes")

@@ -33,6 +33,7 @@ def test_classification_example_is_immutable_and_normalized() -> None:
         {"labels": ()},
         {"labels": ("complaint", "complaint")},
         {"labels": ("no_action", "complaint")},
+        {"conversation_id": " \t "},
         {"tenant_id": " \t "},
         {"source": "customer"},
         {"split": "holdout"},

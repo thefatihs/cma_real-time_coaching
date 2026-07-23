@@ -298,3 +298,24 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Baseline'i yalnizca acikca onaylanan ayri bir calistirmada
   egitip validation/test raporlarini karsilastirmak.
+
+## 36. Sentetik Veri Genisletme ve Guvenli Olasilik Diagnostikleri
+
+- Genel Turkce siniflandirma seed'i 273 benzersiz sentetik ornege genisletildi;
+  split sayilari train 165, validation 54 ve test 54 oldu.
+- Her etiket en az train 25, validation 8 ve test 8 ornekte yer alir; konusma
+  gruplarinin split'ler arasinda gecisi ve yetersiz label dengesi reddedilir.
+- Fiyat sorusu/itirazi, iptal/churn, teknik soru/ariza, sikayet/notr geri bildirim,
+  yenileme bilgisi/niyeti ve negation/ASR-benzeri zor karsitliklar eklendi.
+- Validation raporlarina metin veya tekil tahmin saklamadan probability
+  min/mean/max, threshold gecisleri, TP/FP/FN, bos tahmin ve `no_action`
+  threshold/conflict sayimlari eklendi.
+- Degisen dosyalar: `app/classification/`, `data/synthetic/classification_seed.jsonl`,
+  `scripts/build_classification_seed.py`,
+  `scripts/validate_classification_dataset.py`, ilgili classification testleri
+  ve `PROJECT_PROGRESS.md`.
+- Testler: focused 33 passed; full 300 passed (1 dependency warning); veri seti
+  CLI dogrulamasi basarili.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Ayrica onaylanan bir calismada yalnizca validation
+  probability diagnostiklerini incelemek.

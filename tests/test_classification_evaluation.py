@@ -22,6 +22,17 @@ def test_metrics_include_micro_macro_exact_match_and_hamming_loss() -> None:
     assert metrics.hamming_loss == 1 / 9
     assert metrics.average_inference_time_ms == 10.0
     assert metrics.per_label["a"].support == 1
+    assert metrics.per_label["a"].minimum_probability == 0.1
+    assert metrics.per_label["a"].mean_probability == 0.6
+    assert metrics.per_label["a"].maximum_probability == 0.9
+    assert metrics.per_label["a"].predictions_above_threshold == 2
+    assert metrics.per_label["a"].true_positives == 1
+    assert metrics.per_label["a"].false_positives == 1
+    assert metrics.per_label["a"].false_negatives == 0
+    assert metrics.no_predicted_labels == 0
+    assert metrics.no_action_diagnostics.no_business_label_above_threshold == 1
+    assert metrics.no_action_diagnostics.no_action_above_threshold == 1
+    assert metrics.no_action_diagnostics.pre_exclusivity_conflicts == 0
 
 
 def test_zero_division_labels_are_safe() -> None:
@@ -61,3 +72,17 @@ def test_model_evaluation_uses_fake_probabilities_and_timer() -> None:
     )
     assert metrics.exact_match_ratio == 1.0
     assert round(metrics.average_inference_time_ms, 3) == 25.0
+
+
+def test_no_action_conflict_and_empty_prediction_diagnostics() -> None:
+    metrics = evaluate_probabilities(
+        ((1, 0, 0), (0, 0, 1)),
+        ((0.8, 0.1, 0.9), (0.1, 0.2, 0.3)),
+        encoder(),
+        {"a": 0.5, "b": 0.5, "no_action": 0.5},
+    )
+    assert metrics.no_action_diagnostics.pre_exclusivity_conflicts == 1
+    assert metrics.no_action_diagnostics.no_business_label_above_threshold == 1
+    assert metrics.no_action_diagnostics.no_action_above_threshold == 1
+    assert metrics.no_predicted_labels == 1
+    assert metrics.per_label["no_action"].predictions_above_threshold == 1

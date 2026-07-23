@@ -19,6 +19,13 @@ class LabelMetrics:
     recall: float
     f1: float
     support: int
+    minimum_probability: float
+    mean_probability: float
+    maximum_probability: float
+    predictions_above_threshold: int
+    true_positives: int
+    false_positives: int
+    false_negatives: int
 
     def as_dict(self) -> dict[str, float | int]:
         return {
@@ -26,6 +33,29 @@ class LabelMetrics:
             "recall": self.recall,
             "f1": self.f1,
             "support": self.support,
+            "minimum_probability": self.minimum_probability,
+            "mean_probability": self.mean_probability,
+            "maximum_probability": self.maximum_probability,
+            "predictions_above_threshold": self.predictions_above_threshold,
+            "true_positives": self.true_positives,
+            "false_positives": self.false_positives,
+            "false_negatives": self.false_negatives,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NoActionDiagnostics:
+    no_business_label_above_threshold: int
+    no_action_above_threshold: int
+    pre_exclusivity_conflicts: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "no_business_label_above_threshold": (
+                self.no_business_label_above_threshold
+            ),
+            "no_action_above_threshold": self.no_action_above_threshold,
+            "pre_exclusivity_conflicts": self.pre_exclusivity_conflicts,
         }
 
 
@@ -42,6 +72,8 @@ class EvaluationMetrics:
     hamming_loss: float
     average_inference_time_ms: float
     example_count: int
+    no_predicted_labels: int
+    no_action_diagnostics: NoActionDiagnostics
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -62,6 +94,8 @@ class EvaluationMetrics:
             "hamming_loss": self.hamming_loss,
             "average_inference_time_ms": self.average_inference_time_ms,
             "example_count": self.example_count,
+            "no_predicted_labels": self.no_predicted_labels,
+            "no_action_diagnostics": self.no_action_diagnostics.as_dict(),
         }
 
 
@@ -77,8 +111,19 @@ def evaluate_probabilities(
         raise ValueError("true and probability row counts must match")
     if not true_vectors:
         raise ValueError("evaluation requires at least one example")
+    probability_rows = tuple(
+        _validate_probability_vector(row, len(encoder.label_order))
+        for row in probabilities
+    )
+    raw_predictions = tuple(
+        tuple(
+            int(probability >= thresholds[label])
+            for label, probability in zip(encoder.label_order, row, strict=True)
+        )
+        for row in probability_rows
+    )
     predicted = tuple(
-        encoder.threshold_probabilities(row, thresholds) for row in probabilities
+        encoder.threshold_probabilities(row, thresholds) for row in probability_rows
     )
     truth = tuple(
         _validate_binary_vector(row, len(encoder.label_order)) for row in true_vectors
@@ -100,8 +145,21 @@ def evaluate_probabilities(
             for row, guess in zip(truth, predicted, strict=True)
         )
         support = sum(row[index] for row in truth)
+        label_probabilities = tuple(row[index] for row in probability_rows)
         precision, recall, f1 = _precision_recall_f1(tp, fp, fn)
-        per_label[label] = LabelMetrics(precision, recall, f1, support)
+        per_label[label] = LabelMetrics(
+            precision=precision,
+            recall=recall,
+            f1=f1,
+            support=support,
+            minimum_probability=min(label_probabilities),
+            mean_probability=sum(label_probabilities) / len(label_probabilities),
+            maximum_probability=max(label_probabilities),
+            predictions_above_threshold=sum(row[index] for row in raw_predictions),
+            true_positives=tp,
+            false_positives=fp,
+            false_negatives=fn,
+        )
         total_tp += tp
         total_fp += fp
         total_fn += fn
@@ -117,6 +175,10 @@ def evaluate_probabilities(
         for row, predicted_row in zip(truth, predicted, strict=True)
         for actual, guess in zip(row, predicted_row, strict=True)
     )
+    no_action_index = encoder.label_order.index("no_action")
+    business_indexes = tuple(
+        index for index, label in enumerate(encoder.label_order) if label != "no_action"
+    )
     return EvaluationMetrics(
         micro_precision=micro[0],
         micro_recall=micro[1],
@@ -130,6 +192,20 @@ def evaluate_probabilities(
         hamming_loss=differences / (count * label_count),
         average_inference_time_ms=(elapsed_seconds * 1000) / count,
         example_count=count,
+        no_predicted_labels=sum(not any(row) for row in predicted),
+        no_action_diagnostics=NoActionDiagnostics(
+            no_business_label_above_threshold=sum(
+                not any(row[index] for index in business_indexes)
+                for row in raw_predictions
+            ),
+            no_action_above_threshold=sum(
+                row[no_action_index] for row in raw_predictions
+            ),
+            pre_exclusivity_conflicts=sum(
+                row[no_action_index] and any(row[index] for index in business_indexes)
+                for row in raw_predictions
+            ),
+        ),
     )
 
 
@@ -171,6 +247,17 @@ def _validate_binary_vector(
     vector = tuple(values)
     if len(vector) != expected_length or any(value not in {0, 1} for value in vector):
         raise ValueError("true vectors must be binary and match label order")
+    return vector
+
+
+def _validate_probability_vector(
+    values: Sequence[float], expected_length: int
+) -> tuple[float, ...]:
+    vector = tuple(float(value) for value in values)
+    if len(vector) != expected_length:
+        raise ValueError("probability vectors must match label order")
+    if any(value < 0 or value > 1 for value in vector):
+        raise ValueError("probabilities must be between 0 and 1")
     return vector
 
 

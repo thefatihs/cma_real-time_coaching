@@ -7,6 +7,7 @@ from app.classification.dataset import (
     load_classification_dataset,
     load_classification_taxonomy,
     normalize_example_text,
+    validate_required_label_counts,
 )
 
 TAXONOMY_PATH = Path("config/classification_taxonomy.json")
@@ -45,12 +46,19 @@ def test_seed_dataset_is_valid_balanced_and_ordered() -> None:
         "churn_risk",
         "no_action",
     )
-    assert dataset.total_examples >= 48
-    assert all(dataset.label_counts[label] >= 6 for label in taxonomy.label_ids)
+    validate_required_label_counts(dataset, taxonomy)
+    assert dataset.total_examples == 273
+    assert dataset.split_counts == {"test": 54, "train": 165, "validation": 54}
+    assert all(
+        dataset.label_split_counts[label][split] >= minimum
+        for label in taxonomy.label_ids
+        for split, minimum in {"train": 25, "validation": 8, "test": 8}.items()
+    )
     assert set(dataset.split_counts) == {"train", "validation", "test"}
     assert isinstance(dataset.examples, tuple)
-    assert dataset.examples[0].example_id == "synthetic_pi_001"
+    assert dataset.examples[0].example_id == "synthetic_product_information_001"
     assert any(len(item.labels) > 1 for item in dataset.examples)
+    assert all(item.conversation_id for item in dataset.examples)
 
 
 def test_normalization_handles_unicode_whitespace_and_boundary_punctuation() -> None:
@@ -106,3 +114,30 @@ def test_unknown_label_is_rejected(tmp_path: Path) -> None:
     write_jsonl(path, [record("one", "Sentetik örnek", labels=["unknown"])])
     with pytest.raises(ValueError, match="Unknown label"):
         load_classification_dataset(path, load_classification_taxonomy(TAXONOMY_PATH))
+
+
+def test_conversation_group_cannot_cross_splits(tmp_path: Path) -> None:
+    path = tmp_path / "groups.jsonl"
+    write_jsonl(
+        path,
+        [
+            record("one", "İlk sentetik ifade", conversation_id="shared"),
+            record(
+                "two",
+                "İkinci sentetik ifade",
+                conversation_id="shared",
+                split="validation",
+            ),
+        ],
+    )
+    with pytest.raises(ValueError, match="Conversation group appears"):
+        load_classification_dataset(path, load_classification_taxonomy(TAXONOMY_PATH))
+
+
+def test_required_label_counts_are_enforced(tmp_path: Path) -> None:
+    path = tmp_path / "small.jsonl"
+    write_jsonl(path, [record("one", "Tek sentetik ifade")])
+    taxonomy = load_classification_taxonomy(TAXONOMY_PATH)
+    dataset = load_classification_dataset(path, taxonomy)
+    with pytest.raises(ValueError, match="Insufficient label count"):
+        validate_required_label_counts(dataset, taxonomy)

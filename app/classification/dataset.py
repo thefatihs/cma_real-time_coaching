@@ -12,12 +12,17 @@ from pydantic import ValidationError
 
 from app.classification.models import ClassificationExample, ClassificationTaxonomy
 
+REQUIRED_LABEL_COUNTS: Mapping[str, int] = MappingProxyType(
+    {"train": 25, "validation": 8, "test": 8}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ClassificationDataset:
     examples: tuple[ClassificationExample, ...]
     label_counts: Mapping[str, int]
     split_counts: Mapping[str, int]
+    label_split_counts: Mapping[str, Mapping[str, int]]
 
     @property
     def total_examples(self) -> int:
@@ -58,6 +63,7 @@ def load_classification_dataset(
     examples: list[ClassificationExample] = []
     seen_ids: set[str] = set()
     normalized_locations: dict[str, tuple[str, int]] = {}
+    conversation_splits: dict[str, tuple[str, int]] = {}
     label_ids = set(taxonomy.label_ids)
 
     try:
@@ -101,6 +107,17 @@ def load_classification_dataset(
             raise ValueError(
                 f"Duplicate normalized text at lines {previous_line} and {line_number}"
             )
+        if example.conversation_id is not None:
+            previous_group = conversation_splits.get(example.conversation_id)
+            if previous_group is not None and previous_group[0] != example.split.value:
+                raise ValueError(
+                    "Conversation group appears in multiple splits "
+                    f"at lines {previous_group[1]} and {line_number}"
+                )
+            conversation_splits[example.conversation_id] = (
+                example.split.value,
+                line_number,
+            )
 
         seen_ids.add(example.example_id)
         normalized_locations[normalized_text] = (example.split.value, line_number)
@@ -108,11 +125,42 @@ def load_classification_dataset(
 
     label_counts = Counter(label for example in examples for label in example.labels)
     split_counts = Counter(example.split.value for example in examples)
+    label_split_counts = {
+        label: {
+            split: sum(
+                label in example.labels and example.split.value == split
+                for example in examples
+            )
+            for split in REQUIRED_LABEL_COUNTS
+        }
+        for label in taxonomy.label_ids
+    }
     return ClassificationDataset(
         examples=tuple(examples),
         label_counts=MappingProxyType(dict(sorted(label_counts.items()))),
         split_counts=MappingProxyType(dict(sorted(split_counts.items()))),
+        label_split_counts=MappingProxyType(
+            {
+                label: MappingProxyType(counts)
+                for label, counts in label_split_counts.items()
+            }
+        ),
     )
+
+
+def validate_required_label_counts(
+    dataset: ClassificationDataset,
+    taxonomy: ClassificationTaxonomy,
+    required_counts: Mapping[str, int] = REQUIRED_LABEL_COUNTS,
+) -> None:
+    for label in taxonomy.label_ids:
+        for split, minimum in required_counts.items():
+            actual = dataset.label_split_counts.get(label, {}).get(split, 0)
+            if actual < minimum:
+                raise ValueError(
+                    f"Insufficient label count for {label}/{split}: "
+                    f"required {minimum}, found {actual}"
+                )
 
 
 def _is_surrounding_punctuation(character: str) -> bool:

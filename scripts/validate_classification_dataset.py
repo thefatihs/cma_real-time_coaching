@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.classification.dataset import (  # noqa: E402
     load_classification_dataset,
     load_classification_taxonomy,
+    validate_required_label_counts,
 )
 
 DEFAULT_TAXONOMY_PATH = Path("config/classification_taxonomy.json")
@@ -30,6 +31,7 @@ def main() -> int:
     try:
         taxonomy = load_classification_taxonomy(arguments.taxonomy)
         dataset = load_classification_dataset(arguments.jsonl_path, taxonomy)
+        validate_required_label_counts(dataset, taxonomy)
     except ValueError as error:
         print(f"validation status: failed ({error})")
         return 1
@@ -37,6 +39,8 @@ def main() -> int:
     print(f"total examples: {dataset.total_examples}")
     print(f"split counts: {_format_counts(dataset.split_counts)}")
     print(f"label counts: {_format_counts(dataset.label_counts)}")
+    for label, counts in dataset.label_split_counts.items():
+        print(f"label split counts ({label}): {_format_counts(counts)}")
     print("validation status: valid")
     return 0
 
