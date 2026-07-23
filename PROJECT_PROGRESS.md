@@ -360,3 +360,25 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Profil destekli evaluation'i ayrica onaylanan bir
   validation veya test calismasinda kullanmak.
+
+## 39. Lazy Tenant-Aware SetFit Runtime Adapter
+
+- Yerel `common_turkish_setfit_v2` artifact ve calibrated threshold profilini ilk
+  istekte dogrulayip yukleyen, artifact seti bazinda tekrar kullanan adapter eklendi.
+- Tenant bazli model/profile/taxonomy path override ve ortak v2 default ayarlari
+  desteklendi; stale model, taxonomy veya profile checksum'lari reddedilir.
+- Runtime sonucu mevcut `ClassificationResultEvent` icinde tenant/call/event
+  kimligi, aktif label/score, tum probability/threshold, model/profile ID ve
+  inference suresini tasir.
+- `no_action` yalnizca model probability'si threshold'u gectiginde uretilir ve
+  business label ile birlikte bulunmasi mevcut dislayicilikla engellenir.
+- Loglar yalnizca guvenli kimlik, model/profile, aktif label, sure ve hata tipini
+  icerir; transcript, token veya embedding loglanmaz ve tahmin saklanmaz.
+- Degisen dosyalar: `app/classification/runtime.py`,
+  `app/classification/__init__.py`, `app/events/models.py`,
+  `tests/test_classification_runtime.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 40 passed; full 327 passed (1 dependency warning); tum model
+  yukleme ve inference davranisi mock'ludur.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter'i ayri bir gorevde canli akisa baglamadan once
+  sentetik contract-level kullanimla dogrulamak.

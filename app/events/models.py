@@ -163,6 +163,9 @@ class ClassificationResultEvent(BaseModel):
     labels: list[ClassificationLabel]
     action: CoachingAction
     model_id: str
+    threshold_profile_id: str | None = None
+    probabilities: dict[str, float] = Field(default_factory=dict)
+    thresholds: dict[str, float] = Field(default_factory=dict)
     processing_time_ms: float | None = None
     created_at_utc: datetime
 
@@ -178,6 +181,26 @@ class ClassificationResultEvent(BaseModel):
             raise ValueError("processing_time_ms cannot be negative")
         return value
 
+    @field_validator("threshold_profile_id")
+    @classmethod
+    def validate_threshold_profile_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _required_text(value, "threshold_profile_id")
+
+    @field_validator("probabilities", "thresholds")
+    @classmethod
+    def validate_label_values(
+        cls, values: dict[str, float], info: object
+    ) -> dict[str, float]:
+        field_name = getattr(info, "field_name", "value")
+        return {
+            _required_text(label, f"{field_name} label"): _probability(
+                value, f"{field_name} for {label}"
+            )
+            for label, value in values.items()
+        }
+
     @field_validator("created_at_utc")
     @classmethod
     def validate_created_time(cls, value: datetime) -> datetime:
@@ -189,6 +212,11 @@ class ClassificationResultEvent(BaseModel):
         if len(names) != len(set(names)):
             raise ValueError("classification label names must be unique")
         self.labels = sorted(self.labels, key=lambda label: label.score, reverse=True)
+        if self.probabilities and self.thresholds:
+            if set(self.probabilities) != set(self.thresholds):
+                raise ValueError("probability and threshold labels must match exactly")
+            if not set(names).issubset(self.probabilities):
+                raise ValueError("active classification labels must have probabilities")
         return self
 
 

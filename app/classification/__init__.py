@@ -14,6 +14,11 @@ from app.classification.models import (
     ClassificationTaxonomy,
     DatasetSplit,
 )
+from app.classification.runtime import (
+    RuntimeArtifactPaths,
+    RuntimeClassifierConfig,
+    RuntimeSetFitClassifier,
+)
 
 __all__ = [
     "ClassificationDataset",
@@ -22,6 +27,9 @@ __all__ = [
     "ClassificationTaxonomy",
     "DatasetSplit",
     "MultiLabelEncoder",
+    "RuntimeArtifactPaths",
+    "RuntimeClassifierConfig",
+    "RuntimeSetFitClassifier",
     "load_classification_dataset",
     "load_classification_taxonomy",
     "normalize_example_text",
