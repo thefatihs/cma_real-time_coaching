@@ -276,3 +276,25 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Gelecek ayri bir gorevde SetFit egitim ve degerlendirme
   akisinin tasarlanmasi.
+
+## 35. Genel Multi-Label SetFit Baseline Temeli
+
+- `common_turkish_setfit_v1` icin sabit taksonomi sirali multi-hot encoding,
+  one-vs-rest SetFit egitim orchestration'i ve CPU CLI'i eklendi.
+- Train split'i fit, validation split'i gelistirme degerlendirmesi icin
+  kullanilir; test split'i egitim factory'sine aktarilmaz.
+- Threshold ve `no_action` dislayiciligi sonrasi micro/macro ve etiket bazli
+  metrikler, exact match, hamming loss ve ortalama inference suresi eklendi.
+- Checksum, parametre, split sayimi, zaman ve cozulmus paket surumlerini tutan
+  metinsiz metadata ile guvenli JSON degerlendirme raporu eklendi.
+- SetFit, scikit-learn ve uyumlu Transformers siniri `uv` ile eklendi; model
+  indirilmedi veya egitilmedi.
+- Degisen dosyalar: `app/classification/`, `scripts/train_setfit_baseline.py`,
+  `scripts/evaluate_setfit_model.py`, `tests/test_classification_encoding.py`,
+  `tests/test_classification_evaluation.py`,
+  `tests/test_classification_artifacts.py`, `pyproject.toml`, `uv.lock`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused 29 passed; full 296 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Baseline'i yalnizca acikca onaylanan ayri bir calistirmada
+  egitip validation/test raporlarini karsilastirmak.

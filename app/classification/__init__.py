@@ -6,6 +6,7 @@ from app.classification.dataset import (
     load_classification_taxonomy,
     normalize_example_text,
 )
+from app.classification.encoding import MultiLabelEncoder, taxonomy_thresholds
 from app.classification.models import (
     ClassificationExample,
     ClassificationLabelDefinition,
@@ -19,7 +20,9 @@ __all__ = [
     "ClassificationLabelDefinition",
     "ClassificationTaxonomy",
     "DatasetSplit",
+    "MultiLabelEncoder",
     "load_classification_dataset",
     "load_classification_taxonomy",
     "normalize_example_text",
+    "taxonomy_thresholds",
 ]
