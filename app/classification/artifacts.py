@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from app.classification.evaluation import EvaluationMetrics
 
-MODEL_ID = "common_turkish_setfit_v1"
+MODEL_ID = "common_turkish_setfit_v2"
 DEFAULT_BACKBONE = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 METADATA_FILENAME = "training_metadata.json"
 LABEL_ORDER_FILENAME = "label_order.json"

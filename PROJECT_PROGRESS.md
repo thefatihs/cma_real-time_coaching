@@ -279,7 +279,7 @@ Tarih: 22 Temmuz 2026
 
 ## 35. Genel Multi-Label SetFit Baseline Temeli
 
-- `common_turkish_setfit_v1` icin sabit taksonomi sirali multi-hot encoding,
+- `common_turkish_setfit_v2` icin sabit taksonomi sirali multi-hot encoding,
   one-vs-rest SetFit egitim orchestration'i ve CPU CLI'i eklendi.
 - Train split'i fit, validation split'i gelistirme degerlendirmesi icin
   kullanilir; test split'i egitim factory'sine aktarilmaz.
@@ -319,3 +319,23 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Ayrica onaylanan bir calismada yalnizca validation
   probability diagnostiklerini incelemek.
+
+## 37. Validation-Only Threshold Kalibrasyon Temeli
+
+- Her label icin validation probability'lerinde sinirli ve deterministik threshold
+  aramasi eklendi; normal label'lar F1, kritik label'lar recall hedefiyle secilir.
+- `cancellation_request`, `churn_risk` ve `complaint` icin recall 0.70 hedefi ve
+  hedefe ulasilamazsa recall/precision fallback politikasi uygulandi.
+- `no_action` ayri kalibre edilir, mevcut dislayicilik korunur ve business label
+  ile `no_action` birlikte esik alti kalan ornek sayisi raporlanir.
+- Metin veya tekil tahmin icermeyen before/after metric, checksum, threshold ve
+  calibration configuration JSON raporu ile validation-only CLI eklendi.
+- Expanded-dataset model kimligi `common_turkish_setfit_v2` olarak duzeltildi;
+  rapor model ID'sini artifact metadata'dan aynen korur.
+- Degisen dosyalar: `app/classification/calibration.py`,
+  `app/classification/artifacts.py`, `scripts/calibrate_setfit_thresholds.py`,
+  `tests/test_classification_calibration.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 21 passed; full 307 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Egitilmis v2 artifact ile yalnizca validation
+  kalibrasyonunu ayrica onaylanan bir calismada calistirmak.
