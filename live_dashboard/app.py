@@ -151,13 +151,17 @@ def _render_representative(
         st.subheader("Anlık Koçluk")
         if representative.intent_chips:
             chips = " ".join(
-                f'<span class="chip">{chip.symbol} {chip.text} · {chip.score}</span>'
+                f'<span class="chip">{chip.symbol} {chip.text}</span>'
                 for chip in representative.intent_chips
             )
             st.markdown(chips, unsafe_allow_html=True)
         else:
             st.caption("Aktif niyet veya risk bulunmuyor.")
         feedback = st.session_state.setdefault("suggestion_feedback", {})
+        for message in representative.safe_messages:
+            st.warning(message)
+        if not representative.suggestions:
+            st.info(representative.empty_suggestion_message)
         for index, card in enumerate(representative.suggestions):
             key = f"{card.timestamp}-{card.title}-{index}"
             with st.container(border=True):
@@ -165,7 +169,15 @@ def _render_representative(
                     f"**{card.priority_symbol} {card.priority_text} · {card.title}**"
                 )
                 st.write(card.suggestion)
-                details = [f"Aksiyon: {card.action}", f"Saat: {card.timestamp}"]
+                details = [
+                    f"Öncelik: {card.priority_text}",
+                    f"Aksiyon: {card.action}",
+                    f"Kaynak: {card.source}",
+                    f"Saat: {card.timestamp}",
+                    "Durum: Yeni" if card.is_new else "Durum: Daha önce gösterildi",
+                ]
+                if card.transcript_revision is not None:
+                    details.append(f"Revizyon: {card.transcript_revision}")
                 if card.related_label:
                     details.append(f"Etiket: {card.related_label}")
                 if card.evidence_ids:
@@ -228,10 +240,23 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         "active": "Aktif",
         "simulated": "Simüle",
         "not implemented": "Uygulanmadı",
+        "disabled": "Devre dışı",
         "failed": "Başarısız",
     }
     for component, status in technical.pipeline_statuses:
         st.write(f"**{component}:** {translations[status]}")
+    if technical.classification_metadata:
+        st.subheader("Sınıflandırma")
+        for label, value in technical.classification_metadata:
+            st.write(f"**{label}:** {value}")
+    if technical.probabilities:
+        st.caption("Geçici etiket olasılıkları")
+        for label, value in technical.probabilities:
+            st.write(f"{label}: {value:.3f}")
+    if technical.coaching_metadata:
+        st.subheader("Koçluk")
+        for label, value in technical.coaching_metadata:
+            st.write(f"**{label}:** {value}")
 
 
 def _render_result(runtime: DashboardRuntime, view: DashboardTabsViewModel) -> None:

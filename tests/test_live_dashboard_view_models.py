@@ -1,9 +1,28 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from app.events.models import TranscriptEvent, TranscriptKind
+from app.classification.streaming import (
+    ClassificationProcessingStatus,
+    StableClassificationOutcome,
+)
+from app.coaching.coordinator import (
+    CoachingCoordinatorResult,
+    CoachingProcessingStatus,
+    StableCoachingOutcome,
+)
+from app.events.models import (
+    ClassificationLabel,
+    ClassificationResultEvent,
+    CoachingAction,
+    CoachingSuggestionEvent,
+    CoachingSuggestionSource,
+    SuggestionPriority,
+    TranscriptEvent,
+    TranscriptKind,
+)
 from app.streaming.pipeline import (
     StreamingASRPlan,
     StreamingASRResult,
@@ -22,12 +41,14 @@ from live_dashboard.view_models import (
     dashboard_tabs,
     execute_local_once,
     intent_chips,
+    intent_label,
     ordered_suggestions,
     progress_view,
     reset_runtime,
     reset_local_execution,
     responsive_rows,
     status_cards,
+    suggestion_card,
     suppression_reason_display,
     transcript_view,
 )
@@ -159,6 +180,49 @@ def fake_pipeline_result() -> StreamingASRResult:
         TranscriptKind.STABLE, 2, "Aboneliğimi iptal etmek istiyorum."
     )
     final = pipeline_event(TranscriptKind.FINAL, 3, "İşlem bilgisini aldım.")
+    classification = ClassificationResultEvent(
+        tenant_id="tenant_alpha",
+        call_id="local-call",
+        transcript_event_id=stable.event_id,
+        labels=[ClassificationLabel(name="ayrilma_talebi", score=0.9)],
+        action=CoachingAction.TEMPLATE_ACTION,
+        model_id="common_turkish_setfit_v2",
+        threshold_profile_id="common_turkish_setfit_v2:calibrated:v1",
+        probabilities={"ayrilma_talebi": 0.9},
+        thresholds={"ayrilma_talebi": 0.7},
+        processing_time_ms=4.0,
+        created_at_utc=stable.created_at_utc,
+    )
+    suggestion = CoachingSuggestionEvent(
+        tenant_id="tenant_alpha",
+        call_id="local-call",
+        suggestion_id="live-suggestion-1",
+        source_transcript_event_id=stable.event_id,
+        action=CoachingAction.TEMPLATE_ACTION,
+        priority=SuggestionPriority.HIGH,
+        source=CoachingSuggestionSource.BOTH,
+        title="İptal talebini doğrulayın",
+        suggestion="Müşterinin iptal talebini açıkça doğrulayın.",
+        created_at_utc=stable.created_at_utc,
+    )
+    classification_outcome = StableClassificationOutcome(
+        status=ClassificationProcessingStatus.CLASSIFIED,
+        transcript_revision=stable.revision,
+        source_sequence=None,
+        classification_event=classification,
+    )
+    coaching_outcome = StableCoachingOutcome(
+        status=CoachingProcessingStatus.PROCESSED,
+        transcript_revision=stable.revision,
+        result=CoachingCoordinatorResult(
+            classification_event=classification,
+            displayed_suggestions=(suggestion,),
+            suppressed_suggestions=(),
+            matched_rule_ids=("cancel-rule",),
+            suppression_reasons=(),
+            transcript_revision=stable.revision,
+        ),
+    )
     steps = (
         StreamingASRStep(
             tenant_id="tenant_alpha",
@@ -189,6 +253,8 @@ def fake_pipeline_result() -> StreamingASRResult:
             stable_transcript=stable.text,
             partial_transcript="",
             transcription_time_seconds=0.3,
+            classification_outcomes=(classification_outcome,),
+            coaching_outcomes=(coaching_outcome,),
         ),
     )
     return StreamingASRResult(
@@ -200,12 +266,15 @@ def fake_pipeline_result() -> StreamingASRResult:
         partial_transcript="",
         total_chunks=2,
         audio_duration_seconds=2.0,
+        classification_outcomes=(classification_outcome,),
+        coaching_outcomes=(coaching_outcome,),
     )
 
 
 class FakePipeline:
-    def __init__(self) -> None:
+    def __init__(self, result: StreamingASRResult | None = None) -> None:
         self.calls = 0
+        self.result = result or fake_pipeline_result()
 
     def run(
         self,
@@ -216,7 +285,7 @@ class FakePipeline:
         plan_callback=None,
     ):
         self.calls += 1
-        result = fake_pipeline_result()
+        result = self.result
         if plan_callback is not None:
             plan_callback(
                 StreamingASRPlan(
@@ -259,7 +328,7 @@ def test_local_results_update_transcript_coaching_and_latency() -> None:
     )
     assert state.runtime.call_state.partial_transcript == ""
     assert "İşlem bilgisini aldım." in state.runtime.call_state.stable_transcript
-    assert state.runtime.latest_labels == ()
+    assert [label.name for label in state.runtime.latest_labels] == ["ayrilma_talebi"]
     assert len(state.runtime.suggestions) == 1
     assert state.runtime.latency is not None
     assert state.runtime.latency.asr_ms == 300
@@ -436,3 +505,139 @@ def test_tab_models_expose_no_audio_bytes_or_private_paths() -> None:
     rendered = repr(dashboard_tabs(subject))
     assert "audio_bytes" not in rendered
     assert "CallMetricPrivate" not in rendered
+
+
+def test_general_setfit_labels_have_required_turkish_names() -> None:
+    assert {
+        label: intent_label(label)
+        for label in (
+            "product_information",
+            "price_objection",
+            "cancellation_request",
+            "technical_issue",
+            "complaint",
+            "renewal_interest",
+            "churn_risk",
+            "no_action",
+        )
+    } == {
+        "product_information": "Ürün Bilgisi",
+        "price_objection": "Fiyat İtirazı",
+        "cancellation_request": "İptal Talebi",
+        "technical_issue": "Teknik Sorun",
+        "complaint": "Şikâyet",
+        "renewal_interest": "Yenileme İlgisi",
+        "churn_risk": "Müşteri Kaybı Riski",
+        "no_action": "Aksiyon Gerekmiyor",
+    }
+
+
+@pytest.mark.parametrize(
+    ("source", "display"),
+    [
+        (CoachingSuggestionSource.RULE, "Kural"),
+        (CoachingSuggestionSource.CLASSIFICATION, "Sınıflandırma"),
+        (CoachingSuggestionSource.BOTH, "Kural + sınıflandırma"),
+    ],
+)
+def test_suggestion_card_shows_priority_action_and_provenance(
+    source: CoachingSuggestionSource, display: str
+) -> None:
+    event = fake_pipeline_result().coaching_outcomes[0].result
+    assert event is not None
+    source_event = event.displayed_suggestions[0].model_copy(update={"source": source})
+    card = suggestion_card(source_event, transcript_revision=2)
+    assert (card.priority_text, card.action, card.source) == (
+        "HIGH",
+        "Hazır öneri",
+        display,
+    )
+    assert card.transcript_revision == 2
+    assert card.is_new
+
+
+def test_live_outcomes_are_deduplicated_and_technical_metadata_is_separated() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(state, FakePipeline(), Path("synthetic.wav"))
+    tabs = dashboard_tabs(state.runtime, state)
+    assert len(tabs.representative.suggestions) == 1
+    assert "common_turkish_setfit_v2" not in repr(tabs.representative)
+    assert "0.9" not in repr(tabs.representative)
+    assert ("Model", "common_turkish_setfit_v2") in (
+        tabs.technical.classification_metadata
+    )
+    assert tabs.technical.probabilities == (("ayrilma_talebi", 0.9),)
+    assert tabs.technical.rtf
+    assert tabs.technical.last_asr == "300 ms"
+
+
+def test_disabled_modes_show_calm_empty_state() -> None:
+    disabled_result = replace(
+        fake_pipeline_result(),
+        classification_outcomes=(),
+        coaching_outcomes=(),
+        steps=tuple(
+            replace(step, classification_outcomes=(), coaching_outcomes=())
+            for step in fake_pipeline_result().steps
+        ),
+    )
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(state, FakePipeline(disabled_result), Path("synthetic.wav"))
+    tabs = dashboard_tabs(state.runtime, state)
+    assert tabs.representative.suggestions == ()
+    assert (
+        tabs.representative.empty_suggestion_message
+        == "Şu anda gösterilecek yeni bir koçluk önerisi yok."
+    )
+    assert ("SetFit", "disabled") in tabs.technical.pipeline_statuses
+    assert ("Coaching", "disabled") in tabs.technical.pipeline_statuses
+
+
+def test_failure_outcomes_are_safe_and_do_not_expose_transcript_or_paths(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    base = fake_pipeline_result()
+    classification_failure = StableClassificationOutcome(
+        status=ClassificationProcessingStatus.FAILED,
+        transcript_revision=2,
+        source_sequence=None,
+    )
+    coaching_failure = StableCoachingOutcome(
+        status=CoachingProcessingStatus.FAILED,
+        transcript_revision=2,
+        error_type="RuntimeError",
+        error_code="coaching_failed",
+    )
+    failed = replace(
+        base,
+        classification_outcomes=(classification_failure,),
+        coaching_outcomes=(coaching_failure,),
+        steps=tuple(
+            replace(
+                step,
+                classification_outcomes=(
+                    (classification_failure,) if step.sequence_number == 1 else ()
+                ),
+                coaching_outcomes=(
+                    (coaching_failure,) if step.sequence_number == 1 else ()
+                ),
+            )
+            for step in base.steps
+        ),
+    )
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(
+        state,
+        FakePipeline(failed),
+        Path("C:/CallMetricPrivate/never-render-this.wav"),
+    )
+    tabs = dashboard_tabs(state.runtime, state)
+    assert len(tabs.representative.safe_messages) == 2
+    rendered = repr(tabs)
+    assert "RuntimeError" not in rendered
+    assert "CallMetricPrivate" not in rendered
+    assert "never-render-this" not in rendered
+    assert "Aboneliğimi iptal etmek istiyorum." not in caplog.text

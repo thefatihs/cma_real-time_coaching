@@ -1,7 +1,7 @@
 """Streamlit-independent state and formatting for the live dashboard demo."""
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from itertools import count
 from pathlib import Path
@@ -9,11 +9,21 @@ from time import perf_counter
 from typing import Protocol
 
 from app.calls.models import CallState
-from app.coaching.coordinator import CoachingCoordinator, CoachingCoordinatorResult
+from app.classification.streaming import (
+    ClassificationProcessingStatus,
+    StableClassificationOutcome,
+)
+from app.coaching.coordinator import (
+    CoachingCoordinator,
+    CoachingCoordinatorResult,
+    CoachingProcessingStatus,
+    StableCoachingOutcome,
+)
 from app.coaching.rule_engine import RuleBasedCoachingEngine
 from app.events.models import (
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
@@ -46,6 +56,14 @@ ACTION_LABELS = {
     CoachingAction.ESCALATE: "Yetkiliye aktar",
 }
 INTENT_LABELS = {
+    "product_information": "Ürün Bilgisi",
+    "price_objection": "Fiyat İtirazı",
+    "cancellation_request": "İptal Talebi",
+    "technical_issue": "Teknik Sorun",
+    "complaint": "Şikâyet",
+    "renewal_interest": "Yenileme İlgisi",
+    "churn_risk": "Müşteri Kaybı Riski",
+    "no_action": "Aksiyon Gerekmiyor",
     "urun_bilgisi": "Ürün bilgisi",
     "paket_sorusu": "Ürün bilgisi",
     "fiyat_itirazi": "Fiyat itirazı",
@@ -54,6 +72,11 @@ INTENT_LABELS = {
     "ayrilma_talebi": "İptal riski",
     "kritik_eskalasyon": "Kritik risk",
     "yonetici_aktarimi": "Kritik risk",
+}
+SOURCE_LABELS = {
+    CoachingSuggestionSource.RULE: "Kural",
+    CoachingSuggestionSource.CLASSIFICATION: "Sınıflandırma",
+    CoachingSuggestionSource.BOTH: "Kural + sınıflandırma",
 }
 PRIORITY_SYMBOLS = {
     SuggestionPriority.LOW: "○",
@@ -91,6 +114,7 @@ class LabelViewModel:
 
 @dataclass(frozen=True, slots=True)
 class SuggestionCardViewModel:
+    suggestion_id: str
     priority: SuggestionPriority
     priority_text: str
     title: str
@@ -100,6 +124,9 @@ class SuggestionCardViewModel:
     related_label: str | None
     evidence_ids: tuple[str, ...]
     priority_symbol: str
+    source: str
+    transcript_revision: int | None
+    is_new: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +182,8 @@ class RepresentativeTabViewModel:
     suggestions: tuple[SuggestionCardViewModel, ...]
     intent_chips: tuple[IntentChipViewModel, ...]
     suppressed_count: int
+    empty_suggestion_message: str
+    safe_messages: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +197,9 @@ class TechnicalTabViewModel:
     last_asr: str
     warning: str | None
     error: str | None
+    classification_metadata: tuple[tuple[str, str], ...] = ()
+    probabilities: tuple[tuple[str, float], ...] = ()
+    coaching_metadata: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +239,12 @@ class DashboardRuntime:
     suppression_reasons: list[str] = field(default_factory=list)
     latency: LatencyViewModel | None = None
     detected_label_names: list[str] = field(default_factory=list)
+    classification_probabilities: dict[str, float] = field(default_factory=dict)
+    classification_failure: bool = False
+    coaching_failure: bool = False
+    consumed_suggestion_ids: set[str] = field(default_factory=set)
+    consumed_classification_event_ids: set[str] = field(default_factory=set)
+    consumed_coaching_revisions: set[int] = field(default_factory=set)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -399,9 +437,13 @@ def transcript_view(runtime: DashboardRuntime) -> TranscriptViewModel:
 
 
 def suggestion_card(
-    event: CoachingSuggestionEvent, related_label: str | None = None
+    event: CoachingSuggestionEvent,
+    related_label: str | None = None,
+    *,
+    transcript_revision: int | None = None,
 ) -> SuggestionCardViewModel:
     return SuggestionCardViewModel(
+        event.suggestion_id,
         event.priority,
         event.priority.value,
         event.title,
@@ -411,6 +453,9 @@ def suggestion_card(
         intent_label(related_label) if related_label else None,
         tuple(event.evidence_ids),
         PRIORITY_SYMBOLS[event.priority],
+        SOURCE_LABELS[event.source],
+        transcript_revision,
+        True,
     )
 
 
@@ -592,14 +637,47 @@ def dashboard_tabs(
         ),
         StatusCardViewModel("RTF", rtf),
     )
+    latest_transcript_revision = runtime.call_state.transcript_revision
+    representative_suggestions = tuple(
+        replace(
+            card,
+            is_new=(
+                card.transcript_revision is not None
+                and card.transcript_revision == latest_transcript_revision
+            ),
+        )
+        for card in ordered_suggestions(runtime.suggestions)
+    )
+    safe_messages = tuple(
+        message
+        for active, message in (
+            (
+                runtime.classification_failure,
+                "Sınıflandırma şu anda kullanılamıyor; ses akışı devam ediyor.",
+            ),
+            (
+                runtime.coaching_failure,
+                "Koçluk önerileri şu anda güncellenemiyor; ses akışı devam ediyor.",
+            ),
+        )
+        if active
+    )
+    classification_metadata = runtime.call_state.classification_metadata()
+    coaching_metadata = (
+        runtime.call_state.coaching_suggestions[-1]
+        if runtime.call_state.coaching_suggestions
+        else None
+    )
     return DashboardTabsViewModel(
         representative=RepresentativeTabViewModel(
             status=status,
             progress=progress,
             transcript=transcript_view(runtime),
-            suggestions=tuple(ordered_suggestions(runtime.suggestions)),
+            suggestions=representative_suggestions,
             intent_chips=chips,
             suppressed_count=len(runtime.suppression_reasons),
+            empty_suggestion_message="Şu anda gösterilecek yeni bir koçluk önerisi yok.",
+            safe_messages=safe_messages,
         ),
         technical=TechnicalTabViewModel(
             progress=progress,
@@ -615,7 +693,22 @@ def dashboard_tabs(
                     else "simulated",
                 ),
                 ("Rule Engine", "active"),
-                ("SetFit", "not implemented"),
+                (
+                    "SetFit",
+                    "failed"
+                    if runtime.classification_failure
+                    else "active"
+                    if classification_metadata.model_id is not None
+                    else "disabled",
+                ),
+                (
+                    "Coaching",
+                    "failed"
+                    if runtime.coaching_failure
+                    else "active"
+                    if runtime.call_state.coaching_suggestions
+                    else "disabled",
+                ),
                 ("RAG", "not implemented"),
                 ("LLM", "not implemented"),
             ),
@@ -626,6 +719,43 @@ def dashboard_tabs(
                 "CPU çıkarımı gerçek zamandan yavaş olabilir." if local_mode else None
             ),
             error=local_state.error_message if local_state else None,
+            classification_metadata=tuple(
+                (label, value)
+                for label, value in (
+                    ("Model", classification_metadata.model_id),
+                    (
+                        "Threshold profili",
+                        classification_metadata.threshold_profile_id,
+                    ),
+                    (
+                        "Transcript revision",
+                        (
+                            str(classification_metadata.transcript_revision)
+                            if classification_metadata.transcript_revision is not None
+                            else None
+                        ),
+                    ),
+                    (
+                        "Inference",
+                        (
+                            f"{classification_metadata.inference_time_ms:.2f} ms"
+                            if classification_metadata.inference_time_ms is not None
+                            else None
+                        ),
+                    ),
+                )
+                if value is not None
+            ),
+            probabilities=tuple(sorted(runtime.classification_probabilities.items())),
+            coaching_metadata=(
+                ()
+                if coaching_metadata is None
+                else (
+                    ("Öneri ID", coaching_metadata.suggestion_id),
+                    ("Kaynak", SOURCE_LABELS[coaching_metadata.source]),
+                    ("Transcript revision", str(coaching_metadata.transcript_revision)),
+                )
+            ),
         ),
         result=CallResultTabViewModel(
             completed=complete,
@@ -690,14 +820,22 @@ def _consume_pipeline_result(
             "Pipeline result tenant_id or call_id does not match dashboard"
         )
     if result.final_event is not None:
-        _apply_transcript_event(runtime, result.final_event)
+        _apply_transcript_event(runtime, result.final_event, run_demo_coaching=False)
+    for outcome in result.classification_outcomes:
+        _consume_classification_outcome(runtime, outcome)
+    for outcome in result.coaching_outcomes:
+        _consume_coaching_outcome(runtime, outcome)
     state.total_chunks = result.total_chunks
     state.current_chunk = result.total_chunks
 
 
 def _consume_step(state: LocalExecutionState, step: StreamingASRStep) -> None:
     for event in step.transcript_events:
-        _apply_transcript_event(state.runtime, event)
+        _apply_transcript_event(state.runtime, event, run_demo_coaching=False)
+    for outcome in step.classification_outcomes:
+        _consume_classification_outcome(state.runtime, outcome)
+    for outcome in step.coaching_outcomes:
+        _consume_coaching_outcome(state.runtime, outcome)
     rule_ms = 1.0
     coaching_ms = 1.0
     state.runtime.latency = LatencyViewModel(
@@ -710,15 +848,84 @@ def _consume_step(state: LocalExecutionState, step: StreamingASRStep) -> None:
     state.asr_window_ms.append(step.transcription_time_seconds * 1000)
 
 
-def _apply_transcript_event(runtime: DashboardRuntime, event: TranscriptEvent) -> None:
+def _apply_transcript_event(
+    runtime: DashboardRuntime,
+    event: TranscriptEvent,
+    *,
+    run_demo_coaching: bool = True,
+) -> None:
     runtime.latest_event = event
     runtime.call_state.apply_transcript(event)
     runtime.timeline.append(
         TimelineItem(event.created_at_utc, "Transkript", event.kind.value)
     )
-    result = runtime.coordinator.process(event, event.end_seconds)
-    _apply_coaching_result(runtime, result, event)
+    if run_demo_coaching:
+        result = runtime.coordinator.process(event, event.end_seconds)
+        _apply_coaching_result(runtime, result, event)
     runtime.timeline.sort(key=lambda item: item.timestamp)
+
+
+def _consume_classification_outcome(
+    runtime: DashboardRuntime, outcome: StableClassificationOutcome
+) -> None:
+    if outcome.status is ClassificationProcessingStatus.FAILED:
+        runtime.classification_failure = True
+        return
+    classification = outcome.classification_event
+    if (
+        classification is None
+        or classification.transcript_event_id
+        in runtime.consumed_classification_event_ids
+    ):
+        return
+    runtime.consumed_classification_event_ids.add(classification.transcript_event_id)
+    runtime.classification_failure = False
+    runtime.latest_action = classification.action
+    runtime.latest_labels = tuple(
+        LabelViewModel(
+            label.name,
+            "",
+            label.name in {"cancellation_request", "complaint", "churn_risk"},
+        )
+        for label in classification.labels
+    )
+    runtime.classification_probabilities = dict(classification.probabilities)
+    runtime.call_state.apply_classification(
+        classification,
+        transcript_revision=outcome.transcript_revision or 0,
+        source_sequence=outcome.source_sequence,
+    )
+    for label in classification.labels:
+        if label.name not in runtime.detected_label_names:
+            runtime.detected_label_names.append(label.name)
+    runtime.timeline.append(
+        TimelineItem(
+            classification.created_at_utc,
+            "Sınıflandırma",
+            ", ".join(label.name for label in classification.labels),
+        )
+    )
+
+
+def _consume_coaching_outcome(
+    runtime: DashboardRuntime, outcome: StableCoachingOutcome
+) -> None:
+    if outcome.status is CoachingProcessingStatus.FAILED:
+        runtime.coaching_failure = True
+        return
+    if (
+        outcome.result is None
+        or outcome.transcript_revision in runtime.consumed_coaching_revisions
+    ):
+        return
+    runtime.consumed_coaching_revisions.add(outcome.transcript_revision)
+    runtime.coaching_failure = False
+    _apply_coaching_result(
+        runtime,
+        outcome.result,
+        runtime.latest_event,
+        apply_state_metadata=True,
+    )
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -735,10 +942,14 @@ def _human_duration(seconds: float) -> str:
 
 
 def _apply_coaching_result(
-    runtime: DashboardRuntime, result: CoachingCoordinatorResult, event: TranscriptEvent
+    runtime: DashboardRuntime,
+    result: CoachingCoordinatorResult,
+    event: TranscriptEvent | None,
+    *,
+    apply_state_metadata: bool = False,
 ) -> None:
     classification = result.classification_event
-    if classification is not None:
+    if classification is not None and not apply_state_metadata:
         runtime.latest_action = classification.action
         runtime.latest_labels = tuple(
             LabelViewModel(
@@ -760,13 +971,21 @@ def _apply_coaching_result(
                 ", ".join(label.name for label in classification.labels),
             )
         )
-    elif event.kind is not TranscriptKind.PARTIAL:
+    elif (
+        classification is None
+        and event is not None
+        and event.kind is not TranscriptKind.PARTIAL
+        and not apply_state_metadata
+    ):
         runtime.latest_action = CoachingAction.NO_ACTION
         runtime.latest_labels = ()
     classification_labels = (
         [label.name for label in classification.labels] if classification else []
     )
     for index, item in enumerate(result.displayed_suggestions):
+        if item.suggestion_id in runtime.consumed_suggestion_ids:
+            continue
+        runtime.consumed_suggestion_ids.add(item.suggestion_id)
         related_label = (
             classification_labels[index]
             if index < len(classification_labels)
@@ -774,7 +993,23 @@ def _apply_coaching_result(
             if classification_labels
             else None
         )
-        runtime.suggestions.append(suggestion_card(item, related_label))
+        runtime.suggestions.append(
+            suggestion_card(
+                item,
+                related_label,
+                transcript_revision=result.transcript_revision,
+            )
+        )
+        if apply_state_metadata:
+            runtime.call_state.mark_suggestion_shown(item.suggestion_id)
+            runtime.call_state.apply_coaching_suggestion(
+                item,
+                transcript_revision=result.transcript_revision or 0,
+                model_id=classification.model_id if classification else None,
+                threshold_profile_id=(
+                    classification.threshold_profile_id if classification else None
+                ),
+            )
         runtime.timeline.append(
             TimelineItem(item.created_at_utc, "Öneri gösterildi", item.title)
         )

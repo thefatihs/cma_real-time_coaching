@@ -426,3 +426,24 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Coaching metadata'sini ayri bir gorevde sunum katmanina
   guvenli bir view-model ile aktarmak.
+
+## 42. Live Dashboard Classification ve Coaching Sunumu
+
+- Yerel dashboard akisi pipeline'in transient classification/coaching
+  outcome'larini dogrudan tuketir; inference veya coaching kurallarini yeniden
+  calistirmaz, sentetik demo davranisi korunur.
+- Kesinlesen ve partial transcript ayri sunulur; sekiz SetFit etiketi istenen
+  Turkce adlarla, coaching kartlari priority/action/provenance/revision ve
+  yeni-gosterildi durumuyla temsilci gorunumune aktarilir.
+- Suggestion ID bazli tekrar engelleme, sakin bos durum ve classification/coaching
+  hata mesajlari eklendi; audio akisi ve mevcut ilerleme/ETA/RTF/ASR metrikleri
+  korunur.
+- Model/profile/revision/inference ve transient probability degerleri yalnizca
+  teknik izleme modelindedir; temsilci gorunumunde ham probability bulunmaz.
+- Degisen dosyalar: `live_dashboard/view_models.py`, `live_dashboard/app.py`,
+  `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused dashboard 34 passed; full 346 passed (1 dependency warning);
+  tum runtime sonuclari sentetik/mock'tur.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Canli UI entegrasyonunu kullanici kabul testiyle
+  dogrulamak.
