@@ -229,6 +229,14 @@ def _render_representative(
                         st.session_state.suggestion_feedback = feedback
                 if key in feedback:
                     st.caption(f"Geri bildirim: {feedback[key]}")
+        if representative.suggestion_history:
+            st.caption("Önceki Öneriler")
+            for card in representative.suggestion_history:
+                st.caption(
+                    f"{card.priority_symbol} {card.title} · "
+                    f"{card.related_label or '—'} · Revizyon "
+                    f"{card.transcript_revision if card.transcript_revision is not None else '—'}"
+                )
         st.caption(f"Bastırılan öneri sayısı: {representative.suppressed_count}")
 
 
@@ -314,6 +322,15 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
                 if evidence.threshold_profile_id:
                     details.append(f"profile={evidence.threshold_profile_id}")
                 st.caption(f"{evidence.label}: " + " · ".join(details))
+    if technical.suggestion_decisions:
+        st.subheader("Öneri Kapasite Kararları")
+        for decision in technical.suggestion_decisions:
+            st.write(
+                f"Revizyon {decision.transcript_revision} · "
+                f"{decision.label_id or '—'} · {decision.priority.value} · "
+                f"{decision.reason} · "
+                f"geçmişe taşındı={decision.moved_to_history}"
+            )
     if technical.coaching_metadata:
         st.subheader("Koçluk")
         for label, value in technical.coaching_metadata:

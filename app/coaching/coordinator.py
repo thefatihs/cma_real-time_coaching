@@ -9,6 +9,7 @@ from app.coaching.rule_engine import RuleBasedCoachingEngine
 from app.events.models import (
     ClassificationResultEvent,
     CoachingSuggestionEvent,
+    SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
 )
@@ -25,6 +26,17 @@ class CoachingCoordinatorResult:
     suppression_reasons: tuple[str, ...]
     transcript_revision: int | None = None
     current_revision_labels: tuple[str, ...] = ()
+    replaced_suggestion_ids: tuple[str, ...] = ()
+    suggestion_decisions: tuple["SafeSuggestionDecision", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SafeSuggestionDecision:
+    transcript_revision: int
+    label_id: str | None
+    priority: SuggestionPriority
+    reason: str
+    moved_to_history: bool
 
 
 class CoachingProcessingStatus(str, Enum):
@@ -113,6 +125,8 @@ class CoachingCoordinator:
         displayed: list[CoachingSuggestionEvent] = []
         suppressed: list[CoachingSuggestionEvent] = []
         reasons: list[str] = []
+        replaced_ids: list[str] = []
+        decisions: list[SafeSuggestionDecision] = []
         cooldown_available = self._call_state.can_trigger_coaching(
             current_seconds,
             self._tenant_config.coaching.cooldown_seconds,
@@ -140,17 +154,17 @@ class CoachingCoordinator:
             if fingerprint in self._displayed_fingerprints:
                 suppressed.append(suggestion)
                 reasons.append("duplicate")
+                decisions.append(
+                    _decision(suggestion, event.revision, "duplicate", False)
+                )
             elif not cooldown_available:
                 suppressed.append(suggestion)
                 reasons.append("cooldown")
-            elif len(displayed) >= maximum:
-                suppressed.append(suggestion)
-                reasons.append("max_active_suggestions")
+                decisions.append(
+                    _decision(suggestion, event.revision, "cooldown", False)
+                )
             else:
-                displayed.append(suggestion)
-                self._displayed_fingerprints.add(fingerprint)
-                self._call_state.mark_suggestion_shown(suggestion.suggestion_id)
-                self._call_state.apply_coaching_suggestion(
+                admitted, replaced = self._call_state.admit_coaching_suggestion(
                     suggestion,
                     transcript_revision=event.revision,
                     model_id=(
@@ -163,7 +177,34 @@ class CoachingCoordinator:
                         if classification_event is not None
                         else None
                     ),
+                    maximum_active_suggestions=maximum,
                 )
+                if not admitted:
+                    suppressed.append(suggestion)
+                    reasons.append("max_active_suggestions")
+                    decisions.append(
+                        _decision(
+                            suggestion,
+                            event.revision,
+                            "active_capacity",
+                            False,
+                        )
+                    )
+                    continue
+                displayed.append(suggestion)
+                self._displayed_fingerprints.add(fingerprint)
+                self._call_state.mark_suggestion_shown(suggestion.suggestion_id)
+                if replaced is not None:
+                    replaced_ids.append(replaced.suggestion_id)
+                    decisions.append(
+                        SafeSuggestionDecision(
+                            transcript_revision=replaced.transcript_revision,
+                            label_id=replaced.label_id,
+                            priority=replaced.priority,
+                            reason="replaced_by_higher_rank",
+                            moved_to_history=True,
+                        )
+                    )
 
         if displayed:
             self._call_state.mark_coaching_triggered(current_seconds)
@@ -176,6 +217,8 @@ class CoachingCoordinator:
             suppression_reasons=tuple(reasons),
             transcript_revision=event.revision,
             current_revision_labels=tuple(labels),
+            replaced_suggestion_ids=tuple(replaced_ids),
+            suggestion_decisions=tuple(decisions),
         )
 
     def process_safely(
@@ -226,6 +269,11 @@ class CoachingCoordinator:
             )
 
     def clear(self) -> None:
+        self._call_state.coaching_suggestion_history = [
+            *self._call_state.coaching_suggestion_history,
+            *self._call_state.active_coaching_suggestions,
+        ]
+        self._call_state.active_coaching_suggestions = []
         self._displayed_fingerprints.clear()
         self._processed_revisions.clear()
 
@@ -238,4 +286,19 @@ def _suggestion_fingerprint(
         suggestion.title,
         suggestion.suggestion,
         tuple(suggestion.evidence_ids),
+    )
+
+
+def _decision(
+    suggestion: CoachingSuggestionEvent,
+    transcript_revision: int,
+    reason: str,
+    moved_to_history: bool,
+) -> SafeSuggestionDecision:
+    return SafeSuggestionDecision(
+        transcript_revision=transcript_revision,
+        label_id=suggestion.label_id,
+        priority=suggestion.priority,
+        reason=reason,
+        moved_to_history=moved_to_history,
     )

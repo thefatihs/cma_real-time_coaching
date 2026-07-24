@@ -655,3 +655,30 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Gercek uzun cagri smoke testinde delta/context
   contribution ile product ve technical recovery'yi dogrulamak.
+
+## 52. Priority-Aware Active Coaching ve Suggestion History
+
+- CallState coaching kartlarini aktif oneriler ve daha once gosterilmis/gecmise
+  tasinmis oneriler olarak ayirir; gosterilen tum kartlar history kaydinda
+  kaybolmadan korunur.
+- Aktif kapasite doluyken admission sirasi priority/severity, current revision
+  ve stabil display order ile belirlenir; yeni current HIGH
+  cancellation/churn kartlari eski esit veya dusuk rank'li kartlari degistirir.
+- Replacement eski karti silmez, history'ye tasir; duplicate fingerprint,
+  cooldown ve yalnizca current evidence'tan coaching uretme davranislari
+  korunur.
+- Representative Anlik Kocluk aktif kartlari once, kompakt Onceki Oneriler
+  history'sini sonra gosterir; internal/evidence ID'leri gostermez.
+- Technical Monitoring yalnizca revision, canonical label, priority,
+  suppression/replacement reason ve history durumunu iceren guvenli karar
+  metadata'si gosterir.
+- Degisen dosyalar: `app/calls/models.py`, `app/coaching/coordinator.py`,
+  `live_dashboard/view_models.py`, `live_dashboard/app.py`,
+  `tests/test_coaching_coordinator.py`,
+  `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 170 passed; full 408 passed (1 dependency warning);
+  gercek model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gercek uzun cagri smoke testinde final
+  cancellation/churn kartlarinin aktif, price/complaint kartlarinin history
+  bolumunde oldugunu dogrulamak.

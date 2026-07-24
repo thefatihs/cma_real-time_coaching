@@ -452,3 +452,99 @@ def test_accumulated_old_label_does_not_trigger_new_coaching() -> None:
     assert [item.label for item in state.detected_labels] == ["complaint"]
     assert result.displayed_suggestions == ()
     assert result.suppressed_suggestions == ()
+
+
+def test_long_call_current_critical_suggestions_replace_older_active_cards() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0, maximum=2))
+    price = subject.process(
+        event(text="Bu ücret çok pahalı.", revision=1),
+        1.0,
+        classification_event=classification("price_objection"),
+        active_labels=("price_objection",),
+    )
+    complaint = subject.process(
+        event(event_id="transcript_2", text="Şikayetçiyim.", revision=2),
+        2.0,
+        classification_event=classification("complaint").model_copy(
+            update={"transcript_event_id": "transcript_2"}
+        ),
+        active_labels=("complaint",),
+    )
+    final = subject.process(
+        event(
+            event_id="transcript_3",
+            text=EXACT_CANCELLATION,
+            revision=3,
+        ),
+        3.0,
+        classification_event=classification(
+            "churn_risk", "cancellation_request"
+        ).model_copy(update={"transcript_event_id": "transcript_3"}),
+        active_labels=("churn_risk", "cancellation_request"),
+    )
+
+    assert price.displayed_suggestions[0].label_id == "price_objection"
+    assert complaint.displayed_suggestions[0].label_id == "complaint"
+    assert {item.label_id for item in state.active_coaching_suggestions} == {
+        "churn_risk",
+        "cancellation_request",
+    }
+    assert {item.label_id for item in state.coaching_suggestion_history} == {
+        "price_objection",
+        "complaint",
+    }
+    assert len(final.displayed_suggestions) == 2
+    assert len(final.replaced_suggestion_ids) == 2
+    assert all(
+        decision.reason == "replaced_by_higher_rank" and decision.moved_to_history
+        for decision in final.suggestion_decisions
+    )
+    assert (
+        next(
+            item
+            for item in final.displayed_suggestions
+            if item.label_id == "cancellation_request"
+        ).source
+        is CoachingSuggestionSource.BOTH
+    )
+
+
+def test_current_high_suggestion_replaces_older_lower_priority_suggestion() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0, maximum=1))
+    subject.process(
+        event(text="Ürün bilgisi.", revision=1),
+        1.0,
+        classification_event=classification("product_information"),
+        active_labels=("product_information",),
+    )
+    current = subject.process(
+        event(event_id="transcript_2", text=EXACT_CANCELLATION, revision=2),
+        2.0,
+        classification_event=classification("cancellation_request").model_copy(
+            update={"transcript_event_id": "transcript_2"}
+        ),
+        active_labels=("cancellation_request",),
+    )
+
+    assert state.active_coaching_suggestions[0].label_id == "cancellation_request"
+    assert state.coaching_suggestion_history[0].label_id == "product_information"
+    assert current.replaced_suggestion_ids
+
+
+def test_equal_priority_capacity_order_is_stable() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0, maximum=1))
+    result = subject.process(
+        event(text="Eşleşmeyen ifade."),
+        1.0,
+        classification_event=classification("product_information", "renewal_interest"),
+        active_labels=("product_information", "renewal_interest"),
+    )
+
+    assert [item.label_id for item in result.displayed_suggestions] == [
+        "product_information"
+    ]
+    assert [item.label_id for item in result.suppressed_suggestions] == [
+        "renewal_interest"
+    ]
+    assert result.suppression_reasons == ("max_active_suggestions",)
+    assert state.active_coaching_suggestions[0].label_id == "product_information"
