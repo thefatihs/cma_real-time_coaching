@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.asr.faster_whisper_engine import FasterWhisperEngine  # noqa: E402
+from app.classification.runtime import RuntimeSetFitClassifier  # noqa: E402
 from app.streaming.pipeline import (  # noqa: E402
     StreamingASRPipeline,
     StreamingASRPlan,
@@ -19,6 +20,13 @@ from app.streaming.pipeline import (  # noqa: E402
 )
 from app.streaming.window_transcriber import WindowTranscriber  # noqa: E402
 from live_dashboard.demo_data import scenario_for, tenant_demos  # noqa: E402
+from live_dashboard.runtime_wiring import (  # noqa: E402
+    ArtifactAvailability,
+    DashboardServiceSelection,
+    build_live_pipeline,
+    default_service_selection,
+    inspect_default_artifacts,
+)
 from live_dashboard.uploaded_audio import (  # noqa: E402
     SUPPORTED_UPLOAD_SUFFIXES,
     SafeUploadMetadata,
@@ -73,7 +81,21 @@ def _load_asr_model(
     )
 
 
-def _make_pipeline(runtime: DashboardRuntime) -> StreamingASRPipeline:
+@st.cache_resource(show_spinner=False)
+def _load_runtime_classifier() -> RuntimeSetFitClassifier:
+    return RuntimeSetFitClassifier()
+
+
+@st.cache_resource(show_spinner=False)
+def _artifact_availability() -> ArtifactAvailability:
+    return inspect_default_artifacts()
+
+
+def _make_pipeline(
+    runtime: DashboardRuntime,
+    selection: DashboardServiceSelection,
+    availability: ArtifactAvailability,
+) -> StreamingASRPipeline:
     config = runtime.tenant.config
     engine = _load_asr_model(
         config.asr.model_name,
@@ -83,7 +105,13 @@ def _make_pipeline(runtime: DashboardRuntime) -> StreamingASRPipeline:
         config.asr.condition_on_previous_text,
         config.asr.initial_prompt,
     )
-    return StreamingASRPipeline(config.context, config.asr, WindowTranscriber(engine))
+    return build_live_pipeline(
+        runtime,
+        WindowTranscriber(engine),
+        selection=selection,
+        availability=availability,
+        classifier_provider=_load_runtime_classifier,
+    )
 
 
 def _synthetic_runtime() -> DashboardRuntime:
@@ -309,6 +337,8 @@ uploaded = None
 audio_path_text = ""
 source_mode = "Sentetik demo"
 playback_mode = "Hızlı analiz"
+artifact_availability = _artifact_availability()
+service_selection = DashboardServiceSelection(False, False)
 with st.sidebar:
     st.header("Kontroller")
     with st.expander("Görüşme", expanded=True):
@@ -359,6 +389,10 @@ with st.sidebar:
                 "Oynatma", ("Hızlı analiz", "Gerçek zaman simülasyonu")
             )
     config = demos[tenant_id].config.asr
+    service_defaults = default_service_selection(
+        artifact_availability,
+        deterministic_rules_available=bool(demos[tenant_id].rules),
+    )
     with st.expander("Model Ayarları", expanded=False):
         st.text_input("Model", config.model_name, disabled=True)
         st.text_input("Dil", config.language, disabled=True)
@@ -372,6 +406,22 @@ with st.sidebar:
             "Kararlı bölge", value=config.stable_region_seconds, disabled=True
         )
         st.checkbox("VAD", value=config.vad_filter, disabled=True)
+        enable_setfit = st.checkbox(
+            "SetFit sınıflandırmasını etkinleştir",
+            value=service_defaults.enable_setfit,
+            key="enable_setfit",
+        )
+        enable_coaching = st.checkbox(
+            "Canlı koçluğu etkinleştir",
+            value=service_defaults.enable_coaching,
+            key="enable_coaching",
+        )
+        service_selection = DashboardServiceSelection(
+            enable_setfit=enable_setfit,
+            enable_coaching=enable_coaching,
+        )
+        if enable_setfit and not artifact_availability.compatible:
+            st.info(artifact_availability.safe_message)
     if mode == "Sentetik Demo":
         start, stop = st.columns(2)
         if start.button("Başlat", use_container_width=True):
@@ -426,7 +476,11 @@ with st.sidebar:
                         sleep(max(duration - step.transcription_time_seconds, 0.0))
 
                 try:
-                    pipeline = _make_pipeline(local.runtime)
+                    pipeline = _make_pipeline(
+                        local.runtime,
+                        service_selection,
+                        artifact_availability,
+                    )
                     if source_mode == "Dosya yükle" and uploaded is not None:
                         with temporary_uploaded_audio(
                             uploaded.name, uploaded.getvalue()

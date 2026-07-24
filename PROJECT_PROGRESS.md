@@ -447,3 +447,26 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Canli UI entegrasyonunu kullanici kabul testiyle
   dogrulamak.
+
+## 43. Live Dashboard SetFit ve Coaching Runtime Wiring
+
+- Uploaded-audio pipeline artik mevcut lazy `RuntimeSetFitClassifier`,
+  tenant-specific deterministic `RuleBasedCoachingEngine` ve per-call
+  `CoachingCoordinator` factory ile dashboard tarafinda kuruluyor.
+- Varsayilan v2 model/profile artifact metadata uyumlulugu model agirliklari
+  yuklenmeden kontrol edilir; uyumluysa SetFit, kural veya SetFit varsa coaching
+  varsayilan acik gelir.
+- Model Ayarlari altina SetFit ve canli coaching kontrolleri eklendi; her iki
+  oynatma modu ayni service selection ve pipeline wiring'i kullanir.
+- Eksik/uyumsuz artifact durumunda guvenli Turkce mesaj ve rule-only coaching
+  korunur; cached classifier Streamlit rerun'larinda yeniden olusturulmaz.
+- Teknik izleme SetFit, coaching ve rule engine icin gercek active/disabled/failed
+  durumlarini gosterir; yerel artifact veya audio yolu sunuma tasinmaz.
+- Degisen dosyalar: `live_dashboard/runtime_wiring.py`,
+  `live_dashboard/app.py`, `live_dashboard/view_models.py`,
+  `tests/test_live_dashboard_runtime_wiring.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused dashboard/integration 58 passed; full 350 passed
+  (1 dependency warning); model yukleme mock'ludur.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Yerel uploaded-audio akisini operator kabul testiyle
+  dogrulamak.

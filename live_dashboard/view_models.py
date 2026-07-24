@@ -242,6 +242,10 @@ class DashboardRuntime:
     classification_probabilities: dict[str, float] = field(default_factory=dict)
     classification_failure: bool = False
     coaching_failure: bool = False
+    setfit_enabled: bool = False
+    coaching_enabled: bool = False
+    rule_engine_enabled: bool = False
+    service_status_message: str | None = None
     consumed_suggestion_ids: set[str] = field(default_factory=set)
     consumed_classification_event_ids: set[str] = field(default_factory=set)
     consumed_coaching_revisions: set[int] = field(default_factory=set)
@@ -301,13 +305,16 @@ def create_runtime(
             f"{tenant.config.context.tenant_id}-suggestion-{next(ids)}"
         ),
     )
-    return DashboardRuntime(
+    runtime = DashboardRuntime(
         tenant,
         scenario,
         cleaned_call_id,
         state,
         CoachingCoordinator(tenant.config, state, engine),
     )
+    runtime.coaching_enabled = True
+    runtime.rule_engine_enabled = True
+    return runtime
 
 
 def create_local_execution(tenant: TenantDemo, call_id: str) -> LocalExecutionState:
@@ -659,6 +666,10 @@ def dashboard_tabs(
                 runtime.coaching_failure,
                 "Koçluk önerileri şu anda güncellenemiyor; ses akışı devam ediyor.",
             ),
+            (
+                runtime.service_status_message is not None,
+                runtime.service_status_message or "",
+            ),
         )
         if active
     )
@@ -692,13 +703,16 @@ def dashboard_tabs(
                     if local_mode
                     else "simulated",
                 ),
-                ("Rule Engine", "active"),
+                (
+                    "Rule Engine",
+                    "active" if runtime.rule_engine_enabled else "disabled",
+                ),
                 (
                     "SetFit",
                     "failed"
                     if runtime.classification_failure
                     else "active"
-                    if classification_metadata.model_id is not None
+                    if runtime.setfit_enabled
                     else "disabled",
                 ),
                 (
@@ -706,7 +720,7 @@ def dashboard_tabs(
                     "failed"
                     if runtime.coaching_failure
                     else "active"
-                    if runtime.call_state.coaching_suggestions
+                    if runtime.coaching_enabled
                     else "disabled",
                 ),
                 ("RAG", "not implemented"),
