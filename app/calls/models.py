@@ -2,6 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.events.labels import CANONICAL_LABELS, canonical_labels
 from app.events.models import (
     AudioChunkEvent,
     ClassificationResultEvent,
@@ -29,8 +30,8 @@ class CallDetectedLabelMetadata(BaseModel):
     @classmethod
     def validate_label(cls, value: str) -> str:
         cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("label cannot be empty")
+        if cleaned not in CANONICAL_LABELS:
+            raise ValueError("label must be canonical")
         return cleaned
 
     @field_validator("first_detected_revision", "latest_detected_revision")
@@ -39,6 +40,47 @@ class CallDetectedLabelMetadata(BaseModel):
         if value < 0:
             raise ValueError("detected revision cannot be negative")
         return value
+
+
+class CallRevisionLabelEvidence(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    source: CoachingSuggestionSource
+    model_id: str | None = None
+    threshold_profile_id: str | None = None
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str) -> str:
+        if value not in CANONICAL_LABELS:
+            raise ValueError("label must be canonical")
+        return value
+
+
+class CallRevisionLabelDiagnostic(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    transcript_revision: int
+    current_labels: tuple[str, ...] = ()
+    newly_accumulated_labels: tuple[str, ...] = ()
+    evidence: tuple[CallRevisionLabelEvidence, ...] = ()
+
+    @field_validator("transcript_revision")
+    @classmethod
+    def validate_revision(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("transcript_revision cannot be negative")
+        return value
+
+    @field_validator("current_labels", "newly_accumulated_labels")
+    @classmethod
+    def validate_labels(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if any(value not in CANONICAL_LABELS for value in values):
+            raise ValueError("diagnostic labels must be canonical")
+        if len(values) != len(set(values)):
+            raise ValueError("diagnostic labels must be unique")
+        return values
 
 
 class CallState(BaseModel):
@@ -51,6 +93,9 @@ class CallState(BaseModel):
     last_audio_sequence: int = -1
     active_labels: list[str] = Field(default_factory=list)
     detected_labels: list[CallDetectedLabelMetadata] = Field(default_factory=list)
+    label_revision_timeline: list[CallRevisionLabelDiagnostic] = Field(
+        default_factory=list
+    )
     shown_suggestion_ids: list[str] = Field(default_factory=list)
     last_coaching_trigger_seconds: float | None = None
     transcript_revision: int = 0
@@ -117,7 +162,12 @@ class CallState(BaseModel):
             raise ValueError(f"{getattr(info, 'field_name', 'value')} cannot be empty")
         return cleaned
 
-    @field_validator("active_labels", "shown_suggestion_ids")
+    @field_validator("active_labels")
+    @classmethod
+    def validate_active_labels(cls, values: list[str]) -> list[str]:
+        return canonical_labels(values)
+
+    @field_validator("shown_suggestion_ids")
     @classmethod
     def validate_unique_values(cls, values: list[str], info: object) -> list[str]:
         if len(values) != len(set(values)):
@@ -145,7 +195,7 @@ class CallState(BaseModel):
         self.transcript_revision = event.revision
 
     def update_active_labels(self, labels: list[str]) -> None:
-        self.active_labels = _clean_unique(labels)
+        self.active_labels = canonical_labels(labels)
 
     def mark_classification_attempt(
         self, transcript_revision: int, source_sequence: int | None
@@ -196,6 +246,7 @@ class CallState(BaseModel):
             context_sentence_count=self.classification_context_sentence_count,
             preceding_sentence_count=self.classification_preceding_sentence_count,
             delta_word_count=self.classification_delta_word_count,
+            revision_label_timeline=tuple(self.label_revision_timeline),
         )
 
     def record_detected_labels(
@@ -207,7 +258,8 @@ class CallState(BaseModel):
         model_id: str | None = None,
         threshold_profile_id: str | None = None,
     ) -> None:
-        cleaned = _clean_unique(labels)
+        cleaned = canonical_labels(labels)
+        previously_detected = {item.label for item in self.detected_labels}
         business_labels = [label for label in cleaned if label != "no_action"]
         if business_labels:
             incoming = business_labels
@@ -215,7 +267,8 @@ class CallState(BaseModel):
                 item for item in self.detected_labels if item.label != "no_action"
             ]
         elif self.detected_labels:
-            return
+            incoming = []
+            existing = list(self.detected_labels)
         else:
             incoming = [label for label in cleaned if label == "no_action"]
             existing = list(self.detected_labels)
@@ -260,6 +313,86 @@ class CallState(BaseModel):
                 }
             )
         self.detected_labels = list(by_label.values())
+        self._upsert_label_revision_diagnostic(
+            transcript_revision=transcript_revision,
+            labels=incoming,
+            newly_accumulated=[
+                label for label in incoming if label not in previously_detected
+            ],
+            source=source,
+            model_id=model_id,
+            threshold_profile_id=threshold_profile_id,
+        )
+
+    def _upsert_label_revision_diagnostic(
+        self,
+        *,
+        transcript_revision: int,
+        labels: list[str],
+        newly_accumulated: list[str],
+        source: CoachingSuggestionSource,
+        model_id: str | None,
+        threshold_profile_id: str | None,
+    ) -> None:
+        existing = next(
+            (
+                item
+                for item in self.label_revision_timeline
+                if item.transcript_revision == transcript_revision
+            ),
+            None,
+        )
+        evidence_by_label = (
+            {item.label: item for item in existing.evidence} if existing else {}
+        )
+        for label in labels:
+            previous = evidence_by_label.get(label)
+            evidence_source = (
+                source
+                if previous is None
+                else _combined_source(previous.source, source)
+            )
+            evidence_by_label[label] = CallRevisionLabelEvidence(
+                label=label,
+                source=evidence_source,
+                model_id=(
+                    model_id
+                    if source is not CoachingSuggestionSource.RULE and model_id
+                    else previous.model_id
+                    if previous is not None
+                    else None
+                ),
+                threshold_profile_id=(
+                    threshold_profile_id
+                    if source is not CoachingSuggestionSource.RULE
+                    and threshold_profile_id
+                    else previous.threshold_profile_id
+                    if previous is not None
+                    else None
+                ),
+            )
+        diagnostic = CallRevisionLabelDiagnostic(
+            transcript_revision=transcript_revision,
+            current_labels=tuple(self.active_labels),
+            newly_accumulated_labels=tuple(
+                dict.fromkeys(
+                    (
+                        *(existing.newly_accumulated_labels if existing else ()),
+                        *newly_accumulated,
+                    )
+                )
+            ),
+            evidence=tuple(evidence_by_label.values()),
+        )
+        self.label_revision_timeline = [
+            *(
+                item
+                for item in self.label_revision_timeline
+                if item.transcript_revision != transcript_revision
+            ),
+            diagnostic,
+        ]
+        self.label_revision_timeline.sort(key=lambda item: item.transcript_revision)
 
     def apply_coaching_suggestion(
         self,
@@ -367,6 +500,12 @@ class CallClassificationMetadata(BaseModel):
     context_sentence_count: int | None = None
     preceding_sentence_count: int | None = None
     delta_word_count: int | None = None
+    revision_label_timeline: tuple[CallRevisionLabelDiagnostic, ...] = ()
+
+    @field_validator("active_labels")
+    @classmethod
+    def validate_active_labels(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(canonical_labels(values))
 
     @property
     def current_revision_labels(self) -> tuple[str, ...]:

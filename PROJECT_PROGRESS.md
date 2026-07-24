@@ -607,3 +607,26 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Sentetik olmayan uzun WAV smoke testinde transcript ve
   call-level etiket ayrimini operator ekranindan dogrulamak.
+
+## 50. Canonical Call Label Aggregation ve Revision Diagnostics
+
+- Runtime label siniri sekiz taxonomy etiketiyle sinirlandi; bilinen tenant
+  alias'lari canonical business etiketlerine cevrilir, `iptal_riski` ve
+  `ayrilma_talebi` yalnizca `cancellation_request` olarak saklanir/gosterilir.
+- Classification ve deterministic rule kaniti call aggregate icinde
+  rule/classification/both provenance ile birlesir; first/latest revision ve
+  classification kaynakli model/profile kimlikleri korunur.
+- Her stabil classification revizyonu icin yalnizca revision, current canonical
+  labels, newly accumulated labels ve guvenli evidence metadata'si tutan
+  revision timeline eklendi; text, probability, token, dosya veya path tutulmaz.
+- Revision timeline yalnizca Technical Monitoring'de gosterilir; temsilci
+  ekraninda canonical `cancellation_request` "Iptal Talebi" olarak gorunur.
+- Degisen dosyalar: `app/events/labels.py`, `app/calls/models.py`,
+  `app/classification/postprocessing.py`, `app/classification/streaming.py`,
+  `app/coaching/rule_engine.py`, `live_dashboard/view_models.py`,
+  `live_dashboard/app.py`, ilgili dort test dosyasi ve `PROJECT_PROGRESS.md`.
+- Testler: focused 161 passed; full 399 passed (1 dependency warning);
+  gercek model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gercek uzun cagri smoke testinde revision timeline
+  uzerinden product/technical detection durumunu dogrulamak.

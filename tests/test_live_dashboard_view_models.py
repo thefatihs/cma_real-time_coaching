@@ -125,8 +125,8 @@ def test_tenant_labels_rules_and_state_are_isolated() -> None:
         advance_runtime(subject)
         advance_runtime(subject)
     assert alpha.call_state.tenant_id != beta.call_state.tenant_id
-    assert alpha.latest_labels[0].name == "fiyat_itirazi"
-    assert beta.latest_labels[0].name == "butce_endisesi"
+    assert alpha.latest_labels[0].name == "price_objection"
+    assert beta.latest_labels[0].name == "price_objection"
     assert alpha.suggestions[0].title != beta.suggestions[0].title
 
 
@@ -648,18 +648,25 @@ def test_coaching_card_includes_label_evidence_and_priority_symbol() -> None:
     advance_runtime(subject)
     advance_runtime(subject)
     card = dashboard_tabs(subject).representative.suggestions[0]
-    assert card.related_label == "İptal riski"
+    assert card.related_label == "İptal Talebi"
     assert card.evidence_ids == ("synthetic-a-cancel",)
     assert (card.priority_text, card.priority_symbol) == ("HIGH", "▲")
+    tabs = dashboard_tabs(subject)
+    assert "iptal_riski" not in repr(tabs.representative.intent_chips)
+    assert "iptal_riski" not in repr(tabs.representative.detected_intent_chips)
+    assert tabs.representative.intent_chips[0].text == "İptal Talebi"
+    assert tabs.technical.revision_label_timeline
+    assert "text" not in type(tabs.technical.revision_label_timeline[0]).model_fields
+    assert "probabilities" not in repr(tabs.technical.revision_label_timeline)
 
 
 def test_intent_chip_formatting_is_compact_and_readable() -> None:
-    subject = runtime("tenant_alpha", "critical")
+    subject = runtime("tenant_alpha", "cancel")
     advance_runtime(subject)
     advance_runtime(subject)
     chips = intent_chips(subject.latest_labels)
     assert [(chip.text, chip.score, chip.is_risk, chip.symbol) for chip in chips] == [
-        ("Kritik risk", "%100", True, "⚠")
+        ("İptal Talebi", "%100", True, "⚠")
     ]
 
 

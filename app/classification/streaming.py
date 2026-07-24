@@ -10,6 +10,7 @@ from app.calls.models import CallState
 from app.classification.postprocessing import (
     ClassificationPostProcessingMetadata,
     apply_classification_contrast_guards,
+    canonicalize_classification_result,
 )
 from app.events.models import (
     ClassificationResultEvent,
@@ -125,9 +126,10 @@ class StableTranscriptClassificationStage:
                 revision=event.revision,
                 sequence_number=event.source_chunk_sequence,
             )
+            canonical_result = canonicalize_classification_result(raw_result)
             result, postprocessing = apply_classification_contrast_guards(
                 classification_text,
-                raw_result,
+                canonical_result,
             )
             call_state.apply_classification(
                 result,

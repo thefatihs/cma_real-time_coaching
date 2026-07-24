@@ -2,7 +2,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.classification.postprocessing import apply_classification_contrast_guards
+from app.classification.postprocessing import (
+    apply_classification_contrast_guards,
+    canonicalize_classification_result,
+)
 from app.events.models import (
     ClassificationLabel,
     ClassificationResultEvent,
@@ -74,6 +77,18 @@ def test_true_price_objection_is_preserved(text: str) -> None:
     )
     assert [label.name for label in guarded.labels] == ["price_objection"]
     assert metadata.suppressed_labels == ()
+
+
+def test_internal_cancellation_label_is_canonicalized() -> None:
+    source = result().model_copy(
+        update={
+            "labels": [ClassificationLabel(name="iptal_riski", score=0.9)],
+            "probabilities": {"iptal_riski": 0.9},
+            "thresholds": {"iptal_riski": 0.5},
+        }
+    )
+    canonical = canonicalize_classification_result(source)
+    assert [label.name for label in canonical.labels] == ["cancellation_request"]
 
 
 def test_price_query_and_objection_preserve_multilabel_output() -> None:

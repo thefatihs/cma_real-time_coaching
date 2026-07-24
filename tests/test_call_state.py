@@ -119,7 +119,7 @@ def test_active_labels_and_suggestions_are_normalized() -> None:
     state.mark_suggestion_shown("suggestion_001")
     state.mark_suggestion_shown("suggestion_001")
 
-    assert state.active_labels == ["satış", "şikayet"]
+    assert state.active_labels == []
     assert state.shown_suggestion_ids == ["suggestion_001"]
     with pytest.raises(ValueError, match="cannot be empty"):
         state.mark_suggestion_shown(" ")
@@ -143,6 +143,11 @@ def test_coaching_cooldown_and_trigger_marking() -> None:
 def test_call_level_labels_accumulate_without_storing_classification_payloads() -> None:
     state = CallState(tenant_id="tenant_alpha", call_id="call_001")
     state.apply_classification(
+        classification_event("product_information"),
+        transcript_revision=1,
+        source_sequence=1,
+    )
+    state.apply_classification(
         classification_event("technical_issue"),
         transcript_revision=2,
         source_sequence=2,
@@ -161,12 +166,22 @@ def test_call_level_labels_accumulate_without_storing_classification_payloads() 
     metadata = state.classification_metadata()
     assert metadata.current_revision_labels == ()
     assert [item.label for item in metadata.labels_detected_during_call] == [
+        "product_information",
         "technical_issue",
         "complaint",
         "churn_risk",
     ]
-    assert metadata.labels_detected_during_call[0].first_detected_revision == 2
-    assert metadata.labels_detected_during_call[0].latest_detected_revision == 2
+    assert metadata.labels_detected_during_call[0].first_detected_revision == 1
+    assert metadata.labels_detected_during_call[0].latest_detected_revision == 1
+    assert [
+        diagnostic.current_labels for diagnostic in metadata.revision_label_timeline
+    ] == [
+        ("product_information",),
+        ("technical_issue",),
+        ("complaint", "churn_risk"),
+        (),
+    ]
+    assert metadata.revision_label_timeline[-1].newly_accumulated_labels == ()
     assert "probabilities" not in repr(metadata.labels_detected_during_call)
     assert "transcript" not in repr(metadata.labels_detected_during_call)
 
@@ -198,3 +213,28 @@ def test_call_level_no_action_is_exclusive_and_sources_merge() -> None:
     assert cancellation.first_detected_revision == 2
     assert cancellation.latest_detected_revision == 3
     assert cancellation.model_id == "synthetic-classifier"
+
+
+def test_internal_label_is_canonicalized_and_revision_timeline_is_safe() -> None:
+    private_marker = "C:/CallMetricPrivate/customer.wav"
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    state.apply_classification(
+        classification_event("iptal_riski"),
+        transcript_revision=1,
+        source_sequence=1,
+    )
+
+    metadata = state.classification_metadata()
+    assert metadata.current_revision_labels == ("cancellation_request",)
+    assert [item.label for item in metadata.labels_detected_during_call] == [
+        "cancellation_request"
+    ]
+    diagnostic = metadata.revision_label_timeline[0]
+    assert diagnostic.current_labels == ("cancellation_request",)
+    assert diagnostic.newly_accumulated_labels == ("cancellation_request",)
+    assert diagnostic.evidence[0].source is (CoachingSuggestionSource.CLASSIFICATION)
+    safe_dump = repr(diagnostic)
+    assert "iptal_riski" not in safe_dump
+    assert private_marker not in safe_dump
+    assert "probabilities" not in safe_dump
+    assert "text" not in type(diagnostic).model_fields

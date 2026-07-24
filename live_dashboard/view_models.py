@@ -9,7 +9,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Protocol
 
-from app.calls.models import CallState
+from app.calls.models import CallRevisionLabelDiagnostic, CallState
+from app.events.labels import canonical_label, canonical_labels
 from app.classification.streaming import (
     ClassificationProcessingStatus,
     StableClassificationOutcome,
@@ -69,8 +70,6 @@ INTENT_LABELS = {
     "paket_sorusu": "Ürün bilgisi",
     "fiyat_itirazi": "Fiyat itirazı",
     "butce_endisesi": "Fiyat itirazı",
-    "iptal_riski": "İptal riski",
-    "ayrilma_talebi": "İptal riski",
     "kritik_eskalasyon": "Kritik risk",
     "yonetici_aktarimi": "Kritik risk",
 }
@@ -205,6 +204,7 @@ class TechnicalTabViewModel:
     failure_details: tuple[tuple[str, str], ...] = ()
     current_labels: tuple[str, ...] = ()
     detected_labels: tuple[str, ...] = ()
+    revision_label_timeline: tuple[CallRevisionLabelDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -570,7 +570,12 @@ def suggestion_card(
         event.suggestion,
         action_display(event.action),
         event.created_at_utc.strftime("%H:%M:%S"),
-        intent_label(event.label_id) if event.label_id else None,
+        (
+            intent_label(canonical)
+            if event.label_id
+            and (canonical := canonical_label(event.label_id)) is not None
+            else None
+        ),
         tuple(event.evidence_ids),
         PRIORITY_SYMBOLS[event.priority],
         SOURCE_LABELS[event.source],
@@ -600,12 +605,17 @@ def intent_label(label: str) -> str:
 def intent_chips(labels: tuple[LabelViewModel, ...]) -> tuple[IntentChipViewModel, ...]:
     return tuple(
         IntentChipViewModel(
-            intent_label(label.name),
+            intent_label(canonical),
             label.score_percent,
-            label.critical or "risk" in label.name.casefold(),
-            "⚠" if label.critical or "risk" in label.name.casefold() else "●",
+            label.critical or canonical in {"cancellation_request", "churn_risk"},
+            (
+                "⚠"
+                if label.critical or canonical in {"cancellation_request", "churn_risk"}
+                else "●"
+            ),
         )
         for label in labels
+        if (canonical := canonical_label(label.name)) is not None
     )
 
 
@@ -712,12 +722,15 @@ def dashboard_tabs(
     )
     chips = intent_chips(runtime.latest_labels)
     current_names = tuple(
-        runtime.call_state.active_labels
-        or [label.name for label in runtime.latest_labels]
+        canonical_labels(
+            runtime.call_state.active_labels
+            or [label.name for label in runtime.latest_labels]
+        )
     )
-    detected_names = [
-        item.label for item in runtime.call_state.detected_labels
-    ] or runtime.detected_label_names
+    detected_names = canonical_labels(
+        [item.label for item in runtime.call_state.detected_labels]
+        or runtime.detected_label_names
+    )
     result_chips = intent_chips(
         tuple(
             LabelViewModel(
@@ -944,6 +957,7 @@ def dashboard_tabs(
             ),
             current_labels=current_names,
             detected_labels=tuple(detected_names),
+            revision_label_timeline=classification_metadata.revision_label_timeline,
         ),
         result=CallResultTabViewModel(
             completed=complete,
@@ -1020,6 +1034,10 @@ def _consume_pipeline_result(
         runtime.call_state.detected_labels = list(
             result.classification_metadata.labels_detected_during_call
         )
+    if result.classification_metadata.revision_label_timeline:
+        runtime.call_state.label_revision_timeline = list(
+            result.classification_metadata.revision_label_timeline
+        )
     state.total_chunks = result.total_chunks
     state.current_chunk = result.total_chunks
 
@@ -1076,13 +1094,14 @@ def _consume_classification_outcome(
     runtime.consumed_classification_event_ids.add(classification.transcript_event_id)
     runtime.classification_failure = False
     runtime.latest_action = classification.action
+    current_labels = canonical_labels(label.name for label in classification.labels)
     runtime.latest_labels = tuple(
         LabelViewModel(
-            label.name,
+            label,
             "",
-            label.name in {"cancellation_request", "complaint", "churn_risk"},
+            label in {"cancellation_request", "complaint", "churn_risk"},
         )
-        for label in classification.labels
+        for label in current_labels
     )
     runtime.classification_probabilities = dict(classification.probabilities)
     runtime.call_state.apply_classification(
@@ -1093,14 +1112,14 @@ def _consume_classification_outcome(
         preceding_sentence_count=outcome.preceding_sentence_count,
         delta_word_count=outcome.delta_word_count,
     )
-    for label in classification.labels:
-        if label.name not in runtime.detected_label_names:
-            runtime.detected_label_names.append(label.name)
+    for label in current_labels:
+        if label not in runtime.detected_label_names:
+            runtime.detected_label_names.append(label)
     runtime.timeline.append(
         TimelineItem(
             classification.created_at_utc,
             "Sınıflandırma",
-            ", ".join(label.name for label in classification.labels),
+            ", ".join(current_labels),
         )
     )
 
@@ -1151,24 +1170,31 @@ def _apply_coaching_result(
         runtime.call_state.update_active_labels(list(result.current_revision_labels))
     if classification is not None and not apply_state_metadata:
         runtime.latest_action = classification.action
+        canonical_scores: dict[str, float] = {}
+        for item in classification.labels:
+            label = canonical_label(item.name)
+            if label is not None:
+                canonical_scores[label] = max(
+                    item.score,
+                    canonical_scores.get(label, 0.0),
+                )
+        current_labels = canonical_labels(label.name for label in classification.labels)
         runtime.latest_labels = tuple(
             LabelViewModel(
-                label.name,
-                f"%{label.score * 100:.0f}",
-                any(
-                    marker in label.name.casefold() for marker in CRITICAL_LABEL_MARKERS
-                ),
+                label,
+                f"%{canonical_scores[label] * 100:.0f}",
+                label in {"cancellation_request", "complaint", "churn_risk"},
             )
-            for label in classification.labels
+            for label in current_labels
         )
-        for label in classification.labels:
-            if label.name not in runtime.detected_label_names:
-                runtime.detected_label_names.append(label.name)
+        for label in current_labels:
+            if label not in runtime.detected_label_names:
+                runtime.detected_label_names.append(label)
         runtime.timeline.append(
             TimelineItem(
                 classification.created_at_utc,
                 "Sınıflandırma",
-                ", ".join(label.name for label in classification.labels),
+                ", ".join(current_labels),
             )
         )
     elif (

@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from typing_extensions import Self
 
+from app.events.labels import canonical_label
 from app.events.models import (
     ClassificationLabel,
     ClassificationResultEvent,
@@ -202,11 +203,14 @@ class RuleBasedCoachingEngine:
             for rule in self._rules
             if rule.enabled and _matches(rule, transcript_tokens)
         )
-        classification_label_set = set(classification_labels)
+        classification_label_set = {
+            canonical_label(label) or label for label in classification_labels
+        }
         classification_matches = tuple(
             rule
             for rule in self._rules
-            if rule.enabled and rule.label in classification_label_set
+            if rule.enabled
+            and (canonical_label(rule.label) or rule.label) in classification_label_set
         )
         matched_by_id = {
             rule.rule_id: rule for rule in (*rule_matches, *classification_matches)
@@ -228,7 +232,9 @@ class RuleBasedCoachingEngine:
             return RuleEvaluationResult(None, (), ())
 
         labels = sorted(
-            {rule.label for rule in matched}.union(template_labels),
+            {canonical_label(rule.label) or rule.label for rule in matched}.union(
+                template_labels
+            ),
             key=str.casefold,
         )
         actions = [rule.action for rule in matched] + [
@@ -252,13 +258,16 @@ class RuleBasedCoachingEngine:
                 CoachingAction.ESCALATE,
             }:
                 continue
-            selected = suggestion_rules.get(rule.label)
+            label = canonical_label(rule.label) or rule.label
+            selected = suggestion_rules.get(label)
             if selected is None or self._suggestion_strength(rule) > (
                 self._suggestion_strength(selected)
             ):
-                suggestion_rules[rule.label] = rule
+                suggestion_rules[label] = rule
 
-        rule_labels = {rule.label for rule in rule_matches}
+        rule_labels = {
+            canonical_label(rule.label) or rule.label for rule in rule_matches
+        }
         if explicit_cancellation:
             rule_labels.add("cancellation_request")
         suggestion_labels = tuple(
@@ -269,6 +278,7 @@ class RuleBasedCoachingEngine:
                 self._suggestion_event(
                     event,
                     suggestion_rules[label],
+                    label=label,
                     source=_source_for_signals(
                         label, rule_labels, classification_label_set
                     ),
@@ -304,6 +314,7 @@ class RuleBasedCoachingEngine:
         event: TranscriptEvent,
         rule: CoachingRule,
         *,
+        label: str,
         source: CoachingSuggestionSource,
     ) -> CoachingSuggestionEvent:
         return CoachingSuggestionEvent(
@@ -314,7 +325,7 @@ class RuleBasedCoachingEngine:
             action=rule.action,
             priority=rule.priority,
             source=source,
-            label_id=rule.label,
+            label_id=label,
             title=rule.title,
             suggestion=rule.suggestion,
             evidence_ids=list(rule.evidence_ids),

@@ -300,6 +300,22 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         st.caption("Geçici etiket olasılıkları")
         for label, value in technical.probabilities:
             st.write(f"{label}: {value:.3f}")
+    if technical.revision_label_timeline:
+        st.subheader("Revizyon Etiket Tanısı")
+        for diagnostic in technical.revision_label_timeline:
+            current = ", ".join(diagnostic.current_labels) or "—"
+            newly = ", ".join(diagnostic.newly_accumulated_labels) or "—"
+            st.write(
+                f"**Revizyon {diagnostic.transcript_revision}:** "
+                f"güncel={current} · yeni={newly}"
+            )
+            for evidence in diagnostic.evidence:
+                details = [evidence.source.value]
+                if evidence.model_id:
+                    details.append(f"model={evidence.model_id}")
+                if evidence.threshold_profile_id:
+                    details.append(f"profile={evidence.threshold_profile_id}")
+                st.caption(f"{evidence.label}: " + " · ".join(details))
     if technical.coaching_metadata:
         st.subheader("Koçluk")
         for label, value in technical.coaching_metadata:
