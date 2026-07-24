@@ -76,6 +76,76 @@ class RuleEvaluationResult:
     matched_rule_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ClassificationCoachingTemplate:
+    title: str
+    suggestion: str
+    priority: SuggestionPriority
+    action: CoachingAction = CoachingAction.TEMPLATE_ACTION
+
+
+CLASSIFICATION_COACHING_TEMPLATES = {
+    "product_information": ClassificationCoachingTemplate(
+        "Ürün bilgisini netleştirin",
+        "Müşterinin bilgi ihtiyacını netleştirin ve ilgili ürün özelliklerini "
+        "kısa, anlaşılır biçimde açıklayın.",
+        SuggestionPriority.MEDIUM,
+    ),
+    "price_objection": ClassificationCoachingTemplate(
+        "Fiyat itirazını karşılayın",
+        "Müşterinin bütçe ve değer beklentisini netleştirip uygun seçenekleri "
+        "şeffaf biçimde açıklayın.",
+        SuggestionPriority.HIGH,
+    ),
+    "cancellation_request": ClassificationCoachingTemplate(
+        "İptal talebini dikkatle doğrulayın",
+        "Müşterinin iptal nedenini netleştirin ve uygun tutundurma seçeneklerini "
+        "sunmadan önce talebi dikkatle doğrulayın.",
+        SuggestionPriority.HIGH,
+    ),
+    "technical_issue": ClassificationCoachingTemplate(
+        "Teknik sorunu netleştirin",
+        "Sorunun ne zaman ve hangi koşullarda oluştuğunu netleştirip onaylı "
+        "teknik çözüm adımlarını uygulayın.",
+        SuggestionPriority.HIGH,
+    ),
+    "complaint": ClassificationCoachingTemplate(
+        "Şikâyeti sahiplenin",
+        "Müşterinin şikâyetini dikkatle dinleyin, anladığınızı doğrulayın ve "
+        "uygun çözüm adımını açıklayın.",
+        SuggestionPriority.HIGH,
+    ),
+    "renewal_interest": ClassificationCoachingTemplate(
+        "Yenileme ilgisini değerlendirin",
+        "Müşterinin yenileme beklentilerini netleştirip uygun dönem ve seçenekleri "
+        "açıklayın.",
+        SuggestionPriority.MEDIUM,
+    ),
+    "churn_risk": ClassificationCoachingTemplate(
+        "Müşteri kaybı riskini ele alın",
+        "Müşterinin tereddütlerini netleştirin ve ihtiyacına uygun tutundurma "
+        "seçeneklerini dikkatle sunun.",
+        SuggestionPriority.HIGH,
+    ),
+}
+
+_CANCELLATION_RULE_ID = "general-explicit-cancellation"
+_CANCELLATION_PHRASES = tuple(
+    _tokens
+    for _tokens in (
+        ("iptal", "etmek", "istiyorum"),
+        ("iptal", "ettirmek", "istiyorum"),
+        ("iptal", "işlemini", "başlatın"),
+        ("aboneliğimi", "kapatın"),
+    )
+)
+_CANCELLATION_NEGATIONS = (
+    ("iptal", "etmek", "istemiyorum"),
+    ("iptal", "etmeyeceğim"),
+    ("iptal", "talebim", "yok"),
+)
+
+
 class RuleBasedCoachingEngine:
     _ACTION_STRENGTH = {
         CoachingAction.NO_ACTION: 0,
@@ -142,13 +212,29 @@ class RuleBasedCoachingEngine:
             rule.rule_id: rule for rule in (*rule_matches, *classification_matches)
         }
         matched = tuple(matched_by_id.values())
-        if not matched:
+        tenant_cancellation_matched = any(
+            _is_cancellation_label(rule.label) for rule in rule_matches
+        )
+        explicit_cancellation = (
+            _matches_explicit_cancellation(transcript_tokens)
+            and not tenant_cancellation_matched
+        )
+        template_labels = classification_label_set.intersection(
+            CLASSIFICATION_COACHING_TEMPLATES
+        )
+        if explicit_cancellation:
+            template_labels.add("cancellation_request")
+        if not matched and not template_labels:
             return RuleEvaluationResult(None, (), ())
 
-        labels = sorted({rule.label for rule in matched}, key=str.casefold)
-        strongest_action = max(
-            (rule.action for rule in matched), key=self._ACTION_STRENGTH.__getitem__
+        labels = sorted(
+            {rule.label for rule in matched}.union(template_labels),
+            key=str.casefold,
         )
+        actions = [rule.action for rule in matched] + [
+            CLASSIFICATION_COACHING_TEMPLATES[label].action for label in template_labels
+        ]
+        strongest_action = max(actions, key=self._ACTION_STRENGTH.__getitem__)
         classification = ClassificationResultEvent(
             tenant_id=event.tenant_id,
             call_id=event.call_id,
@@ -172,18 +258,39 @@ class RuleBasedCoachingEngine:
             ):
                 suggestion_rules[rule.label] = rule
 
-        suggestions = tuple(
-            self._suggestion_event(
-                event,
-                rule,
-                source=_source_for_rule(rule, rule_matches, classification_matches),
-            )
-            for rule in suggestion_rules.values()
+        rule_labels = {rule.label for rule in rule_matches}
+        if explicit_cancellation:
+            rule_labels.add("cancellation_request")
+        suggestion_labels = tuple(
+            dict.fromkeys((*suggestion_rules, *sorted(template_labels)))
         )
+        suggestions = tuple(
+            (
+                self._suggestion_event(
+                    event,
+                    suggestion_rules[label],
+                    source=_source_for_signals(
+                        label, rule_labels, classification_label_set
+                    ),
+                )
+                if label in suggestion_rules
+                else self._template_suggestion_event(
+                    event,
+                    label,
+                    source=_source_for_signals(
+                        label, rule_labels, classification_label_set
+                    ),
+                )
+            )
+            for label in suggestion_labels
+        )
+        matched_rule_ids = [rule.rule_id for rule in matched]
+        if explicit_cancellation:
+            matched_rule_ids.append(_CANCELLATION_RULE_ID)
         return RuleEvaluationResult(
             classification_event=classification,
             suggestion_events=suggestions,
-            matched_rule_ids=tuple(rule.rule_id for rule in matched),
+            matched_rule_ids=tuple(matched_rule_ids),
         )
 
     def _suggestion_strength(self, rule: CoachingRule) -> tuple[int, int]:
@@ -213,6 +320,27 @@ class RuleBasedCoachingEngine:
             created_at_utc=self._utc_datetime_factory(),
         )
 
+    def _template_suggestion_event(
+        self,
+        event: TranscriptEvent,
+        label: str,
+        *,
+        source: CoachingSuggestionSource,
+    ) -> CoachingSuggestionEvent:
+        template = CLASSIFICATION_COACHING_TEMPLATES[label]
+        return CoachingSuggestionEvent(
+            tenant_id=event.tenant_id,
+            call_id=event.call_id,
+            suggestion_id=self._event_id_factory(),
+            source_transcript_event_id=event.event_id,
+            action=template.action,
+            priority=template.priority,
+            source=source,
+            title=template.title,
+            suggestion=template.suggestion,
+            created_at_utc=self._utc_datetime_factory(),
+        )
+
 
 def _source_for_rule(
     rule: CoachingRule,
@@ -226,6 +354,31 @@ def _source_for_rule(
     if matched_classification:
         return CoachingSuggestionSource.CLASSIFICATION
     return CoachingSuggestionSource.RULE
+
+
+def _source_for_signals(
+    label: str,
+    rule_labels: set[str],
+    classification_labels: set[str],
+) -> CoachingSuggestionSource:
+    matched_rule = label in rule_labels
+    matched_classification = label in classification_labels
+    if matched_rule and matched_classification:
+        return CoachingSuggestionSource.BOTH
+    if matched_classification:
+        return CoachingSuggestionSource.CLASSIFICATION
+    return CoachingSuggestionSource.RULE
+
+
+def _matches_explicit_cancellation(transcript: tuple[str, ...]) -> bool:
+    if any(_contains(transcript, phrase) for phrase in _CANCELLATION_NEGATIONS):
+        return False
+    return any(_contains(transcript, phrase) for phrase in _CANCELLATION_PHRASES)
+
+
+def _is_cancellation_label(label: str) -> bool:
+    normalized = label.casefold()
+    return any(marker in normalized for marker in ("cancellation", "iptal", "ayril"))
 
 
 def _validated_unique(

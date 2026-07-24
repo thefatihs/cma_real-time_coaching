@@ -470,3 +470,25 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Yerel uploaded-audio akisini operator kabul testiyle
   dogrulamak.
+
+## 44. Classification-Driven Coaching Suggestion Duzeltmesi
+
+- Yedi business classification label'i icin genel, deterministik Turkce coaching
+  template mapping'i eklendi; text rule eslesmese de aktif SetFit label'i
+  suggestion uretebilir.
+- `cancellation_request` icin guvenli dogrulama/tutundurma onerisi ve yaygin
+  `iptal etmek/ettirmek`, `iptal islemini baslatin`, `aboneligimi kapatin`
+  bicimlerini kapsayan genel explicit rule eklendi.
+- `iptal etmek istemiyorum`, `iptal etmeyecegim` ve `iptal talebim yok`
+  olumsuzlamalari rule eslesmesinden dislanir; tenant cancellation rule'u
+  eslesirse genel rule tekrar suggestion uretmez.
+- Provenance classification/rule/both olarak korunur; coordinator cooldown,
+  duplicate suppression, priority ve suggestion limitleri degismemistir.
+- Degisen dosyalar: `app/coaching/rule_engine.py`,
+  `tests/test_rule_engine.py`, `tests/test_coaching_coordinator.py`,
+  `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused coaching/streaming/dashboard 106 passed; full 365 passed
+  (1 dependency warning); model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Uploaded-audio smoke testini ayni sentetik iptal cumlesiyle
+  yeniden dogrulamak.

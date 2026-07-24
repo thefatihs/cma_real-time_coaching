@@ -177,19 +177,21 @@ def pipeline_event(kind: TranscriptKind, revision: int, text: str) -> Transcript
 def fake_pipeline_result() -> StreamingASRResult:
     partial = pipeline_event(TranscriptKind.PARTIAL, 1, "Aboneliğimi")
     stable = pipeline_event(
-        TranscriptKind.STABLE, 2, "Aboneliğimi iptal etmek istiyorum."
+        TranscriptKind.STABLE,
+        2,
+        ("Aboneliğimi bugün iptal ettirmek istiyorum. Lütfen iptal işlemini başlatın."),
     )
     final = pipeline_event(TranscriptKind.FINAL, 3, "İşlem bilgisini aldım.")
     classification = ClassificationResultEvent(
         tenant_id="tenant_alpha",
         call_id="local-call",
         transcript_event_id=stable.event_id,
-        labels=[ClassificationLabel(name="ayrilma_talebi", score=0.9)],
+        labels=[ClassificationLabel(name="cancellation_request", score=1.0)],
         action=CoachingAction.TEMPLATE_ACTION,
         model_id="common_turkish_setfit_v2",
         threshold_profile_id="common_turkish_setfit_v2:calibrated:v1",
-        probabilities={"ayrilma_talebi": 0.9},
-        thresholds={"ayrilma_talebi": 0.7},
+        probabilities={"cancellation_request": 1.0},
+        thresholds={"cancellation_request": 0.7},
         processing_time_ms=4.0,
         created_at_utc=stable.created_at_utc,
     )
@@ -328,7 +330,9 @@ def test_local_results_update_transcript_coaching_and_latency() -> None:
     )
     assert state.runtime.call_state.partial_transcript == ""
     assert "İşlem bilgisini aldım." in state.runtime.call_state.stable_transcript
-    assert [label.name for label in state.runtime.latest_labels] == ["ayrilma_talebi"]
+    assert [label.name for label in state.runtime.latest_labels] == [
+        "cancellation_request"
+    ]
     assert len(state.runtime.suggestions) == 1
     assert state.runtime.latency is not None
     assert state.runtime.latency.asr_ms == 300
@@ -346,6 +350,20 @@ def test_partial_local_event_does_not_trigger_coaching_but_stable_does() -> None
     ]
     assert len(suggestion_events) == 1
     assert suggestion_events[0].detail == "İptal talebini doğrulayın"
+
+
+def test_exact_cancellation_runtime_outcome_reaches_dashboard_card() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(state, FakePipeline(), Path("synthetic.wav"))
+    tabs = dashboard_tabs(state.runtime, state)
+    assert (
+        "Aboneliğimi bugün iptal ettirmek istiyorum."
+        in tabs.representative.transcript.stable_text
+    )
+    assert len(tabs.representative.suggestions) == 1
+    assert tabs.representative.suggestions[0].source == "Kural + sınıflandırma"
+    assert tabs.representative.suppressed_count == 0
 
 
 def test_reset_clears_local_execution_state() -> None:
@@ -486,7 +504,7 @@ def test_completed_call_summary_contains_safe_product_data() -> None:
         ("Biçim", "WAV"),
         ("Boyut", "2.0 KB"),
     )
-    assert "İptal riski" in {chip.text for chip in result.detected_labels}
+    assert "İptal Talebi" in {chip.text for chip in result.detected_labels}
 
 
 def test_feedback_is_session_only_and_does_not_change_coaching() -> None:
@@ -567,7 +585,7 @@ def test_live_outcomes_are_deduplicated_and_technical_metadata_is_separated() ->
     assert ("Model", "common_turkish_setfit_v2") in (
         tabs.technical.classification_metadata
     )
-    assert tabs.technical.probabilities == (("ayrilma_talebi", 0.9),)
+    assert tabs.technical.probabilities == (("cancellation_request", 1.0),)
     assert tabs.technical.rtf
     assert tabs.technical.last_asr == "300 ms"
 
@@ -640,4 +658,4 @@ def test_failure_outcomes_are_safe_and_do_not_expose_transcript_or_paths(
     assert "RuntimeError" not in rendered
     assert "CallMetricPrivate" not in rendered
     assert "never-render-this" not in rendered
-    assert "Aboneliğimi iptal etmek istiyorum." not in caplog.text
+    assert "Aboneliğimi bugün iptal ettirmek istiyorum." not in caplog.text

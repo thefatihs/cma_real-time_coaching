@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from app.coaching.rule_engine import CoachingRule, RuleBasedCoachingEngine
 from app.events.models import (
     CoachingAction,
+    CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
@@ -223,3 +224,54 @@ def test_source_event_and_rules_remain_unchanged() -> None:
     before = (source_rule.model_dump(), source_event.model_dump())
     engine(source_rule).evaluate(source_event)
     assert before == (source_rule.model_dump(), source_event.model_dump())
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "product_information",
+        "price_objection",
+        "cancellation_request",
+        "technical_issue",
+        "complaint",
+        "renewal_interest",
+        "churn_risk",
+    ],
+)
+def test_every_business_classification_label_has_a_coaching_template(
+    label: str,
+) -> None:
+    result = engine().evaluate(
+        transcript(text="Metin kuralıyla eşleşmeyen sentetik ifade."),
+        (label,),
+    )
+    assert len(result.suggestion_events) == 1
+    assert result.suggestion_events[0].source is (
+        CoachingSuggestionSource.CLASSIFICATION
+    )
+
+
+def test_common_turkish_cancellation_forms_match_one_safe_rule_suggestion() -> None:
+    exact = (
+        "Aboneliğimi bugün iptal ettirmek istiyorum. Lütfen iptal işlemini başlatın."
+    )
+    result = engine().evaluate(transcript(text=exact))
+    assert result.matched_rule_ids == ("general-explicit-cancellation",)
+    assert len(result.suggestion_events) == 1
+    suggestion = result.suggestion_events[0]
+    assert suggestion.source is CoachingSuggestionSource.RULE
+    assert "iptal nedenini netleştirin" in suggestion.suggestion
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "İptal etmek istemiyorum.",
+        "Aboneliğimi iptal etmeyeceğim.",
+        "İptal talebim yok.",
+    ],
+)
+def test_negated_cancellation_does_not_match_general_rule(text: str) -> None:
+    result = engine().evaluate(transcript(text=text))
+    assert result.matched_rule_ids == ()
+    assert result.suggestion_events == ()

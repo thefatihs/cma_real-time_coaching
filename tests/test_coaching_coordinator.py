@@ -305,3 +305,68 @@ def test_same_revision_is_processed_only_once() -> None:
     assert len(first.displayed_suggestions) == 1
     assert duplicate.displayed_suggestions == ()
     assert duplicate.suppression_reasons == ("duplicate_revision",)
+
+
+EXACT_CANCELLATION = (
+    "Aboneliğimi bugün iptal ettirmek istiyorum. Lütfen iptal işlemini başlatın."
+)
+
+
+def test_cancellation_classification_without_text_rule_creates_suggestion() -> None:
+    subject, _ = coordinator()
+    result = subject.process(
+        event(text="Üyeliğimin sonlandırılmasını değerlendiriyorum."),
+        1.0,
+        classification_event=classification("cancellation_request"),
+        active_labels=("cancellation_request",),
+    )
+    assert len(result.displayed_suggestions) == 1
+    assert result.suppressed_suggestions == ()
+    assert result.suppression_reasons == ()
+    suggestion = result.displayed_suggestions[0]
+    assert suggestion.source is CoachingSuggestionSource.CLASSIFICATION
+    assert "iptal nedenini netleştirin" in suggestion.suggestion
+
+
+def test_exact_cancellation_rule_only_and_both_provenance() -> None:
+    rule_subject, _ = coordinator()
+    rule_only = rule_subject.process(event(text=EXACT_CANCELLATION), 1.0)
+    assert len(rule_only.displayed_suggestions) == 1
+    assert rule_only.displayed_suggestions[0].source is CoachingSuggestionSource.RULE
+
+    combined_subject, _ = coordinator()
+    combined = combined_subject.process(
+        event(text=EXACT_CANCELLATION),
+        1.0,
+        classification_event=classification("cancellation_request"),
+        active_labels=("cancellation_request",),
+    )
+    assert len(combined.displayed_suggestions) == 1
+    assert combined.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
+    assert combined.suppressed_suggestions == ()
+
+
+def test_cancellation_suggestion_is_not_displayed_twice() -> None:
+    subject, _ = coordinator(tenant=config(cooldown=0))
+    first = subject.process(
+        event(text=EXACT_CANCELLATION),
+        1.0,
+        classification_event=classification("cancellation_request"),
+        active_labels=("cancellation_request",),
+    )
+    duplicate = subject.process(
+        event(
+            event_id="transcript_2",
+            revision=2,
+            text=EXACT_CANCELLATION,
+        ),
+        2.0,
+        classification_event=classification("cancellation_request").model_copy(
+            update={"transcript_event_id": "transcript_2"}
+        ),
+        active_labels=("cancellation_request",),
+    )
+    assert len(first.displayed_suggestions) == 1
+    assert first.suppressed_suggestions == ()
+    assert duplicate.displayed_suggestions == ()
+    assert duplicate.suppression_reasons == ("duplicate",)
