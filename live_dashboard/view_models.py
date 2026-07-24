@@ -445,7 +445,6 @@ def transcript_view(runtime: DashboardRuntime) -> TranscriptViewModel:
 
 def suggestion_card(
     event: CoachingSuggestionEvent,
-    related_label: str | None = None,
     *,
     transcript_revision: int | None = None,
 ) -> SuggestionCardViewModel:
@@ -457,7 +456,7 @@ def suggestion_card(
         event.suggestion,
         action_display(event.action),
         event.created_at_utc.strftime("%H:%M:%S"),
-        intent_label(related_label) if related_label else None,
+        intent_label(event.label_id) if event.label_id else None,
         tuple(event.evidence_ids),
         PRIORITY_SYMBOLS[event.priority],
         SOURCE_LABELS[event.source],
@@ -993,24 +992,13 @@ def _apply_coaching_result(
     ):
         runtime.latest_action = CoachingAction.NO_ACTION
         runtime.latest_labels = ()
-    classification_labels = (
-        [label.name for label in classification.labels] if classification else []
-    )
-    for index, item in enumerate(result.displayed_suggestions):
+    for item in result.displayed_suggestions:
         if item.suggestion_id in runtime.consumed_suggestion_ids:
             continue
         runtime.consumed_suggestion_ids.add(item.suggestion_id)
-        related_label = (
-            classification_labels[index]
-            if index < len(classification_labels)
-            else classification_labels[0]
-            if classification_labels
-            else None
-        )
         runtime.suggestions.append(
             suggestion_card(
                 item,
-                related_label,
                 transcript_revision=result.transcript_revision,
             )
         )

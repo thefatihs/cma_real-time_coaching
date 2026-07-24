@@ -6,6 +6,10 @@ import logging
 from typing import Protocol
 
 from app.calls.models import CallState
+from app.classification.postprocessing import (
+    ClassificationPostProcessingMetadata,
+    apply_classification_contrast_guards,
+)
 from app.events.models import (
     ClassificationResultEvent,
     TranscriptEvent,
@@ -49,6 +53,9 @@ class StableClassificationOutcome:
     source_sequence: int | None
     classification_event: ClassificationResultEvent | None = None
     error: SafeClassificationError | None = None
+    postprocessing: ClassificationPostProcessingMetadata = (
+        ClassificationPostProcessingMetadata()
+    )
 
 
 class StableTranscriptClassificationStage:
@@ -92,13 +99,17 @@ class StableTranscriptClassificationStage:
             event.revision, event.source_chunk_sequence
         )
         try:
-            result = self._classifier.classify(
+            raw_result = self._classifier.classify(
                 tenant_id=event.tenant_id,
                 call_id=event.call_id,
                 text=cumulative_stable_transcript,
                 transcript_event_id=event.event_id,
                 revision=event.revision,
                 sequence_number=event.source_chunk_sequence,
+            )
+            result, postprocessing = apply_classification_contrast_guards(
+                cumulative_stable_transcript,
+                raw_result,
             )
             call_state.apply_classification(
                 result,
@@ -123,6 +134,7 @@ class StableTranscriptClassificationStage:
                 transcript_revision=event.revision,
                 source_sequence=event.source_chunk_sequence,
                 classification_event=result,
+                postprocessing=postprocessing,
             )
         except Exception as error:
             safe_error = SafeClassificationError(error_type=type(error).__name__)

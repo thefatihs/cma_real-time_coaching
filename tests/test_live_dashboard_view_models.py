@@ -203,6 +203,7 @@ def fake_pipeline_result() -> StreamingASRResult:
         action=CoachingAction.TEMPLATE_ACTION,
         priority=SuggestionPriority.HIGH,
         source=CoachingSuggestionSource.BOTH,
+        label_id="cancellation_request",
         title="İptal talebini doğrulayın",
         suggestion="Müşterinin iptal talebini açıkça doğrulayın.",
         created_at_utc=stable.created_at_utc,
@@ -572,6 +573,40 @@ def test_suggestion_card_shows_priority_action_and_provenance(
     )
     assert card.transcript_revision == 2
     assert card.is_new
+
+
+def test_simultaneous_suggestions_keep_their_own_label_metadata() -> None:
+    outcome = fake_pipeline_result().coaching_outcomes[0].result
+    assert outcome is not None
+    base = outcome.displayed_suggestions[0]
+    product = base.model_copy(
+        update={
+            "suggestion_id": "product-card",
+            "label_id": "product_information",
+            "title": "Ürün bilgisini açıklayın",
+            "suggestion": "Ürün bilgisini kısa biçimde açıklayın.",
+            "priority": SuggestionPriority.MEDIUM,
+        }
+    )
+    price = base.model_copy(
+        update={
+            "suggestion_id": "price-card",
+            "label_id": "price_objection",
+            "title": "Fiyat itirazını karşılayın",
+            "suggestion": "Fiyat itirazını dikkatle karşılayın.",
+            "priority": SuggestionPriority.HIGH,
+        }
+    )
+    cards = ordered_suggestions(
+        [
+            suggestion_card(product),
+            suggestion_card(price),
+        ]
+    )
+    assert [(card.title, card.related_label, card.priority) for card in cards] == [
+        ("Fiyat itirazını karşılayın", "Fiyat İtirazı", SuggestionPriority.HIGH),
+        ("Ürün bilgisini açıklayın", "Ürün Bilgisi", SuggestionPriority.MEDIUM),
+    ]
 
 
 def test_live_outcomes_are_deduplicated_and_technical_metadata_is_separated() -> None:

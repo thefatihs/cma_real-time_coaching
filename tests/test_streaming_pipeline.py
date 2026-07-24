@@ -613,3 +613,45 @@ def test_coaching_failure_is_safe_and_does_not_log_transcript(
     assert result.stable_transcript == secret
     assert result.coaching_outcomes[-1].status is CoachingProcessingStatus.FAILED
     assert secret not in caplog.text
+
+
+def test_price_query_guard_prevents_price_objection_coaching_card(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class PriceClassifier(FakeRuntimeClassifier):
+        def classify(self, **kwargs: object) -> ClassificationResultEvent:
+            base = super().classify(**kwargs)  # type: ignore[arg-type]
+            return base.model_copy(
+                update={
+                    "labels": [
+                        ClassificationLabel(name="product_information", score=0.949),
+                        ClassificationLabel(name="price_objection", score=0.940),
+                    ],
+                    "probabilities": {
+                        "product_information": 0.949,
+                        "price_objection": 0.940,
+                    },
+                    "thresholds": {
+                        "product_information": 0.90,
+                        "price_objection": 0.35,
+                    },
+                }
+            )
+
+    transcript = "Paketin aylık fiyatına kadar ücret seçeneklerini öğrenmek istiyorum."
+    caplog.set_level("INFO")
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(transcript, 0.0, 1.0)]]),
+        runtime_classifier=PriceClassifier(),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+    classification = result.classification_outcomes[-1].classification_event
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["product_information"]
+    assert classification.probabilities["price_objection"] == 0.940
+    coaching = result.coaching_outcomes[-1].result
+    assert coaching is not None
+    assert len(coaching.displayed_suggestions) == 1
+    assert coaching.displayed_suggestions[0].label_id == "product_information"
+    assert transcript not in caplog.text

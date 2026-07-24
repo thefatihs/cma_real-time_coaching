@@ -492,3 +492,26 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Uploaded-audio smoke testini ayni sentetik iptal cumlesiyle
   yeniden dogrulamak.
+
+## 45. Fiyat Bilgisi Kontrast Guard ve Suggestion Label Baglantisi
+
+- Final active-label kararina Turkce fiyat bilgisi/fiyat itirazi contrast guard
+  eklendi; net bilgi sorusu ve itiraz kaniti yoksa `price_objection` bastirilir.
+- Gercek itiraz kaniti veya bilgi sorusu ile birlikte itiraz bulunan metinlerde
+  `price_objection` ve multi-label davranisi korunur; threshold degismemistir.
+- Guard yalnizca aktif label listesini filtreler; transient raw probability
+  degerleri teknik izleme icin ClassificationResultEvent'te korunur.
+- `CoachingSuggestionEvent.label_id` suggestion'in kendi label metadata'sini
+  tasir; dashboard artik label'i paralel liste pozisyonundan cikarmadigi icin
+  siralama iki kartin metadata'sini caprazlayamaz.
+- Degisen dosyalar: `app/classification/postprocessing.py`,
+  `app/classification/streaming.py`, `app/events/models.py`,
+  `app/coaching/rule_engine.py`, `live_dashboard/view_models.py`,
+  `tests/test_classification_postprocessing.py`,
+  `tests/test_streaming_pipeline.py`,
+  `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused classification/coaching/streaming/dashboard 139 passed;
+  full 376 passed (1 dependency warning); model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Price-information uploaded-audio smoke testini yeniden
+  dogrulamak.

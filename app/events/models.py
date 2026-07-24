@@ -269,6 +269,7 @@ class CoachingSuggestionEvent(BaseModel):
     action: CoachingAction
     priority: SuggestionPriority
     source: CoachingSuggestionSource = CoachingSuggestionSource.RULE
+    label_id: str | None = None
     title: str
     suggestion: str
     evidence_ids: list[str] = Field(default_factory=list)
@@ -298,6 +299,11 @@ class CoachingSuggestionEvent(BaseModel):
         if value is not None and value < 0:
             raise ValueError("expires_after_seconds cannot be negative")
         return value
+
+    @field_validator("label_id")
+    @classmethod
+    def validate_label_id(cls, value: str | None) -> str | None:
+        return None if value is None else _required_text(value, "label_id")
 
     @field_validator("created_at_utc")
     @classmethod
