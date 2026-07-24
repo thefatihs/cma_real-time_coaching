@@ -542,3 +542,25 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Iki farkli uploaded WAV ile operator smoke testini
   tekrarlamak.
+
+## 47. Uploaded-Audio Stale Run State Duzeltmesi
+
+- File switch sirasinda kontroller fresh `upload_session.execution` kullanirken
+  final dashboard render'in stale `_local_state()` kullanmasi kaldirildi; tek
+  atomik `LocalExecutionState` hem sidebar hem ana gorunumu besler.
+- Upload session `selected_file_identity` ve
+  `initialized_run_file_identity` alanlarini ayri tutar; genuine file change
+  fresh run'i tam bir kez olusturur, normal rerun state'i yeniden sifirlamaz.
+- Fresh run status `idle`, stage `Baslatilmadi`, progress 0%, chunk 0/0,
+  Start enabled ve Stop disabled olarak baslar; tamamlanmis, failed veya stopped
+  eski state'in transcript/label/suggestion/failure/timing alanlari tasinmaz.
+- Automatic switch uploader generation'i degistirmez; explicit reset generation'i
+  yalnizca bir kez artirir ve ilk sonraki secim korunur.
+- Degisen dosyalar: `live_dashboard/view_models.py`,
+  `live_dashboard/app.py`, `tests/test_live_dashboard_view_models.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused dashboard 46 passed; full 383 passed
+  (1 dependency warning); model cache wiring mock'larla korundu.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: File A tamamla -> File B sec -> Baslat akisini canli
+  Streamlit oturumunda yeniden dogrulamak.

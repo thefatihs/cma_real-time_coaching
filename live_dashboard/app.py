@@ -349,6 +349,7 @@ service_selection = DashboardServiceSelection(False, False)
 upload_session = st.session_state.setdefault(
     "uploaded_audio_session", UploadedAudioSession()
 )
+local_state_for_render: LocalExecutionState | None = None
 with st.sidebar:
     st.header("Kontroller")
     with st.expander("Görüşme", expanded=True):
@@ -383,7 +384,7 @@ with st.sidebar:
                     type=[
                         suffix.removeprefix(".") for suffix in SUPPORTED_UPLOAD_SUFFIXES
                     ],
-                    key=f"audio_upload_{st.session_state.get('upload_generation', 0)}",
+                    key=f"audio_upload_{upload_session.uploader_generation}",
                 )
                 if uploaded is not None:
                     uploaded_content = uploaded.getvalue()
@@ -458,12 +459,13 @@ with st.sidebar:
             if source_mode == "Dosya yükle" and upload_session.execution is not None
             else _local_state()
         )
+        local_state_for_render = local
         st.warning("CPU çıkarımı gerçek zamandan daha yavaş olabilir.")
         if st.button(
             "Başlat",
             type="primary",
             use_container_width=True,
-            disabled=local.status != "idle",
+            disabled=not local.start_enabled,
         ):
             if source_mode == "Dosya yükle" and uploaded is None:
                 st.error("Önce bir ses dosyası yükleyin.")
@@ -525,16 +527,13 @@ with st.sidebar:
                     local.stage = "Başarısız"
                     local.error_message = "Ses işleme güvenli biçimde tamamlanamadı."
                     st.error(local.error_message)
-        st.button(
-            "Durdur", disabled=local.status != "running", use_container_width=True
-        )
+        st.button("Durdur", disabled=not local.stop_enabled, use_container_width=True)
         if st.button("Sıfırla", use_container_width=True):
             if source_mode == "Dosya yükle":
                 upload_session.reset()
             else:
                 st.session_state.pop("local_signature", None)
             st.session_state.pop("safe_audio_metadata", None)
-            st.session_state.upload_generation = upload_session.uploader_generation
             st.session_state.suggestion_feedback = {}
 
 st.title("Canlı Koçluk Paneli")
@@ -558,6 +557,11 @@ if mode == "Sentetik Demo":
 
     live_area()
 else:
-    local = _local_state()
+    if local_state_for_render is None:
+        raise RuntimeError("Local dashboard state was not initialized")
     safe_metadata = st.session_state.get("safe_audio_metadata")
-    _render_dashboard(local.runtime, local, safe_metadata)
+    _render_dashboard(
+        local_state_for_render.runtime,
+        local_state_for_render,
+        safe_metadata,
+    )

@@ -439,8 +439,12 @@ def test_uploaded_file_switch_creates_fresh_call_without_manual_reset() -> None:
         base_call_id="dashboard-call",
     )
     assert changed
+    first.status = "completed"
+    first.stage = "Tamamlandı"
     first.current_chunk = 3
     first.total_chunks = 3
+    first.processing_seconds = 4.0
+    first.audio_duration_seconds = 10.0
     first.runtime.call_state.active_labels = ["complaint"]
     coaching_result = fake_pipeline_result().coaching_outcomes[0].result
     assert coaching_result is not None
@@ -469,6 +473,13 @@ def test_uploaded_file_switch_creates_fresh_call_without_manual_reset() -> None:
     assert second.runtime.suggestions == []
     assert second.current_chunk == second.total_chunks == 0
     assert second.safe_failure is None
+    assert second.status == "idle"
+    assert second.stage == "Başlatılmadı"
+    assert progress_view(second).percentage == 0
+    assert second.start_enabled
+    assert not second.stop_enabled
+    assert session.selected_file_identity == identity_b
+    assert session.initialized_run_file_identity == identity_b
 
 
 def test_manual_upload_reset_changes_widget_generation_once() -> None:
@@ -482,7 +493,8 @@ def test_manual_upload_reset_changes_widget_generation_once() -> None:
     session.reset()
     assert session.uploader_generation == 1
     assert session.execution is None
-    assert session.active_identity is None
+    assert session.selected_file_identity is None
+    assert session.initialized_run_file_identity is None
     after_reset, changed = session.select(
         identity=safe_upload_identity(b"next"),
         tenant=tenant,
@@ -499,6 +511,51 @@ def test_manual_upload_reset_changes_widget_generation_once() -> None:
     assert same is after_reset
     assert not changed
     assert session.uploader_generation == 1
+
+
+@pytest.mark.parametrize("prior_status", ["completed", "error", "stopped"])
+def test_file_change_atomically_resets_any_terminal_run(prior_status: str) -> None:
+    session = UploadedAudioSession()
+    tenant = tenant_demos()["tenant_alpha"]
+    first, _ = session.select(
+        identity=safe_upload_identity(b"file-a"),
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    first.status = prior_status
+    first.stage = "Eski durum"
+    first.start_requested = True
+    first.current_chunk = 2
+    first.total_chunks = 2
+    first.elapsed_seconds = 12
+    first.processing_seconds = 8
+    first.audio_duration_seconds = 10
+    first.error_message = "old failure"
+    first.failed_chunk = 2
+    first.runtime.call_state.stable_transcript = "old stable"
+    first.runtime.call_state.partial_transcript = "old partial"
+    first.runtime.call_state.active_labels = ["complaint"]
+
+    second, changed = session.select(
+        identity=safe_upload_identity(b"file-b"),
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    assert changed
+    assert second.status == "idle"
+    assert not second.start_requested
+    assert second.stage == "Başlatılmadı"
+    assert second.current_chunk == second.total_chunks == 0
+    assert second.elapsed_seconds == 0
+    assert second.processing_seconds is None
+    assert second.audio_duration_seconds is None
+    assert second.error_message is None
+    assert second.failed_chunk is None
+    assert second.runtime.call_state.stable_transcript == ""
+    assert second.runtime.call_state.partial_transcript == ""
+    assert second.runtime.call_state.active_labels == []
+    assert second.start_enabled
+    assert not second.stop_enabled
 
 
 def test_responsive_rows_preserve_untruncated_status_values() -> None:

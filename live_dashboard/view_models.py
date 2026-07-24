@@ -291,6 +291,14 @@ class LocalExecutionState:
         if self.status == "idle":
             self.start_requested = True
 
+    @property
+    def start_enabled(self) -> bool:
+        return self.status == "idle"
+
+    @property
+    def stop_enabled(self) -> bool:
+        return self.status == "running"
+
 
 @dataclass(frozen=True, slots=True)
 class SafeRuntimeFailure:
@@ -319,7 +327,8 @@ class SafeRuntimeFailure:
 @dataclass(slots=True)
 class UploadedAudioSession:
     execution: LocalExecutionState | None = None
-    active_identity: str | None = None
+    selected_file_identity: str | None = None
+    initialized_run_file_identity: str | None = None
     tenant_id: str | None = None
     base_call_id: str | None = None
     run_sequence: int = 0
@@ -332,16 +341,17 @@ class UploadedAudioSession:
         tenant: TenantDemo,
         base_call_id: str,
     ) -> tuple[LocalExecutionState, bool]:
+        self.selected_file_identity = identity
         current_execution = self.execution
         if (
             current_execution is not None
-            and identity == self.active_identity
+            and identity == self.initialized_run_file_identity
             and tenant.config.context.tenant_id == self.tenant_id
             and base_call_id == self.base_call_id
         ):
             return current_execution, False
         self.run_sequence += 1
-        self.active_identity = identity
+        self.initialized_run_file_identity = identity
         self.tenant_id = tenant.config.context.tenant_id
         self.base_call_id = base_call_id
         self.execution = create_local_execution(
@@ -352,7 +362,8 @@ class UploadedAudioSession:
 
     def reset(self) -> None:
         self.execution = None
-        self.active_identity = None
+        self.selected_file_identity = None
+        self.initialized_run_file_identity = None
         self.tenant_id = None
         self.base_call_id = None
         self.uploader_generation += 1
