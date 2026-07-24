@@ -11,6 +11,7 @@ class Retriever(Protocol):
         *,
         tenant_id: str,
         knowledge_base_id: str,
+        query: str,
         top_k: int,
         minimum_score: float = 0.0,
     ) -> RetrievalResult: ...

@@ -23,6 +23,7 @@ class RetrievalOrchestrator:
         retrieval = self._retriever.retrieve(
             tenant_id=request.tenant_id,
             knowledge_base_id=request.knowledge_base_id,
+            query=request.user_input,
             top_k=request.top_k,
         )
         prompt = self._prompt_builder.build(

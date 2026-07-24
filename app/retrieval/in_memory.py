@@ -25,6 +25,7 @@ class InMemoryRetriever:
         *,
         tenant_id: str,
         knowledge_base_id: str,
+        query: str,
         top_k: int,
         minimum_score: float = 0.0,
     ) -> RetrievalResult:
@@ -33,6 +34,7 @@ class InMemoryRetriever:
             knowledge_base_id,
             "knowledge_base_id",
         )
+        _required_text(query, "query")
         if top_k <= 0:
             raise ValueError("top_k must be positive")
         if not 0 <= minimum_score <= 1:

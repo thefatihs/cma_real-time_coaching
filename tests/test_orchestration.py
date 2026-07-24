@@ -16,18 +16,21 @@ from app.retrieval import RetrievalDocument, RetrievalResult
 class FakeRetriever:
     calls: list[str]
     documents: tuple[RetrievalDocument, ...] = ()
-    requests: list[tuple[str, str, int, float]] = field(default_factory=list)
+    requests: list[tuple[str, str, str, int, float]] = field(default_factory=list)
 
     def retrieve(
         self,
         *,
         tenant_id: str,
         knowledge_base_id: str,
+        query: str,
         top_k: int,
         minimum_score: float = 0.0,
     ) -> RetrievalResult:
         self.calls.append("retriever")
-        self.requests.append((tenant_id, knowledge_base_id, top_k, minimum_score))
+        self.requests.append(
+            (tenant_id, knowledge_base_id, query, top_k, minimum_score)
+        )
         return RetrievalResult(
             tenant_id=tenant_id,
             knowledge_base_id=knowledge_base_id,
@@ -124,7 +127,15 @@ def test_scope_and_retrieval_arguments_are_propagated() -> None:
 
     result = orchestrator.run(orchestration_request())
 
-    assert retriever.requests == [("tenant_alpha", "kb_support", 3, 0.0)]
+    assert retriever.requests == [
+        (
+            "tenant_alpha",
+            "kb_support",
+            "Synthetic user input.",
+            3,
+            0.0,
+        )
+    ]
     assert prompt_builder.requests[0].tenant_id == "tenant_alpha"
     assert prompt_builder.requests[0].call_id == "call_001"
     assert llm_gateway.requests[0].tenant_id == "tenant_alpha"
