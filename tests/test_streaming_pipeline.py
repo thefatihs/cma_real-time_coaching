@@ -655,3 +655,31 @@ def test_price_query_guard_prevents_price_objection_coaching_card(
     assert len(coaching.displayed_suggestions) == 1
     assert coaching.displayed_suggestions[0].label_id == "product_information"
     assert transcript not in caplog.text
+
+
+def test_three_partial_chunks_finalize_stable_transcript_without_failure() -> None:
+    sentence = (
+        "Program Windows ve MacBook bilgisayarlarda çalışıyor mu? "
+        "Sistem gereksinimlerini öğrenmek istiyorum."
+    )
+    source = [
+        chunk(0, 0.0, 2.0),
+        chunk(1, 2.0, 2.0),
+        chunk(2, 4.0, 2.0),
+    ]
+    transcriber = FakeTranscriber(
+        [
+            [("Program Windows", 0.0, 2.0)],
+            [("Program Windows ve MacBook bilgisayarlarda çalışıyor mu?", 0.0, 4.0)],
+            [(sentence, 0.0, 6.0)],
+        ]
+    )
+    result = pipeline(source, transcriber).run(Path("synthetic.wav"), "call_001")
+    assert result.total_chunks == 3
+    assert all(
+        all(event.kind is TranscriptKind.PARTIAL for event in step.transcript_events)
+        for step in result.steps
+    )
+    assert result.final_event is not None
+    assert result.final_event.kind is TranscriptKind.FINAL
+    assert result.stable_transcript == sentence

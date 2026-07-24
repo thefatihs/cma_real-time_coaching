@@ -31,12 +31,14 @@ from live_dashboard.uploaded_audio import (  # noqa: E402
     SUPPORTED_UPLOAD_SUFFIXES,
     SafeUploadMetadata,
     safe_upload_metadata,
+    safe_upload_identity,
     temporary_uploaded_audio,
 )
 from live_dashboard.view_models import (  # noqa: E402
     DashboardRuntime,
     DashboardTabsViewModel,
     LocalExecutionState,
+    UploadedAudioSession,
     apply_feedback,
     advance_runtime,
     create_local_execution,
@@ -285,6 +287,10 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         st.subheader("Koçluk")
         for label, value in technical.coaching_metadata:
             st.write(f"**{label}:** {value}")
+    if technical.failure_details:
+        st.subheader("Güvenli Hata Tanısı")
+        for label, value in technical.failure_details:
+            st.write(f"**{label}:** {value}")
 
 
 def _render_result(runtime: DashboardRuntime, view: DashboardTabsViewModel) -> None:
@@ -337,8 +343,12 @@ uploaded = None
 audio_path_text = ""
 source_mode = "Sentetik demo"
 playback_mode = "Hızlı analiz"
+uploaded_content: bytes | None = None
 artifact_availability = _artifact_availability()
 service_selection = DashboardServiceSelection(False, False)
+upload_session = st.session_state.setdefault(
+    "uploaded_audio_session", UploadedAudioSession()
+)
 with st.sidebar:
     st.header("Kontroller")
     with st.expander("Görüşme", expanded=True):
@@ -376,8 +386,16 @@ with st.sidebar:
                     key=f"audio_upload_{st.session_state.get('upload_generation', 0)}",
                 )
                 if uploaded is not None:
+                    uploaded_content = uploaded.getvalue()
                     metadata = safe_upload_metadata(uploaded.name, uploaded.size)
                     st.session_state.safe_audio_metadata = metadata
+                    _, upload_changed = upload_session.select(
+                        identity=safe_upload_identity(uploaded_content),
+                        tenant=demos[tenant_id],
+                        base_call_id=st.session_state.call_id,
+                    )
+                    if upload_changed:
+                        st.session_state.suggestion_feedback = {}
                     st.success("Dosya hazır; Başlat komutu bekleniyor.")
                     st.caption(
                         f"{metadata.filename} · {metadata.format_name} · "
@@ -435,7 +453,11 @@ with st.sidebar:
             st.session_state.playing = False
             st.session_state.suggestion_feedback = {}
     else:
-        local = _local_state()
+        local = (
+            upload_session.execution
+            if source_mode == "Dosya yükle" and upload_session.execution is not None
+            else _local_state()
+        )
         st.warning("CPU çıkarımı gerçek zamandan daha yavaş olabilir.")
         if st.button(
             "Başlat",
@@ -481,9 +503,13 @@ with st.sidebar:
                         service_selection,
                         artifact_availability,
                     )
-                    if source_mode == "Dosya yükle" and uploaded is not None:
+                    if (
+                        source_mode == "Dosya yükle"
+                        and uploaded is not None
+                        and uploaded_content is not None
+                    ):
                         with temporary_uploaded_audio(
-                            uploaded.name, uploaded.getvalue()
+                            uploaded.name, uploaded_content
                         ) as path:
                             execute_local_once(
                                 local, pipeline, path, show_step, show_plan
@@ -503,11 +529,12 @@ with st.sidebar:
             "Durdur", disabled=local.status != "running", use_container_width=True
         )
         if st.button("Sıfırla", use_container_width=True):
-            st.session_state.pop("local_signature", None)
+            if source_mode == "Dosya yükle":
+                upload_session.reset()
+            else:
+                st.session_state.pop("local_signature", None)
             st.session_state.pop("safe_audio_metadata", None)
-            st.session_state.upload_generation = (
-                st.session_state.get("upload_generation", 0) + 1
-            )
+            st.session_state.upload_generation = upload_session.uploader_generation
             st.session_state.suggestion_feedback = {}
 
 st.title("Canlı Koçluk Paneli")

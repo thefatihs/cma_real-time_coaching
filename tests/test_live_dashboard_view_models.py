@@ -31,6 +31,7 @@ from app.streaming.pipeline import (
 from live_dashboard.demo_data import scenario_for, tenant_demos
 from live_dashboard.uploaded_audio import (
     safe_upload_metadata,
+    safe_upload_identity,
     temporary_uploaded_audio,
 )
 from live_dashboard.view_models import (
@@ -51,6 +52,7 @@ from live_dashboard.view_models import (
     suggestion_card,
     suppression_reason_display,
     transcript_view,
+    UploadedAudioSession,
 )
 
 
@@ -376,6 +378,127 @@ def test_reset_clears_local_execution_state() -> None:
     assert cleaned.pipeline_calls == cleaned.current_chunk == cleaned.total_chunks == 0
     assert cleaned.runtime.suggestions == []
     assert cleaned.asr_window_ms == []
+
+
+def test_safe_pipeline_failure_logs_metadata_without_private_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_transcript = "PRIVATE_TRANSCRIPT_CONTENT"
+    private_path = Path("C:/CallMetricPrivate/customer-name.wav")
+
+    class FailingPipeline(FakePipeline):
+        def run(self, *args: object, **kwargs: object) -> StreamingASRResult:
+            plan_callback = kwargs.get("plan_callback")
+            step_callback = kwargs.get("step_callback")
+            result = fake_pipeline_result()
+            if callable(plan_callback):
+                plan_callback(
+                    StreamingASRPlan(
+                        tenant_id=result.tenant_id,
+                        call_id=result.call_id,
+                        total_chunks=3,
+                        audio_duration_seconds=3,
+                    )
+                )
+            if callable(step_callback):
+                step_callback(result.steps[0])
+                step_callback(result.steps[1])
+            raise RuntimeError(f"{private_transcript} {private_path}")
+
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.runtime.setfit_enabled = True
+    state.runtime.coaching_enabled = True
+    state.request_start()
+    caplog.set_level("ERROR")
+    with pytest.raises(RuntimeError):
+        execute_local_once(state, FailingPipeline(), private_path)
+    assert state.safe_failure is not None
+    assert state.safe_failure.chunk_sequence == 2
+    assert state.safe_failure.error_code == "RuntimeError"
+    assert state.safe_failure.classification_enabled
+    assert state.safe_failure.coaching_enabled
+    assert private_transcript not in caplog.text
+    assert "CallMetricPrivate" not in caplog.text
+    tabs = dashboard_tabs(state.runtime, state)
+    assert ("Hata kodu", "RuntimeError") in tabs.technical.failure_details
+    assert ("Parça", "3") in tabs.technical.failure_details
+    assert "RuntimeError" not in repr(tabs.representative)
+    assert "Ses işleme güvenli biçimde tamamlanamadı." in (
+        tabs.representative.safe_messages
+    )
+
+
+def test_uploaded_file_switch_creates_fresh_call_without_manual_reset() -> None:
+    session = UploadedAudioSession()
+    tenant = tenant_demos()["tenant_alpha"]
+    identity_a = safe_upload_identity(b"synthetic-file-a")
+    identity_b = safe_upload_identity(b"synthetic-file-b")
+    first, changed = session.select(
+        identity=identity_a,
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    assert changed
+    first.current_chunk = 3
+    first.total_chunks = 3
+    first.runtime.call_state.active_labels = ["complaint"]
+    coaching_result = fake_pipeline_result().coaching_outcomes[0].result
+    assert coaching_result is not None
+    first.runtime.suggestions.append(
+        suggestion_card(coaching_result.displayed_suggestions[0])
+    )
+
+    same, changed = session.select(
+        identity=identity_a,
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    assert same is first
+    assert not changed
+
+    second, changed = session.select(
+        identity=identity_b,
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    assert changed
+    assert second is not first
+    assert second.runtime.call_id != first.runtime.call_id
+    assert second.runtime.call_state.transcript_revision == 0
+    assert second.runtime.call_state.active_labels == []
+    assert second.runtime.suggestions == []
+    assert second.current_chunk == second.total_chunks == 0
+    assert second.safe_failure is None
+
+
+def test_manual_upload_reset_changes_widget_generation_once() -> None:
+    session = UploadedAudioSession()
+    tenant = tenant_demos()["tenant_alpha"]
+    first, _ = session.select(
+        identity=safe_upload_identity(b"first"),
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    session.reset()
+    assert session.uploader_generation == 1
+    assert session.execution is None
+    assert session.active_identity is None
+    after_reset, changed = session.select(
+        identity=safe_upload_identity(b"next"),
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    assert changed
+    assert after_reset is not first
+    assert session.uploader_generation == 1
+    same, changed = session.select(
+        identity=safe_upload_identity(b"next"),
+        tenant=tenant,
+        base_call_id="dashboard-call",
+    )
+    assert same is after_reset
+    assert not changed
+    assert session.uploader_generation == 1
 
 
 def test_responsive_rows_preserve_untruncated_status_values() -> None:

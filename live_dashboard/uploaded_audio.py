@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -15,6 +16,13 @@ class SafeUploadMetadata:
     filename: str
     format_name: str
     size_bytes: int
+
+
+def safe_upload_identity(content: bytes) -> str:
+    """Return an in-memory session identity; callers must not log or persist it."""
+    if not content:
+        raise ValueError("Yüklenen ses dosyası boş")
+    return sha256(content).hexdigest()
 
 
 def safe_upload_metadata(filename: str, size_bytes: int) -> SafeUploadMetadata:

@@ -515,3 +515,30 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Price-information uploaded-audio smoke testini yeniden
   dogrulamak.
+
+## 46. Uploaded-Audio Guvenli Hata Tanisi ve Dosya Oturumu
+
+- Dashboard pipeline exception'lari stage, error class, chunk sequence,
+  transcript revision, servis enable durumlari ve component iceren guvenli
+  structured failure metadata'sina donusturulur.
+- `logger.exception` yalnizca sanitize edilmis wrapper ve guvenli extra metadata
+  ile traceback uretir; transcript, filename, path, audio veya probability loga
+  girmez.
+- Temsilci gorunumu yalnizca genel hata mesaji, teknik izleme ise stage/error
+  code/chunk/component alanlarini gosterir.
+- Uploaded file content icin yalnizca session-memory SHA-256 identity kullanilir;
+  yeni dosya fresh call state/revision/label/suggestion/cooldown/progress ile
+  otomatik baslar, ayni dosya normal rerun'da state'i sifirlamaz.
+- Manuel reset uploader generation'i tam bir kez degistirir; sonraki ilk secim
+  korunur ve cached Whisper/SetFit kaynaklari temizlenmez.
+- Uc partial chunk'li finalization regresyonu final stable transcript ve 3/3
+  completion ile dogrulandi.
+- Degisen dosyalar: `live_dashboard/uploaded_audio.py`,
+  `live_dashboard/view_models.py`, `live_dashboard/app.py`,
+  `tests/test_live_dashboard_view_models.py`,
+  `tests/test_streaming_pipeline.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused dashboard/integration 79 passed; full 380 passed
+  (1 dependency warning); model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Iki farkli uploaded WAV ile operator smoke testini
+  tekrarlamak.

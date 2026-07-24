@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from itertools import count
+import logging
 from pathlib import Path
 from time import perf_counter
 from typing import Protocol
@@ -200,6 +201,7 @@ class TechnicalTabViewModel:
     classification_metadata: tuple[tuple[str, str], ...] = ()
     probabilities: tuple[tuple[str, float], ...] = ()
     coaching_metadata: tuple[tuple[str, str], ...] = ()
+    failure_details: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +279,7 @@ class LocalExecutionState:
     elapsed_seconds: float = 0.0
     latest_step: StreamingASRStep | None = None
     failed_chunk: int | None = None
+    safe_failure: "SafeRuntimeFailure | None" = None
 
     @property
     def real_time_factor(self) -> float | None:
@@ -287,6 +290,76 @@ class LocalExecutionState:
     def request_start(self) -> None:
         if self.status == "idle":
             self.start_requested = True
+
+
+@dataclass(frozen=True, slots=True)
+class SafeRuntimeFailure:
+    stage: str
+    error_code: str
+    chunk_sequence: int | None
+    transcript_revision: int | None
+    asr_enabled: bool
+    classification_enabled: bool
+    coaching_enabled: bool
+    component: str
+
+    def log_metadata(self) -> dict[str, object]:
+        return {
+            "failure_stage": self.stage,
+            "error_code": self.error_code,
+            "chunk_sequence": self.chunk_sequence,
+            "transcript_revision": self.transcript_revision,
+            "asr_enabled": self.asr_enabled,
+            "classification_enabled": self.classification_enabled,
+            "coaching_enabled": self.coaching_enabled,
+            "component": self.component,
+        }
+
+
+@dataclass(slots=True)
+class UploadedAudioSession:
+    execution: LocalExecutionState | None = None
+    active_identity: str | None = None
+    tenant_id: str | None = None
+    base_call_id: str | None = None
+    run_sequence: int = 0
+    uploader_generation: int = 0
+
+    def select(
+        self,
+        *,
+        identity: str,
+        tenant: TenantDemo,
+        base_call_id: str,
+    ) -> tuple[LocalExecutionState, bool]:
+        current_execution = self.execution
+        if (
+            current_execution is not None
+            and identity == self.active_identity
+            and tenant.config.context.tenant_id == self.tenant_id
+            and base_call_id == self.base_call_id
+        ):
+            return current_execution, False
+        self.run_sequence += 1
+        self.active_identity = identity
+        self.tenant_id = tenant.config.context.tenant_id
+        self.base_call_id = base_call_id
+        self.execution = create_local_execution(
+            tenant,
+            f"{base_call_id}-upload-{self.run_sequence}",
+        )
+        return self.execution, True
+
+    def reset(self) -> None:
+        self.execution = None
+        self.active_identity = None
+        self.tenant_id = None
+        self.base_call_id = None
+        self.uploader_generation += 1
+
+
+class _SafeLoggedPipelineError(RuntimeError):
+    pass
 
 
 def create_runtime(
@@ -354,6 +427,7 @@ def execute_local_once(
     progress_callback: Callable[[StreamingASRStep], None] | None = None,
     plan_progress_callback: Callable[[StreamingASRPlan], None] | None = None,
     clock: Callable[[], float] = perf_counter,
+    logger: logging.Logger | None = None,
 ) -> bool:
     """Run only after an explicit request and at most once for this state."""
     if not state.start_requested or state.status != "idle":
@@ -395,11 +469,37 @@ def execute_local_once(
             plan_callback=on_plan,
         )
         _consume_pipeline_result(state, result)
-    except Exception:
+    except Exception as error:
         state.status = "error"
         state.stage = "Başarısız"
         state.failed_chunk = min(state.current_chunk + 1, state.total_chunks or 1)
         state.error_message = "Ses işleme sırasında beklenmeyen bir hata oluştu."
+        state.safe_failure = SafeRuntimeFailure(
+            stage=(
+                "finalization"
+                if state.total_chunks and state.current_chunk >= state.total_chunks
+                else "chunk_processing"
+            ),
+            error_code=type(error).__name__,
+            chunk_sequence=(
+                min(state.current_chunk, state.total_chunks - 1)
+                if state.total_chunks
+                else None
+            ),
+            transcript_revision=state.runtime.call_state.transcript_revision,
+            asr_enabled=True,
+            classification_enabled=state.runtime.setfit_enabled,
+            coaching_enabled=state.runtime.coaching_enabled,
+            component="streaming_asr",
+        )
+        safe_logger = logger or logging.getLogger(__name__)
+        try:
+            raise _SafeLoggedPipelineError(state.safe_failure.error_code) from None
+        except _SafeLoggedPipelineError:
+            safe_logger.exception(
+                "uploaded audio pipeline failed",
+                extra=state.safe_failure.log_metadata(),
+            )
         raise
     state.processing_seconds = max(clock() - started_at, 0.0)
     state.elapsed_seconds = state.processing_seconds
@@ -669,6 +769,14 @@ def dashboard_tabs(
                 runtime.service_status_message is not None,
                 runtime.service_status_message or "",
             ),
+            (
+                local_state is not None and local_state.error_message is not None,
+                (
+                    "Ses işleme güvenli biçimde tamamlanamadı."
+                    if local_state is not None
+                    else ""
+                ),
+            ),
         )
         if active
     )
@@ -767,6 +875,23 @@ def dashboard_tabs(
                     ("Öneri ID", coaching_metadata.suggestion_id),
                     ("Kaynak", SOURCE_LABELS[coaching_metadata.source]),
                     ("Transcript revision", str(coaching_metadata.transcript_revision)),
+                )
+            ),
+            failure_details=(
+                ()
+                if local_state is None or local_state.safe_failure is None
+                else (
+                    ("Aşama", local_state.safe_failure.stage),
+                    ("Hata kodu", local_state.safe_failure.error_code),
+                    (
+                        "Parça",
+                        (
+                            str(local_state.safe_failure.chunk_sequence + 1)
+                            if local_state.safe_failure.chunk_sequence is not None
+                            else "—"
+                        ),
+                    ),
+                    ("Bileşen", local_state.safe_failure.component),
                 )
             ),
         ),
