@@ -630,3 +630,28 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Gercek uzun cagri smoke testinde revision timeline
   uzerinden product/technical detection durumunu dogrulamak.
+
+## 51. Dual-View Long-Call Current Intent Detection
+
+- Her yeni stabil delta hem tek basina hem de en fazla iki onceki cumleyi
+  iceren bounded context ile siniflandirilir; iki canonical sonuc mevcut
+  contrast guard'larindan once birlestirilir.
+- Label bazinda delta/bounded_context/both contribution, iki inference'in
+  calisma durumu, sureleri ve canonical view etiketleri metinsiz guvenli
+  metadata olarak tutulur; raw probability dashboard state'inde tutulmaz.
+- Representative ve Technical current labels ayni CallState current revision
+  kaynagindan uretilir; rule-derived `cancellation_request` temsilci ekraninda
+  "Iptal Talebi" olarak eksiksiz gorunur.
+- Representative coaching kartlarindan evidence/fixture/rule ID'leri
+  kaldirildi; priority, action, provenance, status, timestamp ve revision
+  gorunumu korundu.
+- Degisen dosyalar: `app/events/labels.py`, `app/calls/models.py`,
+  `app/classification/postprocessing.py`, `app/classification/streaming.py`,
+  `live_dashboard/view_models.py`, `live_dashboard/app.py`,
+  `tests/test_streaming_pipeline.py`,
+  `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 166 passed; full 404 passed (1 dependency warning);
+  gercek model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gercek uzun cagri smoke testinde delta/context
+  contribution ile product ve technical recovery'yi dogrulamak.

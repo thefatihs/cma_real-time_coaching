@@ -576,7 +576,7 @@ def suggestion_card(
             and (canonical := canonical_label(event.label_id)) is not None
             else None
         ),
-        tuple(event.evidence_ids),
+        (),
         PRIORITY_SYMBOLS[event.priority],
         SOURCE_LABELS[event.source],
         transcript_revision,
@@ -720,11 +720,21 @@ def dashboard_tabs(
         ),
         StatusCardViewModel("Tamamlanma", f"%{progress.percentage:.0f}"),
     )
-    chips = intent_chips(runtime.latest_labels)
     current_names = tuple(
         canonical_labels(
             runtime.call_state.active_labels
             or [label.name for label in runtime.latest_labels]
+        )
+    )
+    latest_by_name = {label.name: label for label in runtime.latest_labels}
+    chips = intent_chips(
+        tuple(
+            LabelViewModel(
+                name,
+                (latest_by_name[name].score_percent if name in latest_by_name else ""),
+                name in {"cancellation_request", "complaint", "churn_risk"},
+            )
+            for name in current_names
         )
     )
     detected_names = canonical_labels(
@@ -925,10 +935,48 @@ def dashboard_tabs(
                             else None
                         ),
                     ),
+                    (
+                        "Delta inference",
+                        "ran" if classification_metadata.delta_inference_ran else "—",
+                    ),
+                    (
+                        "Context inference",
+                        (
+                            "ran"
+                            if classification_metadata.context_inference_ran
+                            else "—"
+                        ),
+                    ),
+                    (
+                        "Delta inference süresi",
+                        (
+                            f"{classification_metadata.delta_inference_time_ms:.2f} ms"
+                            if classification_metadata.delta_inference_time_ms
+                            is not None
+                            else None
+                        ),
+                    ),
+                    (
+                        "Context inference süresi",
+                        (
+                            f"{classification_metadata.context_inference_time_ms:.2f} ms"
+                            if classification_metadata.context_inference_time_ms
+                            is not None
+                            else None
+                        ),
+                    ),
+                    (
+                        "Delta etiketleri",
+                        ", ".join(classification_metadata.delta_labels) or "—",
+                    ),
+                    (
+                        "Context etiketleri",
+                        ", ".join(classification_metadata.context_labels) or "—",
+                    ),
                 )
                 if value is not None
             ),
-            probabilities=tuple(sorted(runtime.classification_probabilities.items())),
+            probabilities=(),
             coaching_metadata=(
                 ()
                 if coaching_metadata is None
@@ -1103,7 +1151,7 @@ def _consume_classification_outcome(
         )
         for label in current_labels
     )
-    runtime.classification_probabilities = dict(classification.probabilities)
+    runtime.classification_probabilities = {}
     runtime.call_state.apply_classification(
         classification,
         transcript_revision=outcome.transcript_revision or 0,
@@ -1111,6 +1159,13 @@ def _consume_classification_outcome(
         context_sentence_count=outcome.context_sentence_count,
         preceding_sentence_count=outcome.preceding_sentence_count,
         delta_word_count=outcome.delta_word_count,
+        delta_inference_ran=outcome.delta_inference_ran,
+        context_inference_ran=outcome.context_inference_ran,
+        delta_inference_time_ms=outcome.delta_inference_time_ms,
+        context_inference_time_ms=outcome.context_inference_time_ms,
+        delta_labels=outcome.delta_labels,
+        context_labels=outcome.context_labels,
+        label_view_sources=dict(outcome.label_view_sources),
     )
     for label in current_labels:
         if label not in runtime.detected_label_names:

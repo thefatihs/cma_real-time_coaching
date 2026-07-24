@@ -11,7 +11,9 @@ from app.classification.postprocessing import (
     ClassificationPostProcessingMetadata,
     apply_classification_contrast_guards,
     canonicalize_classification_result,
+    merge_classification_views,
 )
+from app.events.labels import ClassificationViewSource
 from app.events.models import (
     ClassificationResultEvent,
     TranscriptEvent,
@@ -61,6 +63,13 @@ class StableClassificationOutcome:
     context_sentence_count: int = 0
     preceding_sentence_count: int = 0
     delta_word_count: int = 0
+    delta_inference_ran: bool = False
+    context_inference_ran: bool = False
+    delta_inference_time_ms: float | None = None
+    context_inference_time_ms: float | None = None
+    delta_labels: tuple[str, ...] = ()
+    context_labels: tuple[str, ...] = ()
+    label_view_sources: tuple[tuple[str, ClassificationViewSource], ...] = ()
 
 
 class StableTranscriptClassificationStage:
@@ -118,7 +127,15 @@ class StableTranscriptClassificationStage:
             event.revision, event.source_chunk_sequence
         )
         try:
-            raw_result = self._classifier.classify(
+            raw_delta_result = self._classifier.classify(
+                tenant_id=event.tenant_id,
+                call_id=event.call_id,
+                text=delta,
+                transcript_event_id=event.event_id,
+                revision=event.revision,
+                sequence_number=event.source_chunk_sequence,
+            )
+            raw_context_result = self._classifier.classify(
                 tenant_id=event.tenant_id,
                 call_id=event.call_id,
                 text=classification_text,
@@ -126,11 +143,22 @@ class StableTranscriptClassificationStage:
                 revision=event.revision,
                 sequence_number=event.source_chunk_sequence,
             )
-            canonical_result = canonicalize_classification_result(raw_result)
+            delta_result = canonicalize_classification_result(raw_delta_result)
+            context_result = canonicalize_classification_result(raw_context_result)
+            merged_result, label_view_sources = merge_classification_views(
+                delta_result,
+                context_result,
+            )
             result, postprocessing = apply_classification_contrast_guards(
                 classification_text,
-                canonical_result,
+                merged_result,
             )
+            active_names = {label.name for label in result.labels}
+            label_view_sources = {
+                label: source
+                for label, source in label_view_sources.items()
+                if label in active_names
+            }
             call_state.apply_classification(
                 result,
                 transcript_revision=event.revision,
@@ -138,6 +166,13 @@ class StableTranscriptClassificationStage:
                 context_sentence_count=sentence_count,
                 preceding_sentence_count=preceding_count,
                 delta_word_count=len(delta.split()),
+                delta_inference_ran=True,
+                context_inference_ran=True,
+                delta_inference_time_ms=delta_result.processing_time_ms,
+                context_inference_time_ms=context_result.processing_time_ms,
+                delta_labels=tuple(label.name for label in delta_result.labels),
+                context_labels=tuple(label.name for label in context_result.labels),
+                label_view_sources=label_view_sources,
             )
             self._logger.info(
                 "stable transcript classification completed",
@@ -150,6 +185,12 @@ class StableTranscriptClassificationStage:
                     "threshold_profile_id": result.threshold_profile_id,
                     "labels": [label.name for label in result.labels],
                     "inference_time_ms": result.processing_time_ms,
+                    "delta_inference_ran": True,
+                    "context_inference_ran": True,
+                    "delta_inference_time_ms": delta_result.processing_time_ms,
+                    "context_inference_time_ms": context_result.processing_time_ms,
+                    "delta_labels": [label.name for label in delta_result.labels],
+                    "context_labels": [label.name for label in context_result.labels],
                     "context_sentence_count": sentence_count,
                     "preceding_sentence_count": preceding_count,
                     "delta_word_count": len(delta.split()),
@@ -164,6 +205,13 @@ class StableTranscriptClassificationStage:
                 context_sentence_count=sentence_count,
                 preceding_sentence_count=preceding_count,
                 delta_word_count=len(delta.split()),
+                delta_inference_ran=True,
+                context_inference_ran=True,
+                delta_inference_time_ms=delta_result.processing_time_ms,
+                context_inference_time_ms=context_result.processing_time_ms,
+                delta_labels=tuple(label.name for label in delta_result.labels),
+                context_labels=tuple(label.name for label in context_result.labels),
+                label_view_sources=tuple(label_view_sources.items()),
             )
         except Exception as error:
             safe_error = SafeClassificationError(error_type=type(error).__name__)

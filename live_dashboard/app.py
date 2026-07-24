@@ -220,8 +220,6 @@ def _render_representative(
                     details.append(f"Revizyon: {card.transcript_revision}")
                 if card.related_label:
                     details.append(f"Etiket: {card.related_label}")
-                if card.evidence_ids:
-                    details.append("Kanıt: " + ", ".join(card.evidence_ids))
                 st.caption(" · ".join(details))
                 for column, value in zip(
                     st.columns(3), ("Görüldü", "Uygulandı", "Uygun değil"), strict=True

@@ -7,6 +7,7 @@ import pytest
 from app.classification.streaming import (
     ClassificationProcessingStatus,
     RuntimeClassifierProtocol,
+    StableClassificationOutcome,
     StableTranscriptClassificationStage,
 )
 from app.calls.models import CallState
@@ -25,6 +26,7 @@ from app.events.models import (
     TranscriptEvent,
     TranscriptKind,
 )
+from app.events.labels import ClassificationViewSource
 from app.streaming.audio_window import ASRAudioWindow
 from app.streaming.pipeline import (
     CoachingCoordinatorFactory,
@@ -247,6 +249,70 @@ class FixedLabelClassifier(FakeRuntimeClassifier):
         )
 
 
+class SequencedViewClassifier(FakeRuntimeClassifier):
+    def __init__(self, *responses: tuple[str, ...]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    def classify(self, **kwargs: object) -> ClassificationResultEvent:
+        base = super().classify(**kwargs)  # type: ignore[arg-type]
+        labels = self.responses[len(self.calls) - 1]
+        action = (
+            CoachingAction.NO_ACTION
+            if not labels or labels == ("no_action",)
+            else CoachingAction.TEMPLATE_ACTION
+        )
+        return base.model_copy(
+            update={
+                "labels": [
+                    ClassificationLabel(name=label, score=0.9) for label in labels
+                ],
+                "action": action,
+                "probabilities": {label: 0.9 for label in labels},
+                "thresholds": {label: 0.5 for label in labels},
+                "processing_time_ms": float(len(self.calls)),
+            }
+        )
+
+
+def dual_view_outcome(
+    delta_labels: tuple[str, ...],
+    context_labels: tuple[str, ...],
+    *,
+    delta: str,
+    preceding: str,
+) -> tuple[StableClassificationOutcome, CallState, SequencedViewClassifier]:
+    classifier = SequencedViewClassifier(delta_labels, context_labels)
+    stage = StableTranscriptClassificationStage(classifier)
+    state = CallState(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        stable_transcript=preceding,
+    )
+    event = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        event_id="stable-dual",
+        kind=TranscriptKind.STABLE,
+        text=delta,
+        start_seconds=1.0,
+        end_seconds=2.0,
+        revision=1,
+        created_at_utc=NOW,
+        source_chunk_sequence=1,
+    )
+    state.apply_transcript(event)
+    outcome = stage.process(
+        event,
+        cumulative_stable_transcript=state.stable_transcript,
+        stable_changed=True,
+        call_state=state,
+        stable_delta=delta,
+        preceding_stable_transcript=preceding,
+    )
+    return outcome, state, classifier
+
+
 def test_ordered_execution_one_transcription_per_chunk_and_short_final_chunk() -> None:
     source = [chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0), chunk(2, 4.0, 0.5)]
     calls: list[object] = []
@@ -409,6 +475,8 @@ def test_only_stable_changes_are_classified_with_bounded_context() -> None:
     )
     assert [call["text"] for call in classifier.calls] == [
         "first second",
+        "first second",
+        "ending",
         "first second ending",
     ]
     assert all(
@@ -423,7 +491,9 @@ def test_only_stable_changes_are_classified_with_bounded_context() -> None:
     assert partial_outcomes
     assert result.classification_metadata.active_labels == ("complaint",)
     assert result.classification_metadata.model_id == "common_turkish_setfit_v2"
-    assert result.classification_metadata.inference_time_ms == 4.0
+    assert result.classification_metadata.inference_time_ms == 8.0
+    assert result.classification_metadata.delta_inference_time_ms == 4.0
+    assert result.classification_metadata.context_inference_time_ms == 4.0
     assert result.classification_metadata.context_sentence_count == 2
     assert result.classification_metadata.preceding_sentence_count == 1
     assert not hasattr(result.classification_metadata, "probabilities")
@@ -516,6 +586,8 @@ def test_duplicate_revision_skipped_and_newer_revision_classified() -> None:
     assert second_outcome.status is ClassificationProcessingStatus.CLASSIFIED
     assert [call["text"] for call in classifier.calls] == [
         "first stable",
+        "first stable",
+        "second stable",
         "first stable second stable",
     ]
     assert second_outcome.preceding_sentence_count == 1
@@ -811,7 +883,7 @@ def test_synthetic_long_call_classifies_deltas_and_accumulates_all_labels() -> N
             )
         )
 
-    assert len(classifier.calls) == 6
+    assert len(classifier.calls) == 12
     assert all(outcome.context_sentence_count <= 3 for outcome in outcomes)
     assert all(outcome.preceding_sentence_count <= 2 for outcome in outcomes)
     assert label_sentences[0][1] not in str(classifier.calls[-1]["text"])
@@ -823,6 +895,83 @@ def test_synthetic_long_call_classifies_deltas_and_accumulates_all_labels() -> N
     metadata = state.classification_metadata()
     assert not hasattr(metadata, "transcript_text")
     assert not hasattr(metadata, "probabilities")
+
+
+def test_delta_view_recovers_product_information() -> None:
+    outcome, state, classifier = dual_view_outcome(
+        ("product_information",),
+        (),
+        delta="Ürün özelliklerini öğrenmek istiyorum.",
+        preceding="Merhaba.",
+    )
+    assert [label.name for label in outcome.classification_event.labels] == [  # type: ignore[union-attr]
+        "product_information"
+    ]
+    assert outcome.delta_labels == ("product_information",)
+    assert outcome.context_labels == ()
+    assert outcome.label_view_sources == (
+        ("product_information", ClassificationViewSource.DELTA),
+    )
+    assert [call["text"] for call in classifier.calls] == [
+        "Ürün özelliklerini öğrenmek istiyorum.",
+        "Merhaba. Ürün özelliklerini öğrenmek istiyorum.",
+    ]
+    assert state.classification_metadata().delta_inference_ran
+    assert (
+        state.label_revision_timeline[0].evidence[0].classification_view
+        is ClassificationViewSource.DELTA
+    )
+
+
+def test_delta_view_recovers_technical_issue_while_context_keeps_price() -> None:
+    outcome, state, _ = dual_view_outcome(
+        ("technical_issue",),
+        ("price_objection",),
+        delta="Uygulama açılmıyor ve bağlantı kurulamıyor.",
+        preceding="Bu ücret çok pahalı.",
+    )
+    classification = outcome.classification_event
+    assert classification is not None
+    assert {label.name for label in classification.labels} == {
+        "technical_issue",
+        "price_objection",
+    }
+    assert dict(outcome.label_view_sources) == {
+        "technical_issue": ClassificationViewSource.DELTA,
+        "price_objection": ClassificationViewSource.BOUNDED_CONTEXT,
+    }
+    assert set(state.active_labels) == {"technical_issue", "price_objection"}
+
+
+def test_context_view_recovers_context_dependent_churn_risk() -> None:
+    outcome, _, _ = dual_view_outcome(
+        (),
+        ("churn_risk",),
+        delta="Böyle devam ederse geçiş yapacağım.",
+        preceding="Sorunlar haftalardır çözülmedi.",
+    )
+    classification = outcome.classification_event
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["churn_risk"]
+    assert outcome.label_view_sources == (
+        ("churn_risk", ClassificationViewSource.BOUNDED_CONTEXT),
+    )
+
+
+def test_dual_view_merge_preserves_multilabel_and_no_action_exclusivity() -> None:
+    outcome, _, _ = dual_view_outcome(
+        ("product_information", "no_action"),
+        ("technical_issue", "no_action"),
+        delta="Özellik bilgisini verir misiniz, uygulama da açılmıyor.",
+        preceding="Destek rica ediyorum.",
+    )
+    classification = outcome.classification_event
+    assert classification is not None
+    assert {label.name for label in classification.labels} == {
+        "product_information",
+        "technical_issue",
+    }
+    assert "no_action" not in dict(outcome.label_view_sources)
 
 
 def test_three_partial_chunks_finalize_stable_transcript_without_failure() -> None:

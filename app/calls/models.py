@@ -2,7 +2,11 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.events.labels import CANONICAL_LABELS, canonical_labels
+from app.events.labels import (
+    CANONICAL_LABELS,
+    ClassificationViewSource,
+    canonical_labels,
+)
 from app.events.models import (
     AudioChunkEvent,
     ClassificationResultEvent,
@@ -49,6 +53,7 @@ class CallRevisionLabelEvidence(BaseModel):
     source: CoachingSuggestionSource
     model_id: str | None = None
     threshold_profile_id: str | None = None
+    classification_view: ClassificationViewSource | None = None
 
     @field_validator("label")
     @classmethod
@@ -107,6 +112,12 @@ class CallState(BaseModel):
     classification_context_sentence_count: int | None = None
     classification_preceding_sentence_count: int | None = None
     classification_delta_word_count: int | None = None
+    classification_delta_inference_ran: bool = False
+    classification_context_inference_ran: bool = False
+    classification_delta_inference_time_ms: float | None = None
+    classification_context_inference_time_ms: float | None = None
+    classification_delta_labels: list[str] = Field(default_factory=list)
+    classification_context_labels: list[str] = Field(default_factory=list)
     coaching_suggestions: list["CallCoachingMetadata"] = Field(default_factory=list)
     coaching_transcript_revision: int | None = None
 
@@ -216,6 +227,13 @@ class CallState(BaseModel):
         context_sentence_count: int | None = None,
         preceding_sentence_count: int | None = None,
         delta_word_count: int | None = None,
+        delta_inference_ran: bool = False,
+        context_inference_ran: bool = False,
+        delta_inference_time_ms: float | None = None,
+        context_inference_time_ms: float | None = None,
+        delta_labels: tuple[str, ...] = (),
+        context_labels: tuple[str, ...] = (),
+        label_view_sources: dict[str, ClassificationViewSource] | None = None,
     ) -> None:
         self._ensure_same_scope(event)
         self.mark_classification_attempt(transcript_revision, source_sequence)
@@ -226,6 +244,7 @@ class CallState(BaseModel):
             source=CoachingSuggestionSource.CLASSIFICATION,
             model_id=event.model_id,
             threshold_profile_id=event.threshold_profile_id,
+            classification_view_sources=label_view_sources,
         )
         self.classification_model_id = event.model_id
         self.classification_threshold_profile_id = event.threshold_profile_id
@@ -233,6 +252,12 @@ class CallState(BaseModel):
         self.classification_context_sentence_count = context_sentence_count
         self.classification_preceding_sentence_count = preceding_sentence_count
         self.classification_delta_word_count = delta_word_count
+        self.classification_delta_inference_ran = delta_inference_ran
+        self.classification_context_inference_ran = context_inference_ran
+        self.classification_delta_inference_time_ms = delta_inference_time_ms
+        self.classification_context_inference_time_ms = context_inference_time_ms
+        self.classification_delta_labels = canonical_labels(delta_labels)
+        self.classification_context_labels = canonical_labels(context_labels)
 
     def classification_metadata(self) -> "CallClassificationMetadata":
         return CallClassificationMetadata(
@@ -247,6 +272,12 @@ class CallState(BaseModel):
             preceding_sentence_count=self.classification_preceding_sentence_count,
             delta_word_count=self.classification_delta_word_count,
             revision_label_timeline=tuple(self.label_revision_timeline),
+            delta_inference_ran=self.classification_delta_inference_ran,
+            context_inference_ran=self.classification_context_inference_ran,
+            delta_inference_time_ms=self.classification_delta_inference_time_ms,
+            context_inference_time_ms=self.classification_context_inference_time_ms,
+            delta_labels=tuple(self.classification_delta_labels),
+            context_labels=tuple(self.classification_context_labels),
         )
 
     def record_detected_labels(
@@ -257,6 +288,9 @@ class CallState(BaseModel):
         source: CoachingSuggestionSource,
         model_id: str | None = None,
         threshold_profile_id: str | None = None,
+        classification_view_sources: (
+            dict[str, ClassificationViewSource] | None
+        ) = None,
     ) -> None:
         cleaned = canonical_labels(labels)
         previously_detected = {item.label for item in self.detected_labels}
@@ -322,6 +356,7 @@ class CallState(BaseModel):
             source=source,
             model_id=model_id,
             threshold_profile_id=threshold_profile_id,
+            classification_view_sources=classification_view_sources or {},
         )
 
     def _upsert_label_revision_diagnostic(
@@ -333,6 +368,7 @@ class CallState(BaseModel):
         source: CoachingSuggestionSource,
         model_id: str | None,
         threshold_profile_id: str | None,
+        classification_view_sources: dict[str, ClassificationViewSource],
     ) -> None:
         existing = next(
             (
@@ -367,6 +403,20 @@ class CallState(BaseModel):
                     if source is not CoachingSuggestionSource.RULE
                     and threshold_profile_id
                     else previous.threshold_profile_id
+                    if previous is not None
+                    else None
+                ),
+                classification_view=(
+                    classification_view_sources.get(
+                        label,
+                        (
+                            previous.classification_view
+                            if previous is not None
+                            else None
+                        ),
+                    )
+                    if source is not CoachingSuggestionSource.RULE
+                    else previous.classification_view
                     if previous is not None
                     else None
                 ),
@@ -501,6 +551,12 @@ class CallClassificationMetadata(BaseModel):
     preceding_sentence_count: int | None = None
     delta_word_count: int | None = None
     revision_label_timeline: tuple[CallRevisionLabelDiagnostic, ...] = ()
+    delta_inference_ran: bool = False
+    context_inference_ran: bool = False
+    delta_inference_time_ms: float | None = None
+    context_inference_time_ms: float | None = None
+    delta_labels: tuple[str, ...] = ()
+    context_labels: tuple[str, ...] = ()
 
     @field_validator("active_labels")
     @classmethod
