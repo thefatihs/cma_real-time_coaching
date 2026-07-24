@@ -7,6 +7,7 @@ import pytest
 from app.classification.streaming import (
     ClassificationProcessingStatus,
     RuntimeClassifierProtocol,
+    StableClassificationOutcome,
     StableTranscriptClassificationStage,
 )
 from app.calls.models import CallState
@@ -25,6 +26,7 @@ from app.events.models import (
     TranscriptEvent,
     TranscriptKind,
 )
+from app.events.labels import ClassificationViewSource
 from app.streaming.audio_window import ASRAudioWindow
 from app.streaming.pipeline import (
     CoachingCoordinatorFactory,
@@ -229,6 +231,88 @@ class FakeRuntimeClassifier:
         )
 
 
+class FixedLabelClassifier(FakeRuntimeClassifier):
+    def __init__(self, *labels: str) -> None:
+        super().__init__()
+        self.labels = labels
+
+    def classify(self, **kwargs: object) -> ClassificationResultEvent:
+        base = super().classify(**kwargs)  # type: ignore[arg-type]
+        return base.model_copy(
+            update={
+                "labels": [
+                    ClassificationLabel(name=label, score=0.9) for label in self.labels
+                ],
+                "probabilities": {label: 0.9 for label in self.labels},
+                "thresholds": {label: 0.5 for label in self.labels},
+            }
+        )
+
+
+class SequencedViewClassifier(FakeRuntimeClassifier):
+    def __init__(self, *responses: tuple[str, ...]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    def classify(self, **kwargs: object) -> ClassificationResultEvent:
+        base = super().classify(**kwargs)  # type: ignore[arg-type]
+        labels = self.responses[len(self.calls) - 1]
+        action = (
+            CoachingAction.NO_ACTION
+            if not labels or labels == ("no_action",)
+            else CoachingAction.TEMPLATE_ACTION
+        )
+        return base.model_copy(
+            update={
+                "labels": [
+                    ClassificationLabel(name=label, score=0.9) for label in labels
+                ],
+                "action": action,
+                "probabilities": {label: 0.9 for label in labels},
+                "thresholds": {label: 0.5 for label in labels},
+                "processing_time_ms": float(len(self.calls)),
+            }
+        )
+
+
+def dual_view_outcome(
+    delta_labels: tuple[str, ...],
+    context_labels: tuple[str, ...],
+    *,
+    delta: str,
+    preceding: str,
+) -> tuple[StableClassificationOutcome, CallState, SequencedViewClassifier]:
+    classifier = SequencedViewClassifier(delta_labels, context_labels)
+    stage = StableTranscriptClassificationStage(classifier)
+    state = CallState(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        stable_transcript=preceding,
+    )
+    event = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        event_id="stable-dual",
+        kind=TranscriptKind.STABLE,
+        text=delta,
+        start_seconds=1.0,
+        end_seconds=2.0,
+        revision=1,
+        created_at_utc=NOW,
+        source_chunk_sequence=1,
+    )
+    state.apply_transcript(event)
+    outcome = stage.process(
+        event,
+        cumulative_stable_transcript=state.stable_transcript,
+        stable_changed=True,
+        call_state=state,
+        stable_delta=delta,
+        preceding_stable_transcript=preceding,
+    )
+    return outcome, state, classifier
+
+
 def test_ordered_execution_one_transcription_per_chunk_and_short_final_chunk() -> None:
     source = [chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0), chunk(2, 4.0, 0.5)]
     calls: list[object] = []
@@ -372,7 +456,7 @@ def test_plan_has_exact_total_and_short_final_chunk_before_inference() -> None:
     ].chunk_start_seconds == (pytest.approx(0.03))
 
 
-def test_only_stable_changes_are_classified_with_cumulative_context() -> None:
+def test_only_stable_changes_are_classified_with_bounded_context() -> None:
     source = [chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0), chunk(2, 4.0, 2.0)]
     transcriber = FakeTranscriber(
         [
@@ -391,6 +475,8 @@ def test_only_stable_changes_are_classified_with_cumulative_context() -> None:
     )
     assert [call["text"] for call in classifier.calls] == [
         "first second",
+        "first second",
+        "ending",
         "first second ending",
     ]
     assert all(
@@ -405,7 +491,11 @@ def test_only_stable_changes_are_classified_with_cumulative_context() -> None:
     assert partial_outcomes
     assert result.classification_metadata.active_labels == ("complaint",)
     assert result.classification_metadata.model_id == "common_turkish_setfit_v2"
-    assert result.classification_metadata.inference_time_ms == 4.0
+    assert result.classification_metadata.inference_time_ms == 8.0
+    assert result.classification_metadata.delta_inference_time_ms == 4.0
+    assert result.classification_metadata.context_inference_time_ms == 4.0
+    assert result.classification_metadata.context_sentence_count == 2
+    assert result.classification_metadata.preceding_sentence_count == 1
     assert not hasattr(result.classification_metadata, "probabilities")
 
 
@@ -486,6 +576,8 @@ def test_duplicate_revision_skipped_and_newer_revision_classified() -> None:
         cumulative_stable_transcript=state.stable_transcript,
         stable_changed=True,
         call_state=state,
+        stable_delta=second.text,
+        preceding_stable_transcript="first stable",
     )
     assert first_outcome.status is ClassificationProcessingStatus.CLASSIFIED
     assert duplicate_outcome.status is (
@@ -494,8 +586,11 @@ def test_duplicate_revision_skipped_and_newer_revision_classified() -> None:
     assert second_outcome.status is ClassificationProcessingStatus.CLASSIFIED
     assert [call["text"] for call in classifier.calls] == [
         "first stable",
+        "first stable",
+        "second stable",
         "first stable second stable",
     ]
+    assert second_outcome.preceding_sentence_count == 1
 
 
 def test_empty_cumulative_stable_transcript_is_skipped() -> None:
@@ -655,6 +750,228 @@ def test_price_query_guard_prevents_price_objection_coaching_card(
     assert len(coaching.displayed_suggestions) == 1
     assert coaching.displayed_suggestions[0].label_id == "product_information"
     assert transcript not in caplog.text
+
+
+def test_short_explicit_cancellation_preserves_label_coaching_and_both_source() -> None:
+    transcript = (
+        "Aboneliğimi bugün iptal ettirmek istiyorum. Lütfen iptal işlemini başlatın."
+    )
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(transcript, 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier("cancellation_request"),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    coaching = result.coaching_outcomes[-1].result
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["cancellation_request"]
+    assert coaching is not None
+    assert len(coaching.displayed_suggestions) == 1
+    assert coaching.displayed_suggestions[0].label_id == "cancellation_request"
+    assert coaching.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
+
+
+def test_short_negated_cancellation_does_not_trigger_rule_or_coaching() -> None:
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("İptal etmek istemiyorum.", 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier(),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    coaching = result.coaching_outcomes[-1].result
+    assert classification is not None
+    assert classification.labels == []
+    assert coaching is not None
+    assert coaching.displayed_suggestions == ()
+    assert coaching.matched_rule_ids == ()
+
+
+def test_short_price_information_question_preserves_product_information_only() -> None:
+    transcript = "Paketin aylık fiyatı ne kadar, ücret seçeneklerini öğrenebilir miyim?"
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(transcript, 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier(
+            "product_information", "price_objection"
+        ),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["product_information"]
+
+
+def test_short_true_price_objection_preserves_price_objection() -> None:
+    transcript = "Bu ücret çok pahalı, bütçemi aşıyor."
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(transcript, 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier("price_objection"),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    coaching = result.coaching_outcomes[-1].result
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["price_objection"]
+    assert coaching is not None
+    assert coaching.displayed_suggestions[0].label_id == "price_objection"
+    assert coaching.displayed_suggestions[0].source is (
+        CoachingSuggestionSource.CLASSIFICATION
+    )
+
+
+def test_synthetic_long_call_classifies_deltas_and_accumulates_all_labels() -> None:
+    label_sentences = (
+        ("product_information", "Ürün özelliklerini öğrenmek istiyorum."),
+        ("price_objection", "Bu ücret çok pahalı."),
+        ("technical_issue", "Uygulama açılmıyor."),
+        ("complaint", "Bu durumdan şikayetçiyim."),
+        ("churn_risk", "Böyle devam ederse başka firmaya geçeceğim."),
+        ("cancellation_request", "Aboneliğimi iptal etmek istiyorum."),
+    )
+
+    class LongCallClassifier(FakeRuntimeClassifier):
+        def classify(self, **kwargs: object) -> ClassificationResultEvent:
+            base = super().classify(**kwargs)  # type: ignore[arg-type]
+            text = str(kwargs["text"])
+            label = next(
+                label
+                for label, sentence in reversed(label_sentences)
+                if sentence in text
+            )
+            return base.model_copy(
+                update={
+                    "labels": [ClassificationLabel(name=label, score=0.9)],
+                    "probabilities": {label: 0.9},
+                    "thresholds": {label: 0.5},
+                }
+            )
+
+    classifier = LongCallClassifier()
+    stage = StableTranscriptClassificationStage(classifier)
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    outcomes = []
+    for revision, (_, sentence) in enumerate(label_sentences, start=1):
+        previous = state.stable_transcript
+        event = TranscriptEvent(
+            tenant_id="tenant_alpha",
+            call_id="call_001",
+            event_id=f"stable-{revision}",
+            kind=TranscriptKind.STABLE,
+            text=sentence,
+            start_seconds=float(revision - 1),
+            end_seconds=float(revision),
+            revision=revision,
+            created_at_utc=NOW,
+            source_chunk_sequence=revision,
+        )
+        state.apply_transcript(event)
+        outcomes.append(
+            stage.process(
+                event,
+                cumulative_stable_transcript=state.stable_transcript,
+                stable_changed=True,
+                call_state=state,
+                stable_delta=event.text,
+                preceding_stable_transcript=previous,
+            )
+        )
+
+    assert len(classifier.calls) == 12
+    assert all(outcome.context_sentence_count <= 3 for outcome in outcomes)
+    assert all(outcome.preceding_sentence_count <= 2 for outcome in outcomes)
+    assert label_sentences[0][1] not in str(classifier.calls[-1]["text"])
+    assert label_sentences[-1][1] in str(classifier.calls[-1]["text"])
+    assert [item.label for item in state.detected_labels] == [
+        label for label, _ in label_sentences
+    ]
+    assert state.active_labels == ["cancellation_request"]
+    metadata = state.classification_metadata()
+    assert not hasattr(metadata, "transcript_text")
+    assert not hasattr(metadata, "probabilities")
+
+
+def test_delta_view_recovers_product_information() -> None:
+    outcome, state, classifier = dual_view_outcome(
+        ("product_information",),
+        (),
+        delta="Ürün özelliklerini öğrenmek istiyorum.",
+        preceding="Merhaba.",
+    )
+    assert [label.name for label in outcome.classification_event.labels] == [  # type: ignore[union-attr]
+        "product_information"
+    ]
+    assert outcome.delta_labels == ("product_information",)
+    assert outcome.context_labels == ()
+    assert outcome.label_view_sources == (
+        ("product_information", ClassificationViewSource.DELTA),
+    )
+    assert [call["text"] for call in classifier.calls] == [
+        "Ürün özelliklerini öğrenmek istiyorum.",
+        "Merhaba. Ürün özelliklerini öğrenmek istiyorum.",
+    ]
+    assert state.classification_metadata().delta_inference_ran
+    assert (
+        state.label_revision_timeline[0].evidence[0].classification_view
+        is ClassificationViewSource.DELTA
+    )
+
+
+def test_delta_view_recovers_technical_issue_while_context_keeps_price() -> None:
+    outcome, state, _ = dual_view_outcome(
+        ("technical_issue",),
+        ("price_objection",),
+        delta="Uygulama açılmıyor ve bağlantı kurulamıyor.",
+        preceding="Bu ücret çok pahalı.",
+    )
+    classification = outcome.classification_event
+    assert classification is not None
+    assert {label.name for label in classification.labels} == {
+        "technical_issue",
+        "price_objection",
+    }
+    assert dict(outcome.label_view_sources) == {
+        "technical_issue": ClassificationViewSource.DELTA,
+        "price_objection": ClassificationViewSource.BOUNDED_CONTEXT,
+    }
+    assert set(state.active_labels) == {"technical_issue", "price_objection"}
+
+
+def test_context_view_recovers_context_dependent_churn_risk() -> None:
+    outcome, _, _ = dual_view_outcome(
+        (),
+        ("churn_risk",),
+        delta="Böyle devam ederse geçiş yapacağım.",
+        preceding="Sorunlar haftalardır çözülmedi.",
+    )
+    classification = outcome.classification_event
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["churn_risk"]
+    assert outcome.label_view_sources == (
+        ("churn_risk", ClassificationViewSource.BOUNDED_CONTEXT),
+    )
+
+
+def test_dual_view_merge_preserves_multilabel_and_no_action_exclusivity() -> None:
+    outcome, _, _ = dual_view_outcome(
+        ("product_information", "no_action"),
+        ("technical_issue", "no_action"),
+        delta="Özellik bilgisini verir misiniz, uygulama da açılmıyor.",
+        preceding="Destek rica ediyorum.",
+    )
+    classification = outcome.classification_event
+    assert classification is not None
+    assert {label.name for label in classification.labels} == {
+        "product_information",
+        "technical_issue",
+    }
+    assert "no_action" not in dict(outcome.label_view_sources)
 
 
 def test_three_partial_chunks_finalize_stable_transcript_without_failure() -> None:

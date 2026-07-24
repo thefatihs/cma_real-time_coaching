@@ -564,3 +564,94 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: File A tamamla -> File B sec -> Baslat akisini canli
   Streamlit oturumunda yeniden dogrulamak.
+
+## 48. Kisa Cagri Siniflandirma Geriye Uyumluluk Regresyonlari
+
+- Kisa cagrilarda acik iptal talebi ve coaching, Turkce iptal olumsuzlamasi,
+  fiyat bilgisi ile fiyat itirazi ayrimi ve gercek fiyat itirazi davranislari
+  uc uca sentetik regresyonlarla koruma altina alindi.
+- Kisa cagri coaching onerilerinde `both` provenance ve icerik tabanli
+  deduplication davranisinin degismedigi ayrica dogrulandi.
+- Degisen dosyalar: `tests/test_streaming_pipeline.py`,
+  `tests/test_coaching_coordinator.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused streaming/coaching 48 passed; full 388 passed
+  (1 dependency warning); model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Uzun cagri artimli siniflandirma uygulanirken bu kisa
+  cagri regresyonlarini degisikliksiz gecirmek.
+
+## 49. Uzun Cagri Transkript ve Siniflandirma Iyilestirmeleri
+
+- Rolling-window stabil metin uzlastirmasi zaman ortusmesi, noktalama/Turkce
+  case normalizasyonu ve sinirli fuzzy kelime ortusmesiyle eski cumleleri
+  yeniden eklemez; daha sonra gercekten tekrarlanan konusma korunur.
+- Her stabil revizyonda yalnizca yeni delta ve en fazla iki onceki stabil cumle
+  siniflandirilir; partial metin, duplicate revizyon ve classification input
+  metni guvenli metadata'ya veya loglara girmez.
+- Current revision etiketleri ile call-level etiketler ayrildi; call-level
+  metadata ilk/son revizyon, rule/classification/both kaynagi ve guvenli model
+  kimliklerini saklar, `no_action` business etiketlerle birlikte tutulmaz.
+- Coaching yalnizca guncel stabil delta ve guncel classification sonucu ile
+  uretilir; deterministic kurallar, cooldown, deduplication, priority ve
+  maksimum oneri davranislari korundu.
+- Dashboard "Su Anki Etiketler" ve "Gorusmede Tespit Edilenler" alanlarini
+  ayri gosterir; teknik gorunum yalnizca metinsiz bounded-context sayaclarini
+  gosterir.
+- Degisen dosyalar: `app/calls/models.py`, `app/classification/streaming.py`,
+  `app/coaching/coordinator.py`, `app/streaming/pipeline.py`,
+  `app/streaming/transcript_reconciler.py`, `live_dashboard/app.py`,
+  `live_dashboard/view_models.py`, ilgili bes test dosyasi ve
+  `PROJECT_PROGRESS.md`.
+- Testler: focused 158 passed; full 396 passed (1 dependency warning);
+  gercek model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Sentetik olmayan uzun WAV smoke testinde transcript ve
+  call-level etiket ayrimini operator ekranindan dogrulamak.
+
+## 50. Canonical Call Label Aggregation ve Revision Diagnostics
+
+- Runtime label siniri sekiz taxonomy etiketiyle sinirlandi; bilinen tenant
+  alias'lari canonical business etiketlerine cevrilir, `iptal_riski` ve
+  `ayrilma_talebi` yalnizca `cancellation_request` olarak saklanir/gosterilir.
+- Classification ve deterministic rule kaniti call aggregate icinde
+  rule/classification/both provenance ile birlesir; first/latest revision ve
+  classification kaynakli model/profile kimlikleri korunur.
+- Her stabil classification revizyonu icin yalnizca revision, current canonical
+  labels, newly accumulated labels ve guvenli evidence metadata'si tutan
+  revision timeline eklendi; text, probability, token, dosya veya path tutulmaz.
+- Revision timeline yalnizca Technical Monitoring'de gosterilir; temsilci
+  ekraninda canonical `cancellation_request` "Iptal Talebi" olarak gorunur.
+- Degisen dosyalar: `app/events/labels.py`, `app/calls/models.py`,
+  `app/classification/postprocessing.py`, `app/classification/streaming.py`,
+  `app/coaching/rule_engine.py`, `live_dashboard/view_models.py`,
+  `live_dashboard/app.py`, ilgili dort test dosyasi ve `PROJECT_PROGRESS.md`.
+- Testler: focused 161 passed; full 399 passed (1 dependency warning);
+  gercek model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gercek uzun cagri smoke testinde revision timeline
+  uzerinden product/technical detection durumunu dogrulamak.
+
+## 51. Dual-View Long-Call Current Intent Detection
+
+- Her yeni stabil delta hem tek basina hem de en fazla iki onceki cumleyi
+  iceren bounded context ile siniflandirilir; iki canonical sonuc mevcut
+  contrast guard'larindan once birlestirilir.
+- Label bazinda delta/bounded_context/both contribution, iki inference'in
+  calisma durumu, sureleri ve canonical view etiketleri metinsiz guvenli
+  metadata olarak tutulur; raw probability dashboard state'inde tutulmaz.
+- Representative ve Technical current labels ayni CallState current revision
+  kaynagindan uretilir; rule-derived `cancellation_request` temsilci ekraninda
+  "Iptal Talebi" olarak eksiksiz gorunur.
+- Representative coaching kartlarindan evidence/fixture/rule ID'leri
+  kaldirildi; priority, action, provenance, status, timestamp ve revision
+  gorunumu korundu.
+- Degisen dosyalar: `app/events/labels.py`, `app/calls/models.py`,
+  `app/classification/postprocessing.py`, `app/classification/streaming.py`,
+  `live_dashboard/view_models.py`, `live_dashboard/app.py`,
+  `tests/test_streaming_pipeline.py`,
+  `tests/test_live_dashboard_view_models.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 166 passed; full 404 passed (1 dependency warning);
+  gercek model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gercek uzun cagri smoke testinde delta/context
+  contribution ile product ve technical recovery'yi dogrulamak.

@@ -24,6 +24,7 @@ class CoachingCoordinatorResult:
     matched_rule_ids: tuple[str, ...]
     suppression_reasons: tuple[str, ...]
     transcript_revision: int | None = None
+    current_revision_labels: tuple[str, ...] = ()
 
 
 class CoachingProcessingStatus(str, Enum):
@@ -99,15 +100,14 @@ class CoachingCoordinator:
         labels_for_evaluation = active_labels or ()
         evaluation = self._rule_engine.evaluate(event, labels_for_evaluation)
         classification = classification_event or evaluation.classification_event
-        labels = (
-            list(labels_for_evaluation)
-            if active_labels is not None
-            else (
-                [label.name for label in classification.labels]
-                if classification is not None
-                else []
-            )
+        evaluated_labels = (
+            [label.name for label in evaluation.classification_event.labels]
+            if evaluation.classification_event is not None
+            else []
         )
+        labels = list(dict.fromkeys((*labels_for_evaluation, *evaluated_labels)))
+        if any(label != "no_action" for label in labels):
+            labels = [label for label in labels if label != "no_action"]
         self._call_state.update_active_labels(labels)
 
         displayed: list[CoachingSuggestionEvent] = []
@@ -120,6 +120,22 @@ class CoachingCoordinator:
         maximum = self._tenant_config.coaching.max_active_suggestions
 
         for suggestion in evaluation.suggestion_events:
+            if suggestion.label_id is not None:
+                self._call_state.record_detected_labels(
+                    [suggestion.label_id],
+                    transcript_revision=event.revision,
+                    source=suggestion.source,
+                    model_id=(
+                        classification_event.model_id
+                        if classification_event is not None
+                        else None
+                    ),
+                    threshold_profile_id=(
+                        classification_event.threshold_profile_id
+                        if classification_event is not None
+                        else None
+                    ),
+                )
             fingerprint = _suggestion_fingerprint(suggestion)
             if fingerprint in self._displayed_fingerprints:
                 suppressed.append(suggestion)
@@ -159,6 +175,7 @@ class CoachingCoordinator:
             matched_rule_ids=evaluation.matched_rule_ids,
             suppression_reasons=tuple(reasons),
             transcript_revision=event.revision,
+            current_revision_labels=tuple(labels),
         )
 
     def process_safely(

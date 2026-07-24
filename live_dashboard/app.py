@@ -179,6 +179,7 @@ def _render_representative(
         st.caption(f"Son olay türü: {transcript.latest_event_type}")
     with right:
         st.subheader("Anlık Koçluk")
+        st.caption("Şu Anki Etiketler")
         if representative.intent_chips:
             chips = " ".join(
                 f'<span class="chip">{chip.symbol} {chip.text}</span>'
@@ -187,6 +188,15 @@ def _render_representative(
             st.markdown(chips, unsafe_allow_html=True)
         else:
             st.caption("Aktif niyet veya risk bulunmuyor.")
+        st.caption("Görüşmede Tespit Edilenler")
+        if representative.detected_intent_chips:
+            detected_chips = " ".join(
+                f'<span class="chip">{chip.symbol} {chip.text}</span>'
+                for chip in representative.detected_intent_chips
+            )
+            st.markdown(detected_chips, unsafe_allow_html=True)
+        else:
+            st.caption("Görüşmede henüz etiket tespit edilmedi.")
         feedback = st.session_state.setdefault("suggestion_feedback", {})
         for message in representative.safe_messages:
             st.warning(message)
@@ -210,8 +220,6 @@ def _render_representative(
                     details.append(f"Revizyon: {card.transcript_revision}")
                 if card.related_label:
                     details.append(f"Etiket: {card.related_label}")
-                if card.evidence_ids:
-                    details.append("Kanıt: " + ", ".join(card.evidence_ids))
                 st.caption(" · ".join(details))
                 for column, value in zip(
                     st.columns(3), ("Görüldü", "Uygulandı", "Uygun değil"), strict=True
@@ -279,10 +287,33 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         st.subheader("Sınıflandırma")
         for label, value in technical.classification_metadata:
             st.write(f"**{label}:** {value}")
+        st.write(
+            "**Şu Anki Etiketler:** " + (", ".join(technical.current_labels) or "—")
+        )
+        st.write(
+            "**Görüşmede Tespit Edilenler:** "
+            + (", ".join(technical.detected_labels) or "—")
+        )
     if technical.probabilities:
         st.caption("Geçici etiket olasılıkları")
         for label, value in technical.probabilities:
             st.write(f"{label}: {value:.3f}")
+    if technical.revision_label_timeline:
+        st.subheader("Revizyon Etiket Tanısı")
+        for diagnostic in technical.revision_label_timeline:
+            current = ", ".join(diagnostic.current_labels) or "—"
+            newly = ", ".join(diagnostic.newly_accumulated_labels) or "—"
+            st.write(
+                f"**Revizyon {diagnostic.transcript_revision}:** "
+                f"güncel={current} · yeni={newly}"
+            )
+            for evidence in diagnostic.evidence:
+                details = [evidence.source.value]
+                if evidence.model_id:
+                    details.append(f"model={evidence.model_id}")
+                if evidence.threshold_profile_id:
+                    details.append(f"profile={evidence.threshold_profile_id}")
+                st.caption(f"{evidence.label}: " + " · ".join(details))
     if technical.coaching_metadata:
         st.subheader("Koçluk")
         for label, value in technical.coaching_metadata:

@@ -3,13 +3,17 @@
 from dataclasses import dataclass
 from enum import Enum
 import logging
+import re
 from typing import Protocol
 
 from app.calls.models import CallState
 from app.classification.postprocessing import (
     ClassificationPostProcessingMetadata,
     apply_classification_contrast_guards,
+    canonicalize_classification_result,
+    merge_classification_views,
 )
+from app.events.labels import ClassificationViewSource
 from app.events.models import (
     ClassificationResultEvent,
     TranscriptEvent,
@@ -56,6 +60,16 @@ class StableClassificationOutcome:
     postprocessing: ClassificationPostProcessingMetadata = (
         ClassificationPostProcessingMetadata()
     )
+    context_sentence_count: int = 0
+    preceding_sentence_count: int = 0
+    delta_word_count: int = 0
+    delta_inference_ran: bool = False
+    context_inference_ran: bool = False
+    delta_inference_time_ms: float | None = None
+    context_inference_time_ms: float | None = None
+    delta_labels: tuple[str, ...] = ()
+    context_labels: tuple[str, ...] = ()
+    label_view_sources: tuple[tuple[str, ClassificationViewSource], ...] = ()
 
 
 class StableTranscriptClassificationStage:
@@ -64,9 +78,13 @@ class StableTranscriptClassificationStage:
         classifier: RuntimeClassifierProtocol | None,
         *,
         logger: logging.Logger | None = None,
+        maximum_preceding_sentences: int = 2,
     ) -> None:
+        if maximum_preceding_sentences < 0 or maximum_preceding_sentences > 2:
+            raise ValueError("maximum_preceding_sentences must be between 0 and 2")
         self._classifier = classifier
         self._logger = logger or logging.getLogger(__name__)
+        self._maximum_preceding_sentences = maximum_preceding_sentences
 
     def process(
         self,
@@ -75,6 +93,8 @@ class StableTranscriptClassificationStage:
         cumulative_stable_transcript: str,
         stable_changed: bool,
         call_state: CallState,
+        stable_delta: str | None = None,
+        preceding_stable_transcript: str = "",
     ) -> StableClassificationOutcome:
         if event.kind is TranscriptKind.PARTIAL:
             return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
@@ -95,26 +115,64 @@ class StableTranscriptClassificationStage:
         if self._classifier is None:
             return self._outcome(ClassificationProcessingStatus.DISABLED, event)
 
+        delta = (stable_delta if stable_delta is not None else event.text).strip()
+        if not delta:
+            return self._outcome(ClassificationProcessingStatus.EMPTY_SKIPPED, event)
+        classification_text, preceding_count, sentence_count = _bounded_context(
+            preceding_stable_transcript,
+            delta,
+            maximum_preceding_sentences=self._maximum_preceding_sentences,
+        )
         call_state.mark_classification_attempt(
             event.revision, event.source_chunk_sequence
         )
         try:
-            raw_result = self._classifier.classify(
+            raw_delta_result = self._classifier.classify(
                 tenant_id=event.tenant_id,
                 call_id=event.call_id,
-                text=cumulative_stable_transcript,
+                text=delta,
                 transcript_event_id=event.event_id,
                 revision=event.revision,
                 sequence_number=event.source_chunk_sequence,
             )
-            result, postprocessing = apply_classification_contrast_guards(
-                cumulative_stable_transcript,
-                raw_result,
+            raw_context_result = self._classifier.classify(
+                tenant_id=event.tenant_id,
+                call_id=event.call_id,
+                text=classification_text,
+                transcript_event_id=event.event_id,
+                revision=event.revision,
+                sequence_number=event.source_chunk_sequence,
             )
+            delta_result = canonicalize_classification_result(raw_delta_result)
+            context_result = canonicalize_classification_result(raw_context_result)
+            merged_result, label_view_sources = merge_classification_views(
+                delta_result,
+                context_result,
+            )
+            result, postprocessing = apply_classification_contrast_guards(
+                classification_text,
+                merged_result,
+            )
+            active_names = {label.name for label in result.labels}
+            label_view_sources = {
+                label: source
+                for label, source in label_view_sources.items()
+                if label in active_names
+            }
             call_state.apply_classification(
                 result,
                 transcript_revision=event.revision,
                 source_sequence=event.source_chunk_sequence,
+                context_sentence_count=sentence_count,
+                preceding_sentence_count=preceding_count,
+                delta_word_count=len(delta.split()),
+                delta_inference_ran=True,
+                context_inference_ran=True,
+                delta_inference_time_ms=delta_result.processing_time_ms,
+                context_inference_time_ms=context_result.processing_time_ms,
+                delta_labels=tuple(label.name for label in delta_result.labels),
+                context_labels=tuple(label.name for label in context_result.labels),
+                label_view_sources=label_view_sources,
             )
             self._logger.info(
                 "stable transcript classification completed",
@@ -127,6 +185,15 @@ class StableTranscriptClassificationStage:
                     "threshold_profile_id": result.threshold_profile_id,
                     "labels": [label.name for label in result.labels],
                     "inference_time_ms": result.processing_time_ms,
+                    "delta_inference_ran": True,
+                    "context_inference_ran": True,
+                    "delta_inference_time_ms": delta_result.processing_time_ms,
+                    "context_inference_time_ms": context_result.processing_time_ms,
+                    "delta_labels": [label.name for label in delta_result.labels],
+                    "context_labels": [label.name for label in context_result.labels],
+                    "context_sentence_count": sentence_count,
+                    "preceding_sentence_count": preceding_count,
+                    "delta_word_count": len(delta.split()),
                 },
             )
             return StableClassificationOutcome(
@@ -135,6 +202,16 @@ class StableTranscriptClassificationStage:
                 source_sequence=event.source_chunk_sequence,
                 classification_event=result,
                 postprocessing=postprocessing,
+                context_sentence_count=sentence_count,
+                preceding_sentence_count=preceding_count,
+                delta_word_count=len(delta.split()),
+                delta_inference_ran=True,
+                context_inference_ran=True,
+                delta_inference_time_ms=delta_result.processing_time_ms,
+                context_inference_time_ms=context_result.processing_time_ms,
+                delta_labels=tuple(label.name for label in delta_result.labels),
+                context_labels=tuple(label.name for label in context_result.labels),
+                label_view_sources=tuple(label_view_sources.items()),
             )
         except Exception as error:
             safe_error = SafeClassificationError(error_type=type(error).__name__)
@@ -154,6 +231,9 @@ class StableTranscriptClassificationStage:
                 transcript_revision=event.revision,
                 source_sequence=event.source_chunk_sequence,
                 error=safe_error,
+                context_sentence_count=sentence_count,
+                preceding_sentence_count=preceding_count,
+                delta_word_count=len(delta.split()),
             )
 
     @staticmethod
@@ -165,3 +245,28 @@ class StableTranscriptClassificationStage:
             transcript_revision=event.revision,
             source_sequence=event.source_chunk_sequence,
         )
+
+
+_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+
+
+def _bounded_context(
+    preceding_transcript: str,
+    delta: str,
+    *,
+    maximum_preceding_sentences: int,
+) -> tuple[str, int, int]:
+    preceding_sentences = _sentences(preceding_transcript)
+    selected_preceding = preceding_sentences[-maximum_preceding_sentences:]
+    if maximum_preceding_sentences == 0:
+        selected_preceding = []
+    delta_sentences = _sentences(delta)
+    parts = [*selected_preceding, *delta_sentences]
+    return " ".join(parts), len(selected_preceding), len(parts)
+
+
+def _sentences(text: str) -> list[str]:
+    cleaned = " ".join(text.split())
+    if not cleaned:
+        return []
+    return [part.strip() for part in _SENTENCE_BOUNDARY.split(cleaned) if part.strip()]

@@ -35,7 +35,16 @@ def config(
         context=TenantContext(tenant_id=tenant_id, tenant_name="Synthetic"),
         asr=TenantASRConfig(),
         classification=TenantClassificationConfig(
-            model_id="rules-v1", labels=["iade", "acil", "bilgi"]
+            model_id="rules-v1",
+            labels=[
+                "iade",
+                "acil",
+                "bilgi",
+                "product_information",
+                "complaint",
+                "churn_risk",
+                "iptal_riski",
+            ],
         ),
         rag=TenantRAGConfig(enabled=False),
         coaching=TenantCoachingConfig(
@@ -159,7 +168,10 @@ def test_initialization_rejects_engine_or_state_from_another_tenant() -> None:
 
 
 def test_active_labels_are_updated() -> None:
-    subject, state = coordinator(rule(), rule("rule_2", label="acil", phrase="acil"))
+    subject, state = coordinator(
+        rule(label="complaint"),
+        rule("rule_2", label="churn_risk", phrase="acil"),
+    )
     result = subject.process(event(), 1.0)
     assert result.classification_event is not None
     assert state.active_labels == [
@@ -329,12 +341,16 @@ def test_cancellation_classification_without_text_rule_creates_suggestion() -> N
 
 
 def test_exact_cancellation_rule_only_and_both_provenance() -> None:
-    rule_subject, _ = coordinator()
+    rule_subject, rule_state = coordinator()
     rule_only = rule_subject.process(event(text=EXACT_CANCELLATION), 1.0)
     assert len(rule_only.displayed_suggestions) == 1
     assert rule_only.displayed_suggestions[0].source is CoachingSuggestionSource.RULE
+    assert [item.label for item in rule_state.detected_labels] == [
+        "cancellation_request"
+    ]
+    assert rule_state.detected_labels[0].source is CoachingSuggestionSource.RULE
 
-    combined_subject, _ = coordinator()
+    combined_subject, combined_state = coordinator()
     combined = combined_subject.process(
         event(text=EXACT_CANCELLATION),
         1.0,
@@ -344,6 +360,27 @@ def test_exact_cancellation_rule_only_and_both_provenance() -> None:
     assert len(combined.displayed_suggestions) == 1
     assert combined.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
     assert combined.suppressed_suggestions == ()
+    assert combined_state.detected_labels[0].source is CoachingSuggestionSource.BOTH
+    assert combined_state.label_revision_timeline[0].evidence[0].source is (
+        CoachingSuggestionSource.BOTH
+    )
+
+
+def test_internal_cancellation_rule_label_is_never_stored() -> None:
+    subject, state = coordinator(
+        rule(label="iptal_riski", phrase="iptal etmek istiyorum")
+    )
+    result = subject.process(
+        event(text="Aboneliğimi iptal etmek istiyorum."),
+        1.0,
+        classification_event=classification(),
+        active_labels=(),
+    )
+    assert result.current_revision_labels == ("cancellation_request",)
+    assert result.displayed_suggestions[0].label_id == "cancellation_request"
+    assert state.active_labels == ["cancellation_request"]
+    assert [item.label for item in state.detected_labels] == ["cancellation_request"]
+    assert "iptal_riski" not in repr(state)
 
 
 def test_cancellation_suggestion_is_not_displayed_twice() -> None:
@@ -370,3 +407,48 @@ def test_cancellation_suggestion_is_not_displayed_twice() -> None:
     assert first.suppressed_suggestions == ()
     assert duplicate.displayed_suggestions == ()
     assert duplicate.suppression_reasons == ("duplicate",)
+
+
+def test_short_call_suggestion_provenance_and_deduplication_are_unchanged() -> None:
+    subject, _ = coordinator(tenant=config(cooldown=0))
+    first = subject.process(
+        event(text=EXACT_CANCELLATION),
+        1.0,
+        classification_event=classification("cancellation_request"),
+        active_labels=("cancellation_request",),
+    )
+    repeated = subject.process(
+        event(
+            event_id="transcript_2",
+            revision=2,
+            text=EXACT_CANCELLATION,
+        ),
+        2.0,
+        classification_event=classification("cancellation_request").model_copy(
+            update={"transcript_event_id": "transcript_2"}
+        ),
+        active_labels=("cancellation_request",),
+    )
+
+    assert first.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
+    assert repeated.displayed_suggestions == ()
+    assert repeated.suppression_reasons == ("duplicate",)
+
+
+def test_accumulated_old_label_does_not_trigger_new_coaching() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0))
+    state.record_detected_labels(
+        ["complaint"],
+        transcript_revision=1,
+        source=CoachingSuggestionSource.CLASSIFICATION,
+        model_id="synthetic-classifier",
+    )
+    result = subject.process(
+        event(text="Yeni revizyonda eşleşen bir sinyal yok."),
+        2.0,
+        classification_event=classification(),
+        active_labels=(),
+    )
+    assert [item.label for item in state.detected_labels] == ["complaint"]
+    assert result.displayed_suggestions == ()
+    assert result.suppressed_suggestions == ()

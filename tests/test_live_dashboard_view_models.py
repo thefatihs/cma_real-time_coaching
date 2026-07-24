@@ -43,6 +43,7 @@ from live_dashboard.view_models import (
     execute_local_once,
     intent_chips,
     intent_label,
+    LabelViewModel,
     ordered_suggestions,
     progress_view,
     reset_runtime,
@@ -125,8 +126,8 @@ def test_tenant_labels_rules_and_state_are_isolated() -> None:
         advance_runtime(subject)
         advance_runtime(subject)
     assert alpha.call_state.tenant_id != beta.call_state.tenant_id
-    assert alpha.latest_labels[0].name == "fiyat_itirazi"
-    assert beta.latest_labels[0].name == "butce_endisesi"
+    assert alpha.latest_labels[0].name == "price_objection"
+    assert beta.latest_labels[0].name == "price_objection"
     assert alpha.suggestions[0].title != beta.suggestions[0].title
 
 
@@ -648,18 +649,26 @@ def test_coaching_card_includes_label_evidence_and_priority_symbol() -> None:
     advance_runtime(subject)
     advance_runtime(subject)
     card = dashboard_tabs(subject).representative.suggestions[0]
-    assert card.related_label == "İptal riski"
-    assert card.evidence_ids == ("synthetic-a-cancel",)
+    assert card.related_label == "İptal Talebi"
+    assert card.evidence_ids == ()
     assert (card.priority_text, card.priority_symbol) == ("HIGH", "▲")
+    tabs = dashboard_tabs(subject)
+    assert "iptal_riski" not in repr(tabs.representative.intent_chips)
+    assert "iptal_riski" not in repr(tabs.representative.detected_intent_chips)
+    assert tabs.representative.intent_chips[0].text == "İptal Talebi"
+    assert tabs.technical.revision_label_timeline
+    assert "text" not in type(tabs.technical.revision_label_timeline[0]).model_fields
+    assert "probabilities" not in repr(tabs.technical.revision_label_timeline)
+    assert "synthetic-a-cancel" not in repr(tabs.representative)
 
 
 def test_intent_chip_formatting_is_compact_and_readable() -> None:
-    subject = runtime("tenant_alpha", "critical")
+    subject = runtime("tenant_alpha", "cancel")
     advance_runtime(subject)
     advance_runtime(subject)
     chips = intent_chips(subject.latest_labels)
     assert [(chip.text, chip.score, chip.is_risk, chip.symbol) for chip in chips] == [
-        ("Kritik risk", "%100", True, "⚠")
+        ("İptal Talebi", "%100", True, "⚠")
     ]
 
 
@@ -800,9 +809,58 @@ def test_live_outcomes_are_deduplicated_and_technical_metadata_is_separated() ->
     assert ("Model", "common_turkish_setfit_v2") in (
         tabs.technical.classification_metadata
     )
-    assert tabs.technical.probabilities == (("cancellation_request", 1.0),)
+    assert tabs.technical.probabilities == ()
     assert tabs.technical.rtf
     assert tabs.technical.last_asr == "300 ms"
+
+
+def test_dashboard_separates_current_and_call_level_labels_without_context_text() -> (
+    None
+):
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(state, FakePipeline(), Path("synthetic.wav"))
+    state.runtime.call_state.record_detected_labels(
+        ["technical_issue"],
+        transcript_revision=1,
+        source=CoachingSuggestionSource.CLASSIFICATION,
+        model_id="synthetic-classifier",
+    )
+
+    tabs = dashboard_tabs(state.runtime, state)
+    assert [chip.text for chip in tabs.representative.intent_chips] == ["İptal Talebi"]
+    assert {chip.text for chip in tabs.representative.detected_intent_chips} == {
+        "İptal Talebi",
+        "Teknik Sorun",
+    }
+    assert tabs.technical.current_labels == ("cancellation_request",)
+    assert set(tabs.technical.detected_labels) == {
+        "cancellation_request",
+        "technical_issue",
+    }
+    assert "synthetic.wav" not in repr(tabs.technical.classification_metadata)
+    assert "Aboneliğimi" not in repr(tabs.technical.classification_metadata)
+
+
+def test_representative_and_technical_use_the_same_rule_enriched_current_labels() -> (
+    None
+):
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.runtime.latest_labels = (LabelViewModel("churn_risk", "%90", True),)
+    state.runtime.call_state.update_active_labels(
+        ["churn_risk", "cancellation_request"]
+    )
+
+    tabs = dashboard_tabs(state.runtime, state)
+    representative_labels = {chip.text for chip in tabs.representative.intent_chips}
+    assert representative_labels == {
+        "Müşteri Kaybı Riski",
+        "İptal Talebi",
+    }
+    assert tabs.technical.current_labels == (
+        "churn_risk",
+        "cancellation_request",
+    )
 
 
 def test_disabled_modes_show_calm_empty_state() -> None:

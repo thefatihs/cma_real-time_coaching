@@ -167,6 +167,8 @@ class StreamingASRPipeline:
                     cumulative_stable_transcript=call_state.stable_transcript,
                     stable_changed=(call_state.stable_transcript != previous_stable),
                     call_state=call_state,
+                    stable_delta=event.text,
+                    preceding_stable_transcript=previous_stable,
                 )
                 step_classification_outcomes.append(outcome)
                 all_classification_outcomes.append(outcome)
@@ -174,7 +176,6 @@ class StreamingASRPipeline:
                     coordinator=coaching_coordinator,
                     event=event,
                     stable_changed=(call_state.stable_transcript != previous_stable),
-                    cumulative_stable_transcript=call_state.stable_transcript,
                     classification_outcome=outcome,
                 )
                 if coaching_outcome is not None:
@@ -213,13 +214,14 @@ class StreamingASRPipeline:
                 cumulative_stable_transcript=call_state.stable_transcript,
                 stable_changed=(call_state.stable_transcript != previous_stable),
                 call_state=call_state,
+                stable_delta=final_event.text,
+                preceding_stable_transcript=previous_stable,
             )
             all_classification_outcomes.append(final_classification)
             final_coaching = self._process_coaching(
                 coordinator=coaching_coordinator,
                 event=final_event,
                 stable_changed=(call_state.stable_transcript != previous_stable),
-                cumulative_stable_transcript=call_state.stable_transcript,
                 classification_outcome=final_classification,
             )
             if final_coaching is not None:
@@ -245,19 +247,15 @@ class StreamingASRPipeline:
         coordinator: CoachingCoordinator | None,
         event: TranscriptEvent,
         stable_changed: bool,
-        cumulative_stable_transcript: str,
         classification_outcome: StableClassificationOutcome,
     ) -> StableCoachingOutcome | None:
         if (
             coordinator is None
             or event.kind.value == "PARTIAL"
             or not stable_changed
-            or not cumulative_stable_transcript.strip()
+            or not event.text.strip()
         ):
             return None
-        cumulative_event = event.model_copy(
-            update={"text": cumulative_stable_transcript}
-        )
         classification_event = classification_outcome.classification_event
         active_labels = (
             tuple(label.name for label in classification_event.labels)
@@ -265,7 +263,7 @@ class StreamingASRPipeline:
             else ()
         )
         return coordinator.process_safely(
-            cumulative_event,
+            event,
             event.end_seconds,
             classification_event=classification_event,
             active_labels=active_labels,
