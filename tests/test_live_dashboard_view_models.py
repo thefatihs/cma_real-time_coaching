@@ -805,6 +805,34 @@ def test_live_outcomes_are_deduplicated_and_technical_metadata_is_separated() ->
     assert tabs.technical.last_asr == "300 ms"
 
 
+def test_dashboard_separates_current_and_call_level_labels_without_context_text() -> (
+    None
+):
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(state, FakePipeline(), Path("synthetic.wav"))
+    state.runtime.call_state.record_detected_labels(
+        ["technical_issue"],
+        transcript_revision=1,
+        source=CoachingSuggestionSource.CLASSIFICATION,
+        model_id="synthetic-classifier",
+    )
+
+    tabs = dashboard_tabs(state.runtime, state)
+    assert [chip.text for chip in tabs.representative.intent_chips] == ["İptal Talebi"]
+    assert {chip.text for chip in tabs.representative.detected_intent_chips} == {
+        "İptal Talebi",
+        "Teknik Sorun",
+    }
+    assert tabs.technical.current_labels == ("cancellation_request",)
+    assert set(tabs.technical.detected_labels) == {
+        "cancellation_request",
+        "technical_issue",
+    }
+    assert "synthetic.wav" not in repr(tabs.technical.classification_metadata)
+    assert "Aboneliğimi" not in repr(tabs.technical.classification_metadata)
+
+
 def test_disabled_modes_show_calm_empty_state() -> None:
     disabled_result = replace(
         fake_pipeline_result(),

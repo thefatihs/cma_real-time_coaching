@@ -72,12 +72,64 @@ def test_stable_text_emission_and_repeated_overlap_deduplication() -> None:
     assert subject.stable_transcript == "Hello, world!"
 
 
+def test_repeated_old_window_that_is_not_the_current_suffix_is_not_appended() -> None:
+    subject = reconciler()
+    subject.ingest(
+        result(
+            segment("Birinci cümle.", 1.0, 2.0),
+            segment("İkinci cümle.", 2.0, 4.0),
+        )
+    )
+    repeated_old = subject.ingest(
+        result(
+            segment("BİRİNCİ CÜMLE", 1.0, 2.0),
+            last_sequence=2,
+        )
+    )
+    assert repeated_old == ()
+    assert subject.stable_transcript == "Birinci cümle. İkinci cümle."
+
+
 def test_suffix_prefix_overlap_preserves_new_original_wording() -> None:
     subject = reconciler()
     subject.ingest(result(segment("One TWO.", 1.0, 4.0)))
     events = subject.ingest(result(segment("two, THREE!", 3.0, 5.0), last_sequence=2))
     assert events[0].text == "THREE!"
     assert subject.stable_transcript == "One TWO. THREE!"
+
+
+def test_small_asr_substitution_and_partial_sentence_overlap_are_deduplicated() -> None:
+    subject = reconciler()
+    subject.ingest(
+        result(segment("Paket fiyatını ve özelliklerini öğrenmek istiyorum.", 1.0, 4.0))
+    )
+    events = subject.ingest(
+        result(
+            segment(
+                "paketin ücretini ve özelliklerini öğrenmek istiyorum, ayrıca destek.",
+                1.0,
+                5.0,
+            ),
+            last_sequence=2,
+        )
+    )
+    assert events[0].text == "ayrıca destek."
+    assert subject.stable_transcript.count("özelliklerini") == 1
+
+
+def test_legitimate_repeated_speech_at_a_later_time_is_preserved() -> None:
+    subject = reconciler()
+    subject.ingest(result(segment("Bağlantı çalışmıyor.", 1.0, 4.0)))
+    events = subject.ingest(
+        result(
+            segment("Bağlantı çalışmıyor.", 6.0, 7.0),
+            last_sequence=2,
+            window_end_seconds=12.0,
+            window_duration_seconds=12.0,
+        )
+    )
+    assert events[0].text == "Bağlantı çalışmıyor."
+    assert subject.stable_transcript == "Bağlantı çalışmıyor. Bağlantı çalışmıyor."
 
 
 def test_stable_and_partial_are_emitted_from_same_window_in_order() -> None:

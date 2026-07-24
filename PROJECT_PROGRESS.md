@@ -579,3 +579,31 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Uzun cagri artimli siniflandirma uygulanirken bu kisa
   cagri regresyonlarini degisikliksiz gecirmek.
+
+## 49. Uzun Cagri Transkript ve Siniflandirma Iyilestirmeleri
+
+- Rolling-window stabil metin uzlastirmasi zaman ortusmesi, noktalama/Turkce
+  case normalizasyonu ve sinirli fuzzy kelime ortusmesiyle eski cumleleri
+  yeniden eklemez; daha sonra gercekten tekrarlanan konusma korunur.
+- Her stabil revizyonda yalnizca yeni delta ve en fazla iki onceki stabil cumle
+  siniflandirilir; partial metin, duplicate revizyon ve classification input
+  metni guvenli metadata'ya veya loglara girmez.
+- Current revision etiketleri ile call-level etiketler ayrildi; call-level
+  metadata ilk/son revizyon, rule/classification/both kaynagi ve guvenli model
+  kimliklerini saklar, `no_action` business etiketlerle birlikte tutulmaz.
+- Coaching yalnizca guncel stabil delta ve guncel classification sonucu ile
+  uretilir; deterministic kurallar, cooldown, deduplication, priority ve
+  maksimum oneri davranislari korundu.
+- Dashboard "Su Anki Etiketler" ve "Gorusmede Tespit Edilenler" alanlarini
+  ayri gosterir; teknik gorunum yalnizca metinsiz bounded-context sayaclarini
+  gosterir.
+- Degisen dosyalar: `app/calls/models.py`, `app/classification/streaming.py`,
+  `app/coaching/coordinator.py`, `app/streaming/pipeline.py`,
+  `app/streaming/transcript_reconciler.py`, `live_dashboard/app.py`,
+  `live_dashboard/view_models.py`, ilgili bes test dosyasi ve
+  `PROJECT_PROGRESS.md`.
+- Testler: focused 158 passed; full 396 passed (1 dependency warning);
+  gercek model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Sentetik olmayan uzun WAV smoke testinde transcript ve
+  call-level etiket ayrimini operator ekranindan dogrulamak.

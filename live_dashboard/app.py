@@ -179,6 +179,7 @@ def _render_representative(
         st.caption(f"Son olay türü: {transcript.latest_event_type}")
     with right:
         st.subheader("Anlık Koçluk")
+        st.caption("Şu Anki Etiketler")
         if representative.intent_chips:
             chips = " ".join(
                 f'<span class="chip">{chip.symbol} {chip.text}</span>'
@@ -187,6 +188,15 @@ def _render_representative(
             st.markdown(chips, unsafe_allow_html=True)
         else:
             st.caption("Aktif niyet veya risk bulunmuyor.")
+        st.caption("Görüşmede Tespit Edilenler")
+        if representative.detected_intent_chips:
+            detected_chips = " ".join(
+                f'<span class="chip">{chip.symbol} {chip.text}</span>'
+                for chip in representative.detected_intent_chips
+            )
+            st.markdown(detected_chips, unsafe_allow_html=True)
+        else:
+            st.caption("Görüşmede henüz etiket tespit edilmedi.")
         feedback = st.session_state.setdefault("suggestion_feedback", {})
         for message in representative.safe_messages:
             st.warning(message)
@@ -279,6 +289,13 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         st.subheader("Sınıflandırma")
         for label, value in technical.classification_metadata:
             st.write(f"**{label}:** {value}")
+        st.write(
+            "**Şu Anki Etiketler:** " + (", ".join(technical.current_labels) or "—")
+        )
+        st.write(
+            "**Görüşmede Tespit Edilenler:** "
+            + (", ".join(technical.detected_labels) or "—")
+        )
     if technical.probabilities:
         st.caption("Geçici etiket olasılıkları")
         for label, value in technical.probabilities:

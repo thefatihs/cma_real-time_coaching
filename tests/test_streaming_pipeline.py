@@ -390,7 +390,7 @@ def test_plan_has_exact_total_and_short_final_chunk_before_inference() -> None:
     ].chunk_start_seconds == (pytest.approx(0.03))
 
 
-def test_only_stable_changes_are_classified_with_cumulative_context() -> None:
+def test_only_stable_changes_are_classified_with_bounded_context() -> None:
     source = [chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0), chunk(2, 4.0, 2.0)]
     transcriber = FakeTranscriber(
         [
@@ -424,6 +424,8 @@ def test_only_stable_changes_are_classified_with_cumulative_context() -> None:
     assert result.classification_metadata.active_labels == ("complaint",)
     assert result.classification_metadata.model_id == "common_turkish_setfit_v2"
     assert result.classification_metadata.inference_time_ms == 4.0
+    assert result.classification_metadata.context_sentence_count == 2
+    assert result.classification_metadata.preceding_sentence_count == 1
     assert not hasattr(result.classification_metadata, "probabilities")
 
 
@@ -504,6 +506,8 @@ def test_duplicate_revision_skipped_and_newer_revision_classified() -> None:
         cumulative_stable_transcript=state.stable_transcript,
         stable_changed=True,
         call_state=state,
+        stable_delta=second.text,
+        preceding_stable_transcript="first stable",
     )
     assert first_outcome.status is ClassificationProcessingStatus.CLASSIFIED
     assert duplicate_outcome.status is (
@@ -514,6 +518,7 @@ def test_duplicate_revision_skipped_and_newer_revision_classified() -> None:
         "first stable",
         "first stable second stable",
     ]
+    assert second_outcome.preceding_sentence_count == 1
 
 
 def test_empty_cumulative_stable_transcript_is_skipped() -> None:
@@ -747,6 +752,77 @@ def test_short_true_price_objection_preserves_price_objection() -> None:
     assert coaching.displayed_suggestions[0].source is (
         CoachingSuggestionSource.CLASSIFICATION
     )
+
+
+def test_synthetic_long_call_classifies_deltas_and_accumulates_all_labels() -> None:
+    label_sentences = (
+        ("product_information", "Ürün özelliklerini öğrenmek istiyorum."),
+        ("price_objection", "Bu ücret çok pahalı."),
+        ("technical_issue", "Uygulama açılmıyor."),
+        ("complaint", "Bu durumdan şikayetçiyim."),
+        ("churn_risk", "Böyle devam ederse başka firmaya geçeceğim."),
+        ("cancellation_request", "Aboneliğimi iptal etmek istiyorum."),
+    )
+
+    class LongCallClassifier(FakeRuntimeClassifier):
+        def classify(self, **kwargs: object) -> ClassificationResultEvent:
+            base = super().classify(**kwargs)  # type: ignore[arg-type]
+            text = str(kwargs["text"])
+            label = next(
+                label
+                for label, sentence in reversed(label_sentences)
+                if sentence in text
+            )
+            return base.model_copy(
+                update={
+                    "labels": [ClassificationLabel(name=label, score=0.9)],
+                    "probabilities": {label: 0.9},
+                    "thresholds": {label: 0.5},
+                }
+            )
+
+    classifier = LongCallClassifier()
+    stage = StableTranscriptClassificationStage(classifier)
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    outcomes = []
+    for revision, (_, sentence) in enumerate(label_sentences, start=1):
+        previous = state.stable_transcript
+        event = TranscriptEvent(
+            tenant_id="tenant_alpha",
+            call_id="call_001",
+            event_id=f"stable-{revision}",
+            kind=TranscriptKind.STABLE,
+            text=sentence,
+            start_seconds=float(revision - 1),
+            end_seconds=float(revision),
+            revision=revision,
+            created_at_utc=NOW,
+            source_chunk_sequence=revision,
+        )
+        state.apply_transcript(event)
+        outcomes.append(
+            stage.process(
+                event,
+                cumulative_stable_transcript=state.stable_transcript,
+                stable_changed=True,
+                call_state=state,
+                stable_delta=event.text,
+                preceding_stable_transcript=previous,
+            )
+        )
+
+    assert len(classifier.calls) == 6
+    assert all(outcome.context_sentence_count <= 3 for outcome in outcomes)
+    assert all(outcome.preceding_sentence_count <= 2 for outcome in outcomes)
+    assert label_sentences[0][1] not in str(classifier.calls[-1]["text"])
+    assert label_sentences[-1][1] in str(classifier.calls[-1]["text"])
+    assert [item.label for item in state.detected_labels] == [
+        label for label, _ in label_sentences
+    ]
+    assert state.active_labels == ["cancellation_request"]
+    metadata = state.classification_metadata()
+    assert not hasattr(metadata, "transcript_text")
+    assert not hasattr(metadata, "probabilities")
 
 
 def test_three_partial_chunks_finalize_stable_transcript_without_failure() -> None:

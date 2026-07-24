@@ -396,3 +396,22 @@ def test_short_call_suggestion_provenance_and_deduplication_are_unchanged() -> N
     assert first.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
     assert repeated.displayed_suggestions == ()
     assert repeated.suppression_reasons == ("duplicate",)
+
+
+def test_accumulated_old_label_does_not_trigger_new_coaching() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0))
+    state.record_detected_labels(
+        ["complaint"],
+        transcript_revision=1,
+        source=CoachingSuggestionSource.CLASSIFICATION,
+        model_id="synthetic-classifier",
+    )
+    result = subject.process(
+        event(text="Yeni revizyonda eşleşen bir sinyal yok."),
+        2.0,
+        classification_event=classification(),
+        active_labels=(),
+    )
+    assert [item.label for item in state.detected_labels] == ["complaint"]
+    assert result.displayed_suggestions == ()
+    assert result.suppressed_suggestions == ()

@@ -2,6 +2,7 @@
 
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 import unicodedata
 from uuid import uuid4
 
@@ -63,7 +64,30 @@ class TranscriptReconciler:
 
         events: list[TranscriptEvent] = []
         stable_candidate = _join_segment_text(stable_segments)
-        new_stable_text = _new_suffix(self._stable_transcript, stable_candidate)
+        stable_start, stable_end = (
+            _segment_times(stable_segments) if stable_segments else (None, None)
+        )
+        overlaps_committed_time = (
+            stable_start is not None
+            and self._stable_end_seconds is not None
+            and stable_start
+            <= self._stable_end_seconds + self.timestamp_tolerance_seconds
+        )
+        fully_committed_time = (
+            stable_end is not None
+            and self._stable_end_seconds is not None
+            and stable_end
+            <= self._stable_end_seconds + self.timestamp_tolerance_seconds
+        )
+        new_stable_text = (
+            ""
+            if fully_committed_time
+            else _new_suffix(
+                self._stable_transcript,
+                stable_candidate,
+                allow_overlap=overlaps_committed_time,
+            )
+        )
         if new_stable_text:
             self._stable_transcript = _join_text(
                 self._stable_transcript, new_stable_text
@@ -75,6 +99,11 @@ class TranscriptReconciler:
                     stable_segments,
                     result.last_sequence,
                 )
+            )
+        if stable_end is not None:
+            self._stable_end_seconds = max(
+                self._stable_end_seconds or stable_end,
+                stable_end,
             )
 
         partial_candidate = _join_segment_text(partial_segments)
@@ -103,11 +132,23 @@ class TranscriptReconciler:
     def finalize(self) -> TranscriptEvent | None:
         if not self._partial_transcript:
             return None
-        text = _new_suffix(self._stable_transcript, self._partial_transcript)
+        text = _new_suffix(
+            self._stable_transcript,
+            self._partial_transcript,
+            allow_overlap=(
+                self._stable_end_seconds is not None
+                and self._finalize_start_seconds
+                <= self._stable_end_seconds + self.timestamp_tolerance_seconds
+            ),
+        )
         self._clear_partial()
         if not text:
             return None
         self._stable_transcript = _join_text(self._stable_transcript, text)
+        self._stable_end_seconds = max(
+            self._stable_end_seconds or self._finalize_end_seconds,
+            self._finalize_end_seconds,
+        )
         return self._make_event_from_times(
             TranscriptKind.FINAL,
             text,
@@ -129,6 +170,7 @@ class TranscriptReconciler:
         self._finalize_source_sequence: int | None = None
         self._last_sequence: int | None = None
         self._last_window_end_seconds: float | None = None
+        self._stable_end_seconds: float | None = None
         self._revision = 0
 
     def _validate_scope_and_order(self, result: WindowTranscriptionResult) -> None:
@@ -204,17 +246,45 @@ def _join_text(first: str, second: str) -> str:
     return " ".join(part for part in (first, second) if part)
 
 
-def _new_suffix(existing: str, candidate: str) -> str:
+def _new_suffix(
+    existing: str,
+    candidate: str,
+    *,
+    allow_overlap: bool = True,
+) -> str:
+    if not allow_overlap:
+        return candidate
     existing_words = existing.split()
     candidate_words = candidate.split()
     normalized_existing = [_normalize_word(word) for word in existing_words]
     normalized_candidate = [_normalize_word(word) for word in candidate_words]
-    overlap = 0
+    if not normalized_existing or not normalized_candidate:
+        return candidate
+
     for size in range(min(len(existing_words), len(candidate_words)), 0, -1):
         if normalized_existing[-size:] == normalized_candidate[:size]:
-            overlap = size
-            break
-    return " ".join(candidate_words[overlap:])
+            return " ".join(candidate_words[size:])
+
+    best_candidate_size = 0
+    best_match: tuple[float, int, int] = (0.0, 0, 0)
+    maximum = min(len(existing_words), len(candidate_words))
+    for existing_size in range(maximum, 1, -1):
+        for candidate_size in range(
+            max(2, existing_size - 2),
+            min(len(candidate_words), existing_size + 2) + 1,
+        ):
+            score = SequenceMatcher(
+                None,
+                normalized_existing[-existing_size:],
+                normalized_candidate[:candidate_size],
+                autojunk=False,
+            ).ratio()
+            required_score = 0.82 if min(existing_size, candidate_size) < 5 else 0.66
+            match = (score, -abs(existing_size - candidate_size), candidate_size)
+            if score >= required_score and match > best_match:
+                best_candidate_size = candidate_size
+                best_match = match
+    return " ".join(candidate_words[best_candidate_size:])
 
 
 def _normalize_word(word: str) -> str:
