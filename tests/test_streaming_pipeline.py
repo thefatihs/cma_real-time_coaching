@@ -229,6 +229,24 @@ class FakeRuntimeClassifier:
         )
 
 
+class FixedLabelClassifier(FakeRuntimeClassifier):
+    def __init__(self, *labels: str) -> None:
+        super().__init__()
+        self.labels = labels
+
+    def classify(self, **kwargs: object) -> ClassificationResultEvent:
+        base = super().classify(**kwargs)  # type: ignore[arg-type]
+        return base.model_copy(
+            update={
+                "labels": [
+                    ClassificationLabel(name=label, score=0.9) for label in self.labels
+                ],
+                "probabilities": {label: 0.9 for label in self.labels},
+                "thresholds": {label: 0.5 for label in self.labels},
+            }
+        )
+
+
 def test_ordered_execution_one_transcription_per_chunk_and_short_final_chunk() -> None:
     source = [chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0), chunk(2, 4.0, 0.5)]
     calls: list[object] = []
@@ -655,6 +673,80 @@ def test_price_query_guard_prevents_price_objection_coaching_card(
     assert len(coaching.displayed_suggestions) == 1
     assert coaching.displayed_suggestions[0].label_id == "product_information"
     assert transcript not in caplog.text
+
+
+def test_short_explicit_cancellation_preserves_label_coaching_and_both_source() -> None:
+    transcript = (
+        "Aboneliğimi bugün iptal ettirmek istiyorum. Lütfen iptal işlemini başlatın."
+    )
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(transcript, 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier("cancellation_request"),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    coaching = result.coaching_outcomes[-1].result
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["cancellation_request"]
+    assert coaching is not None
+    assert len(coaching.displayed_suggestions) == 1
+    assert coaching.displayed_suggestions[0].label_id == "cancellation_request"
+    assert coaching.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
+
+
+def test_short_negated_cancellation_does_not_trigger_rule_or_coaching() -> None:
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("İptal etmek istemiyorum.", 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier(),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    coaching = result.coaching_outcomes[-1].result
+    assert classification is not None
+    assert classification.labels == []
+    assert coaching is not None
+    assert coaching.displayed_suggestions == ()
+    assert coaching.matched_rule_ids == ()
+
+
+def test_short_price_information_question_preserves_product_information_only() -> None:
+    transcript = "Paketin aylık fiyatı ne kadar, ücret seçeneklerini öğrenebilir miyim?"
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(transcript, 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier(
+            "product_information", "price_objection"
+        ),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["product_information"]
+
+
+def test_short_true_price_objection_preserves_price_objection() -> None:
+    transcript = "Bu ücret çok pahalı, bütçemi aşıyor."
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[(transcript, 0.0, 1.0)]]),
+        runtime_classifier=FixedLabelClassifier("price_objection"),
+        coaching_factory=coaching_factory(phrase="eşleşmeyen"),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    classification = result.classification_outcomes[-1].classification_event
+    coaching = result.coaching_outcomes[-1].result
+    assert classification is not None
+    assert [label.name for label in classification.labels] == ["price_objection"]
+    assert coaching is not None
+    assert coaching.displayed_suggestions[0].label_id == "price_objection"
+    assert coaching.displayed_suggestions[0].source is (
+        CoachingSuggestionSource.CLASSIFICATION
+    )
 
 
 def test_three_partial_chunks_finalize_stable_transcript_without_failure() -> None:

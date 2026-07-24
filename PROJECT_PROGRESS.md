@@ -564,3 +564,18 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: File A tamamla -> File B sec -> Baslat akisini canli
   Streamlit oturumunda yeniden dogrulamak.
+
+## 48. Kisa Cagri Siniflandirma Geriye Uyumluluk Regresyonlari
+
+- Kisa cagrilarda acik iptal talebi ve coaching, Turkce iptal olumsuzlamasi,
+  fiyat bilgisi ile fiyat itirazi ayrimi ve gercek fiyat itirazi davranislari
+  uc uca sentetik regresyonlarla koruma altina alindi.
+- Kisa cagri coaching onerilerinde `both` provenance ve icerik tabanli
+  deduplication davranisinin degismedigi ayrica dogrulandi.
+- Degisen dosyalar: `tests/test_streaming_pipeline.py`,
+  `tests/test_coaching_coordinator.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused streaming/coaching 48 passed; full 388 passed
+  (1 dependency warning); model yuklenmedi.
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Uzun cagri artimli siniflandirma uygulanirken bu kisa
+  cagri regresyonlarini degisikliksiz gecirmek.

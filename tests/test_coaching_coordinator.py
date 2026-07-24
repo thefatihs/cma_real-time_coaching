@@ -370,3 +370,29 @@ def test_cancellation_suggestion_is_not_displayed_twice() -> None:
     assert first.suppressed_suggestions == ()
     assert duplicate.displayed_suggestions == ()
     assert duplicate.suppression_reasons == ("duplicate",)
+
+
+def test_short_call_suggestion_provenance_and_deduplication_are_unchanged() -> None:
+    subject, _ = coordinator(tenant=config(cooldown=0))
+    first = subject.process(
+        event(text=EXACT_CANCELLATION),
+        1.0,
+        classification_event=classification("cancellation_request"),
+        active_labels=("cancellation_request",),
+    )
+    repeated = subject.process(
+        event(
+            event_id="transcript_2",
+            revision=2,
+            text=EXACT_CANCELLATION,
+        ),
+        2.0,
+        classification_event=classification("cancellation_request").model_copy(
+            update={"transcript_event_id": "transcript_2"}
+        ),
+        active_labels=("cancellation_request",),
+    )
+
+    assert first.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
+    assert repeated.displayed_suggestions == ()
+    assert repeated.suppression_reasons == ("duplicate",)
