@@ -25,6 +25,7 @@ class RetrievalOrchestrator:
             knowledge_base_id=request.knowledge_base_id,
             query=request.user_input,
             top_k=request.top_k,
+            minimum_score=request.minimum_score,
         )
         prompt = self._prompt_builder.build(
             PromptBuildRequest(

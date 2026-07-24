@@ -11,6 +11,7 @@ class OrchestrationRequest(BaseModel):
     knowledge_base_id: str
     user_input: str
     top_k: int
+    minimum_score: float = 0.0
 
     @field_validator(
         "tenant_id",
@@ -30,6 +31,13 @@ class OrchestrationRequest(BaseModel):
     def validate_top_k(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("top_k must be positive")
+        return value
+
+    @field_validator("minimum_score")
+    @classmethod
+    def validate_minimum_score(cls, value: float) -> float:
+        if not 0 <= value <= 1:
+            raise ValueError("minimum_score must be between 0 and 1")
         return value
 
 

@@ -69,14 +69,16 @@ class FakeLLMGateway:
         )
 
 
-def orchestration_request() -> OrchestrationRequest:
-    return OrchestrationRequest(
-        tenant_id="tenant_alpha",
-        call_id="call_001",
-        knowledge_base_id="kb_support",
-        user_input="Synthetic user input.",
-        top_k=3,
-    )
+def orchestration_request(**changes: object) -> OrchestrationRequest:
+    values: dict[str, object] = {
+        "tenant_id": "tenant_alpha",
+        "call_id": "call_001",
+        "knowledge_base_id": "kb_support",
+        "user_input": "Synthetic user input.",
+        "top_k": 3,
+    }
+    values.update(changes)
+    return OrchestrationRequest.model_validate(values)
 
 
 def document() -> RetrievalDocument:
@@ -155,6 +157,22 @@ def test_retrieval_documents_are_translated_to_prompt_context() -> None:
     assert context[0].chunk_id == "chunk_1"
     assert context[0].text == "Synthetic retrieved context."
     assert context[0].score == 0.9
+
+
+def test_non_zero_minimum_score_is_forwarded_exactly() -> None:
+    orchestrator, retriever, _, _, _ = dependencies()
+
+    orchestrator.run(orchestration_request(minimum_score=0.65))
+
+    assert retriever.requests[0][-1] == 0.65
+
+
+def test_zero_minimum_score_is_preserved() -> None:
+    orchestrator, retriever, _, _, _ = dependencies()
+
+    orchestrator.run(orchestration_request(minimum_score=0.0))
+
+    assert retriever.requests[0][-1] == 0.0
 
 
 def test_empty_retrieval_result_is_forwarded_safely() -> None:
