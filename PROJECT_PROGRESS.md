@@ -764,3 +764,22 @@ Tarih: 22 Temmuz 2026
 - Testler: focused 22 passed; full 575 passed (1 dependency warning).
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Gate bu gorevin saf karar sinirinda tamamlandi.
+
+## 58. Trusted Orchestration Result Metadata
+
+- Orchestration request ve result contract'larina non-negative trusted transcript
+  revision eklendi ve sonuc boyunca aynen korundu.
+- Citation reference'lari yalnizca Retriever'in sirali document/chunk
+  kimliklerinden uretildi; duplicate citation kimlikleri fail-closed reddedildi.
+- LLM response tenant/call kapsami sonuc olusturulmadan once dogrulandi;
+  uyusmazliklar fail-closed reddedildi.
+- Bos retrieval sonucu `None` donmeye, PromptBuilder ve LLMGateway'i atlamaya
+  devam eder.
+- Degisen dosyalar: `app/orchestration/__init__.py`,
+  `app/orchestration/models.py`, `app/orchestration/retrieval.py`,
+  `tests/test_orchestration.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 16 passed; full suite mevcut Torch `c10.dll` WinError 1114
+  nedeniyle 3 ASR/CLI testinin collection asamasinda durdu.
+- Kalite: Ruff check/format passed; Pyright 0 errors; `git diff --check` passed.
+- Sonraki planli adim: Trusted orchestration sonucunu ayri, onayli bir coaching
+  adapter gorevinde kullanmak.
