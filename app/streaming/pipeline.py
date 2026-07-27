@@ -11,8 +11,12 @@ from app.classification.streaming import (
     StableClassificationOutcome,
     StableTranscriptClassificationStage,
 )
-from app.coaching.coordinator import CoachingCoordinator, StableCoachingOutcome
-from app.events.models import AudioChunkEvent, TranscriptEvent
+from app.coaching.coordinator import StableCoachingOutcome
+from app.events.models import (
+    AudioChunkEvent,
+    ClassificationResultEvent,
+    TranscriptEvent,
+)
 from app.streaming.audio_window import ASRAudioWindow, AudioWindowBuilder
 from app.streaming.chunk_generator import generate_audio_chunks
 from app.streaming.rolling_buffer import RollingAudioBuffer
@@ -67,10 +71,21 @@ class WindowTranscriberProtocol(Protocol):
     def transcribe(self, window: ASRAudioWindow) -> WindowTranscriptionResult: ...
 
 
+class CoachingProcessorProtocol(Protocol):
+    def process_safely(
+        self,
+        event: TranscriptEvent,
+        current_seconds: float,
+        *,
+        classification_event: ClassificationResultEvent | None = None,
+        active_labels: tuple[str, ...] | None = None,
+    ) -> StableCoachingOutcome: ...
+
+
 ChunkGenerator = Callable[[Path, str, str, float], Iterable[AudioChunkEvent]]
 StepCallback = Callable[[StreamingASRStep], None]
 PlanCallback = Callable[[StreamingASRPlan], None]
-CoachingCoordinatorFactory = Callable[[CallState], CoachingCoordinator]
+CoachingCoordinatorFactory = Callable[[CallState], CoachingProcessorProtocol]
 
 
 class StreamingASRPipeline:
@@ -244,7 +259,7 @@ class StreamingASRPipeline:
     @staticmethod
     def _process_coaching(
         *,
-        coordinator: CoachingCoordinator | None,
+        coordinator: CoachingProcessorProtocol | None,
         event: TranscriptEvent,
         stable_changed: bool,
         classification_outcome: StableClassificationOutcome,
