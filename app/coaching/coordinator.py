@@ -1,8 +1,11 @@
 """Coordinate deterministic coaching evaluation with per-call display state."""
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 import logging
+
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
 from app.calls.models import (
     CallCoachingMetadata,
@@ -14,6 +17,7 @@ from app.coaching.rule_engine import RuleBasedCoachingEngine
 from app.events.labels import canonical_label
 from app.events.models import (
     ClassificationResultEvent,
+    CoachingAction,
     CoachingSuggestionEvent,
     CoachingSuggestionSource,
     SuggestionPriority,
@@ -44,6 +48,43 @@ class SafeSuggestionDecision:
     priority: SuggestionPriority
     reason: str
     moved_to_history: bool
+
+
+class ExternalSuggestionAdmissionStatus(str, Enum):
+    ADMITTED = "admitted"
+    SUPPRESSED = "suppressed"
+    REJECTED = "rejected"
+
+
+class ExternalSuggestionAdmissionReason(str, Enum):
+    ADMITTED = "admitted"
+    DUPLICATE_PREVIOUSLY_DISPLAYED = "duplicate_previously_displayed"
+    COOLDOWN_PREVIOUSLY_DISPLAYED = "cooldown_previously_displayed"
+    REJECTED_BY_CAPACITY = "rejected_by_capacity"
+    INVALID_CANDIDATE = "invalid_candidate"
+    UNKNOWN_LABEL = "unknown_label"
+    INVALID_SCOPE = "invalid_scope"
+    INVALID_REVISION = "invalid_revision"
+
+
+class ExternalCoachingCandidate(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tenant_id: StrictStr
+    call_id: StrictStr
+    transcript_revision: StrictInt
+    label_id: StrictStr
+    action: CoachingAction
+    title: StrictStr
+    suggestion: StrictStr
+    priority: SuggestionPriority
+    source: CoachingSuggestionSource = CoachingSuggestionSource.LLM
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalSuggestionAdmissionResult:
+    status: ExternalSuggestionAdmissionStatus
+    reason: ExternalSuggestionAdmissionReason
 
 
 class CoachingProcessingStatus(str, Enum):
@@ -203,7 +244,6 @@ class CoachingCoordinator:
         reasons: list[str] = []
         replaced_ids: list[str] = []
         decisions: list[SafeSuggestionDecision] = []
-        maximum = self._tenant_config.coaching.max_active_suggestions
 
         for suggestion in _merge_current_candidates(evaluation.suggestion_events):
             if suggestion.label_id is not None:
@@ -222,9 +262,22 @@ class CoachingCoordinator:
                         else None
                     ),
                 )
-            fingerprint = _suggestion_fingerprint(suggestion)
-            candidate_key = _candidate_key(suggestion)
-            if fingerprint in self._displayed_fingerprints:
+            admission_reason, replaced = self._admit_candidate(
+                suggestion,
+                transcript_revision=event.revision,
+                current_seconds=current_seconds,
+                model_id=(
+                    classification_event.model_id
+                    if classification_event is not None
+                    else None
+                ),
+                threshold_profile_id=(
+                    classification_event.threshold_profile_id
+                    if classification_event is not None
+                    else None
+                ),
+            )
+            if admission_reason == "duplicate_same_revision":
                 suppressed.append(suggestion)
                 reasons.append("duplicate_same_revision")
                 decisions.append(
@@ -235,11 +288,7 @@ class CoachingCoordinator:
                         False,
                     )
                 )
-            elif not _cooldown_available(
-                self._displayed_candidate_times.get(candidate_key),
-                current_seconds,
-                self._tenant_config.coaching.cooldown_seconds,
-            ):
+            elif admission_reason == "cooldown_previously_displayed":
                 suppressed.append(suggestion)
                 reasons.append("cooldown_previously_displayed")
                 decisions.append(
@@ -250,38 +299,20 @@ class CoachingCoordinator:
                         False,
                     )
                 )
-            else:
-                admitted, replaced = self._call_state.admit_coaching_suggestion(
-                    suggestion,
-                    transcript_revision=event.revision,
-                    model_id=(
-                        classification_event.model_id
-                        if classification_event is not None
-                        else None
-                    ),
-                    threshold_profile_id=(
-                        classification_event.threshold_profile_id
-                        if classification_event is not None
-                        else None
-                    ),
-                    maximum_active_suggestions=maximum,
-                )
-                if not admitted:
-                    suppressed.append(suggestion)
-                    reasons.append("rejected_by_capacity")
-                    decisions.append(
-                        _decision(
-                            suggestion,
-                            event.revision,
-                            "rejected_by_capacity",
-                            False,
-                        )
+            elif admission_reason == "rejected_by_capacity":
+                suppressed.append(suggestion)
+                reasons.append("rejected_by_capacity")
+                decisions.append(
+                    _decision(
+                        suggestion,
+                        event.revision,
+                        "rejected_by_capacity",
+                        False,
                     )
-                    continue
+                )
+                continue
+            else:
                 displayed.append(suggestion)
-                self._displayed_fingerprints.add(fingerprint)
-                self._displayed_candidate_times[candidate_key] = current_seconds
-                self._call_state.mark_suggestion_shown(suggestion.suggestion_id)
                 decisions.append(
                     _decision(suggestion, event.revision, "admitted", False)
                 )
@@ -311,6 +342,134 @@ class CoachingCoordinator:
             replaced_suggestion_ids=tuple(replaced_ids),
             suggestion_decisions=tuple(decisions),
         )
+
+    def admit_external_suggestion(
+        self,
+        candidate: object,
+        *,
+        current_seconds: float,
+    ) -> ExternalSuggestionAdmissionResult:
+        try:
+            validated = ExternalCoachingCandidate.model_validate(candidate)
+        except ValidationError:
+            return ExternalSuggestionAdmissionResult(
+                ExternalSuggestionAdmissionStatus.REJECTED,
+                ExternalSuggestionAdmissionReason.INVALID_CANDIDATE,
+            )
+        if (
+            not validated.tenant_id.strip()
+            or not validated.call_id.strip()
+            or not validated.label_id.strip()
+            or not validated.title.strip()
+            or not validated.suggestion.strip()
+            or validated.transcript_revision < 0
+            or current_seconds < 0
+            or validated.source is not CoachingSuggestionSource.LLM
+            or validated.action.value
+            not in self._tenant_config.coaching.allowed_actions
+        ):
+            return ExternalSuggestionAdmissionResult(
+                ExternalSuggestionAdmissionStatus.REJECTED,
+                ExternalSuggestionAdmissionReason.INVALID_CANDIDATE,
+            )
+        if (
+            validated.tenant_id != self._call_state.tenant_id
+            or validated.call_id != self._call_state.call_id
+        ):
+            return ExternalSuggestionAdmissionResult(
+                ExternalSuggestionAdmissionStatus.REJECTED,
+                ExternalSuggestionAdmissionReason.INVALID_SCOPE,
+            )
+        if validated.transcript_revision != self._call_state.transcript_revision:
+            return ExternalSuggestionAdmissionResult(
+                ExternalSuggestionAdmissionStatus.REJECTED,
+                ExternalSuggestionAdmissionReason.INVALID_REVISION,
+            )
+        if (
+            canonical_label(validated.label_id) != validated.label_id
+            or validated.label_id == "no_action"
+        ):
+            return ExternalSuggestionAdmissionResult(
+                ExternalSuggestionAdmissionStatus.REJECTED,
+                ExternalSuggestionAdmissionReason.UNKNOWN_LABEL,
+            )
+
+        suggestion = CoachingSuggestionEvent(
+            tenant_id=validated.tenant_id,
+            call_id=validated.call_id,
+            suggestion_id=(f"llm:{validated.transcript_revision}:{validated.label_id}"),
+            source_transcript_event_id=f"external:{validated.transcript_revision}",
+            action=validated.action,
+            priority=validated.priority,
+            source=validated.source,
+            label_id=validated.label_id,
+            title=validated.title,
+            suggestion=validated.suggestion,
+            created_at_utc=datetime.now(UTC),
+        )
+        reason, _ = self._admit_candidate(
+            suggestion,
+            transcript_revision=validated.transcript_revision,
+            current_seconds=current_seconds,
+            model_id=None,
+            threshold_profile_id=None,
+        )
+        if reason == "admitted":
+            self._call_state.mark_coaching_triggered(current_seconds)
+            return ExternalSuggestionAdmissionResult(
+                ExternalSuggestionAdmissionStatus.ADMITTED,
+                ExternalSuggestionAdmissionReason.ADMITTED,
+            )
+        reason_map = {
+            "duplicate_same_revision": (
+                ExternalSuggestionAdmissionReason.DUPLICATE_PREVIOUSLY_DISPLAYED
+            ),
+            "cooldown_previously_displayed": (
+                ExternalSuggestionAdmissionReason.COOLDOWN_PREVIOUSLY_DISPLAYED
+            ),
+            "rejected_by_capacity": (
+                ExternalSuggestionAdmissionReason.REJECTED_BY_CAPACITY
+            ),
+        }
+        return ExternalSuggestionAdmissionResult(
+            ExternalSuggestionAdmissionStatus.SUPPRESSED,
+            reason_map[reason],
+        )
+
+    def _admit_candidate(
+        self,
+        suggestion: CoachingSuggestionEvent,
+        *,
+        transcript_revision: int,
+        current_seconds: float,
+        model_id: str | None,
+        threshold_profile_id: str | None,
+    ) -> tuple[str, CallCoachingMetadata | None]:
+        fingerprint = _suggestion_fingerprint(suggestion)
+        candidate_key = _candidate_key(suggestion)
+        if fingerprint in self._displayed_fingerprints:
+            return "duplicate_same_revision", None
+        if not _cooldown_available(
+            self._displayed_candidate_times.get(candidate_key),
+            current_seconds,
+            self._tenant_config.coaching.cooldown_seconds,
+        ):
+            return "cooldown_previously_displayed", None
+        admitted, replaced = self._call_state.admit_coaching_suggestion(
+            suggestion,
+            transcript_revision=transcript_revision,
+            model_id=model_id,
+            threshold_profile_id=threshold_profile_id,
+            maximum_active_suggestions=(
+                self._tenant_config.coaching.max_active_suggestions
+            ),
+        )
+        if not admitted:
+            return "rejected_by_capacity", None
+        self._displayed_fingerprints.add(fingerprint)
+        self._displayed_candidate_times[candidate_key] = current_seconds
+        self._call_state.mark_suggestion_shown(suggestion.suggestion_id)
+        return "admitted", replaced
 
     def process_safely(
         self,
