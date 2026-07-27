@@ -50,6 +50,68 @@ class VectorRecord(BaseModel):
         return tuple(result)
 
 
+class VectorRecordIdentity(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    document_id: str
+    chunk_id: str
+
+    @field_validator("document_id", "chunk_id")
+    @classmethod
+    def validate_required_text(cls, value: str, info: object) -> str:
+        return _required_text(value, getattr(info, "field_name", "value"))
+
+
+class VectorBatchWriteRequest(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    knowledge_base_id: str
+    records: tuple[VectorRecord, ...]
+
+    @field_validator("tenant_id", "knowledge_base_id")
+    @classmethod
+    def validate_required_text(cls, value: str, info: object) -> str:
+        return _required_text(value, getattr(info, "field_name", "value"))
+
+    @model_validator(mode="after")
+    def validate_records(self) -> Self:
+        if not self.records:
+            raise ValueError("records cannot be empty")
+        if any(record.tenant_id != self.tenant_id for record in self.records):
+            raise ValueError("vector record tenant_id does not match batch request")
+        if any(
+            record.knowledge_base_id != self.knowledge_base_id
+            for record in self.records
+        ):
+            raise ValueError(
+                "vector record knowledge_base_id does not match batch request"
+            )
+        identities = tuple(
+            (record.document_id, record.chunk_id) for record in self.records
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("vector batch record identities must be unique")
+        dimensions = {len(record.embedding) for record in self.records}
+        if len(dimensions) != 1:
+            raise ValueError("vector batch embeddings must have equal dimensions")
+        return self
+
+
+class VectorBatchWriteResult(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    knowledge_base_id: str
+    inserted_identities: tuple[VectorRecordIdentity, ...]
+    unchanged_identities: tuple[VectorRecordIdentity, ...]
+
+    @field_validator("tenant_id", "knowledge_base_id")
+    @classmethod
+    def validate_required_text(cls, value: str, info: object) -> str:
+        return _required_text(value, getattr(info, "field_name", "value"))
+
+
 class SearchRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
