@@ -8,6 +8,7 @@ from app.vector_store import (
     SearchRequest,
     SearchResult,
     VectorRecord,
+    VectorSearchHit,
     VectorStore,
 )
 
@@ -18,6 +19,7 @@ def record(
     tenant_id: str = "tenant_alpha",
     knowledge_base_id: str = "kb_support",
     document_id: str = "guide",
+    text: str | None = None,
     embedding: tuple[float, ...] = (1.0, 0.0),
 ) -> VectorRecord:
     return VectorRecord(
@@ -25,6 +27,7 @@ def record(
         knowledge_base_id=knowledge_base_id,
         document_id=document_id,
         chunk_id=chunk_id,
+        text=text or f"Synthetic vector content for {chunk_id}.",
         embedding=embedding,
         metadata=(("source", "synthetic"),),
     )
@@ -36,6 +39,7 @@ def request(**changes: object) -> SearchRequest:
         "knowledge_base_id": "kb_support",
         "query_embedding": (1.0, 0.0),
         "top_k": 5,
+        "minimum_score": 0.0,
     }
     values.update(changes)
     return SearchRequest.model_validate(values)
@@ -47,7 +51,7 @@ def test_protocol_compatibility_and_upsert() -> None:
 
     store.upsert(stored)
 
-    assert store.search(request()).records == (stored,)
+    assert store.search(request()).hits == (VectorSearchHit(record=stored, score=1.0),)
 
 
 def test_upsert_replaces_chunk_within_scope() -> None:
@@ -57,7 +61,9 @@ def test_upsert_replaces_chunk_within_scope() -> None:
 
     store.upsert(replacement)
 
-    assert store.search(request()).records == (replacement,)
+    assert store.search(request()).hits == (
+        VectorSearchHit(record=replacement, score=1.0),
+    )
 
 
 def test_search_order_is_deterministic() -> None:
@@ -72,7 +78,7 @@ def test_search_order_is_deterministic() -> None:
 
     result = store.search(request())
 
-    assert [item.chunk_id for item in result.records] == [
+    assert [hit.record.chunk_id for hit in result.hits] == [
         "chunk_high",
         "chunk_a",
         "chunk_c",
@@ -87,7 +93,7 @@ def test_tenant_isolation() -> None:
 
     result = store.search(request())
 
-    assert [item.chunk_id for item in result.records] == ["alpha"]
+    assert [hit.record.chunk_id for hit in result.hits] == ["alpha"]
 
 
 def test_knowledge_base_isolation() -> None:
@@ -97,7 +103,7 @@ def test_knowledge_base_isolation() -> None:
 
     result = store.search(request())
 
-    assert [item.chunk_id for item in result.records] == ["support"]
+    assert [hit.record.chunk_id for hit in result.hits] == ["support"]
 
 
 def test_top_k_limits_results() -> None:
@@ -107,7 +113,7 @@ def test_top_k_limits_results() -> None:
 
     result = store.search(request(top_k=1))
 
-    assert [item.chunk_id for item in result.records] == ["first"]
+    assert [hit.record.chunk_id for hit in result.hits] == ["first"]
 
 
 def test_repeated_searches_are_identical() -> None:
@@ -155,6 +161,14 @@ def test_top_k_must_be_positive() -> None:
         request(top_k=0)
 
 
+@pytest.mark.parametrize("minimum_score", [-0.1, 1.1, nan, inf, -inf])
+def test_minimum_score_must_be_finite_and_in_range(
+    minimum_score: float,
+) -> None:
+    with pytest.raises(ValidationError, match="minimum_score"):
+        request(minimum_score=minimum_score)
+
+
 def test_embedding_dimensions_are_enforced_per_scope() -> None:
     store = InMemoryVectorStore()
     store.upsert(record("chunk_1"))
@@ -171,7 +185,7 @@ def test_models_are_immutable() -> None:
     result = SearchResult(
         tenant_id="tenant_alpha",
         knowledge_base_id="kb_support",
-        records=(stored,),
+        hits=(VectorSearchHit(record=stored, score=1.0),),
     )
 
     with pytest.raises(ValidationError):
@@ -179,10 +193,72 @@ def test_models_are_immutable() -> None:
     with pytest.raises(ValidationError):
         source_request.top_k = 1
     with pytest.raises(ValidationError):
-        result.records = ()
+        result.hits = ()
 
 
 def test_empty_search_is_safe() -> None:
     result = InMemoryVectorStore().search(request())
 
-    assert result.records == ()
+    assert result.hits == ()
+
+
+def test_record_text_is_required_and_normalized() -> None:
+    assert record("chunk_1", text="  Synthetic text  ").text == "Synthetic text"
+    with pytest.raises(ValidationError, match="text cannot be empty"):
+        VectorRecord(
+            tenant_id="tenant_alpha",
+            knowledge_base_id="kb_support",
+            document_id="guide",
+            chunk_id="chunk_1",
+            text=" ",
+            embedding=(1.0, 0.0),
+        )
+
+
+@pytest.mark.parametrize("score", [-0.1, 1.1, nan, inf, -inf])
+def test_vector_search_hit_score_must_be_finite_and_in_range(score: float) -> None:
+    with pytest.raises(ValidationError, match="score"):
+        VectorSearchHit(record=record(), score=score)
+
+
+def test_search_result_rejects_duplicate_hit_identities() -> None:
+    stored = record("chunk_1")
+    with pytest.raises(ValidationError, match="identities must be unique"):
+        SearchResult(
+            tenant_id="tenant_alpha",
+            knowledge_base_id="kb_support",
+            hits=(
+                VectorSearchHit(record=stored, score=0.9),
+                VectorSearchHit(record=stored, score=0.8),
+            ),
+        )
+
+
+def test_minimum_score_filters_before_top_k() -> None:
+    store = InMemoryVectorStore()
+    store.upsert(record("high", embedding=(0.9, 0.0)))
+    store.upsert(record("low", embedding=(0.4, 0.0)))
+
+    result = store.search(request(minimum_score=0.5))
+
+    assert [hit.record.chunk_id for hit in result.hits] == ["high"]
+    assert result.hits[0].score == 0.9
+
+
+@pytest.mark.parametrize(
+    ("query_embedding", "record_embedding"),
+    [
+        ((1.0, 0.0), (-0.1, 0.0)),
+        ((1.0, 0.0), (1.1, 0.0)),
+        ((1e308,), (1e308,)),
+    ],
+)
+def test_invalid_computed_relevance_is_rejected(
+    query_embedding: tuple[float, ...],
+    record_embedding: tuple[float, ...],
+) -> None:
+    store = InMemoryVectorStore()
+    store.upsert(record(embedding=record_embedding))
+
+    with pytest.raises(ValueError):
+        store.search(request(query_embedding=query_embedding))
