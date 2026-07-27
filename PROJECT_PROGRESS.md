@@ -839,3 +839,24 @@ Tarih: 27 Temmuz 2026
 - Kalite: scoped Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: VectorStore batch yazma ve idempotency semantigi
   netlestikten sonra ayri bir ingestion servisini degerlendirmek.
+
+## 62. Atomic Idempotent Vector Batch Admission
+
+Tarih: 27 Temmuz 2026
+
+- In-memory vector kayit kimligi tenant, knowledge base, document ve chunk
+  alanlarini birlikte kullanacak sekilde duzeltildi.
+- Mevcut tekil `VectorStore` protokolu korunurken ayri provider-neutral atomik
+  batch writer, immutable request/result ve metinsiz identity modelleri eklendi.
+- Yeni kayitlar tek state swap ile eklenir, tamamen ayni kayitlar unchanged
+  no-op olur ve herhangi bir conflict tum batch'i state degistirmeden reddeder.
+- Degisen dosyalar: `app/vector_store/models.py`,
+  `app/vector_store/protocols.py`, `app/vector_store/in_memory.py`,
+  `app/vector_store/__init__.py`, `tests/test_vector_store.py`,
+  `tests/test_vector_store_batch_admission.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused vector-store/retrieval 84 passed; full suite mevcut Torch
+  `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection asamasinda
+  durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Atomik batch admission ile document embedding'i ayri,
+  provider-neutral bir ingestion composition gorevinde birlestirmek.

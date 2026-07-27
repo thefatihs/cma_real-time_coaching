@@ -2,10 +2,23 @@
 
 from typing import Protocol
 
-from app.vector_store.models import SearchRequest, SearchResult, VectorRecord
+from app.vector_store.models import (
+    SearchRequest,
+    SearchResult,
+    VectorBatchWriteRequest,
+    VectorBatchWriteResult,
+    VectorRecord,
+)
 
 
 class VectorStore(Protocol):
     def upsert(self, record: VectorRecord) -> None: ...
 
     def search(self, request: SearchRequest) -> SearchResult: ...
+
+
+class AtomicVectorBatchWriter(Protocol):
+    def admit_batch(
+        self,
+        request: VectorBatchWriteRequest,
+    ) -> VectorBatchWriteResult: ...

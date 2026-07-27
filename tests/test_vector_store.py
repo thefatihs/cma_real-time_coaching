@@ -54,10 +54,28 @@ def test_protocol_compatibility_and_upsert() -> None:
     assert store.search(request()).hits == (VectorSearchHit(record=stored, score=1.0),)
 
 
-def test_upsert_replaces_chunk_within_scope() -> None:
+def test_upsert_preserves_same_chunk_id_in_different_documents() -> None:
     store = InMemoryVectorStore()
-    store.upsert(record("chunk_1", document_id="old"))
-    replacement = record("chunk_1", document_id="new")
+    first = record("chunk_1", document_id="guide_a")
+    second = record("chunk_1", document_id="guide_b")
+
+    store.upsert(first)
+    store.upsert(second)
+
+    assert store.search(request()).hits == (
+        VectorSearchHit(record=first, score=1.0),
+        VectorSearchHit(record=second, score=1.0),
+    )
+
+
+def test_upsert_replaces_same_full_identity() -> None:
+    store = InMemoryVectorStore()
+    store.upsert(record("chunk_1", document_id="guide", text="Synthetic old."))
+    replacement = record(
+        "chunk_1",
+        document_id="guide",
+        text="Synthetic replacement.",
+    )
 
     store.upsert(replacement)
 
