@@ -818,3 +818,24 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Ayrica onaylanan bir gorevde offline diarization backend
   tasarimini bu protocol uzerinde uygulamak.
+
+## 61. Document Embedding Temeli
+
+Tarih: 27 Temmuz 2026
+
+- Query-only contract degistirilmeden provider-neutral `DocumentEmbedder`
+  protokolu eklendi.
+- SentenceTransformers saglayicisi query ve document embedding icin ayni lazy,
+  thread-safe backend, model ayarlari ve embedding dimension state'ini kullanir.
+- Batch sira/sayisi, bos metin, numeric/finite deger ve ortak dimension
+  dogrulamalari model veya network calistirmadan sentetik testlerle dogrulandi.
+- Degisen dosyalar: `app/embeddings/protocols.py`,
+  `app/embeddings/sentence_transformers.py`, `app/embeddings/__init__.py`,
+  `tests/test_sentence_transformer_document_embedder.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused embedding/retrieval 100 passed; full suite mevcut Torch
+  `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection asamasinda
+  durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: VectorStore batch yazma ve idempotency semantigi
+  netlestikten sonra ayri bir ingestion servisini degerlendirmek.
