@@ -29,6 +29,7 @@ class CoachingSuggestionSource(str, Enum):
     RULE = "rule"
     CLASSIFICATION = "classification"
     BOTH = "both"
+    LLM = "llm"
 
 
 class AudioChunkEvent(BaseModel):

@@ -751,6 +751,7 @@ def test_general_setfit_labels_have_required_turkish_names() -> None:
         (CoachingSuggestionSource.RULE, "Kural"),
         (CoachingSuggestionSource.CLASSIFICATION, "Sınıflandırma"),
         (CoachingSuggestionSource.BOTH, "Kural + sınıflandırma"),
+        (CoachingSuggestionSource.LLM, "LLM"),
     ],
 )
 def test_suggestion_card_shows_priority_action_and_provenance(
