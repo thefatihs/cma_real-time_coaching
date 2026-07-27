@@ -860,3 +860,24 @@ Tarih: 27 Temmuz 2026
 - Kalite: scoped Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Atomik batch admission ile document embedding'i ayri,
   provider-neutral bir ingestion composition gorevinde birlestirmek.
+
+## 63. Provider-Neutral Document Ingestion Temeli
+
+Tarih: 27 Temmuz 2026
+
+- Hazir ve guvenilir document chunk girdilerini tek batch embedding cagrisi ile
+  VectorRecord'lara cevirip mevcut atomik writer'a aktaran senkron servis eklendi.
+- Scope, kimlik, text ve metadata model yuklemeden once normalize edilir;
+  embedding sekli/degerleri ve writer sonucunun request-relative identity
+  butunlugu fail-closed dogrulanir.
+- Servis mevcut atomic idempotency/conflict davranisini degistirmeden sonucu
+  aynen dondurur; loader, chunker, provider veya runtime wiring eklenmedi.
+- Eklenen dosyalar: `app/ingestion/__init__.py`,
+  `app/ingestion/models.py`, `app/ingestion/service.py`,
+  `tests/test_document_ingestion.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused ingestion/embedding/vector admission 88 passed; full suite
+  mevcut Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Ingestion servisini provider-neutral composition
+  seviyesinde sentetik hazir chunk'larla kullanmayi degerlendirmek.
