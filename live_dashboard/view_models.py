@@ -78,6 +78,7 @@ SOURCE_LABELS = {
     CoachingSuggestionSource.RULE: "Kural",
     CoachingSuggestionSource.CLASSIFICATION: "Sınıflandırma",
     CoachingSuggestionSource.BOTH: "Kural + sınıflandırma",
+    CoachingSuggestionSource.LLM: "LLM",
 }
 PRIORITY_SYMBOLS = {
     SuggestionPriority.LOW: "○",

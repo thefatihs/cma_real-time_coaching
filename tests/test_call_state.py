@@ -8,7 +8,9 @@ from app.events.models import (
     ClassificationLabel,
     ClassificationResultEvent,
     CoachingAction,
+    CoachingSuggestionEvent,
     CoachingSuggestionSource,
+    SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
 )
@@ -138,6 +140,31 @@ def test_coaching_cooldown_and_trigger_marking() -> None:
         state.mark_coaching_triggered(-1)
     with pytest.raises(ValueError, match="negative"):
         state.can_trigger_coaching(-1, 20)
+
+
+def test_call_state_preserves_llm_coaching_source() -> None:
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    suggestion = CoachingSuggestionEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        suggestion_id="suggestion_llm",
+        source_transcript_event_id="transcript_1",
+        action=CoachingAction.RAG_ACTION,
+        priority=SuggestionPriority.HIGH,
+        source=CoachingSuggestionSource.LLM,
+        title="Synthetic guidance",
+        suggestion="Apply the synthetic guidance.",
+        created_at_utc=NOW,
+    )
+
+    state.apply_coaching_suggestion(
+        suggestion,
+        transcript_revision=1,
+        model_id=None,
+        threshold_profile_id=None,
+    )
+
+    assert state.coaching_suggestions[0].source is CoachingSuggestionSource.LLM
 
 
 def test_call_level_labels_accumulate_without_storing_classification_payloads() -> None:
