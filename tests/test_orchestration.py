@@ -129,6 +129,7 @@ def test_scope_and_retrieval_arguments_are_propagated() -> None:
 
     result = orchestrator.run(orchestration_request())
 
+    assert result is not None
     assert retriever.requests == [
         (
             "tenant_alpha",
@@ -175,18 +176,29 @@ def test_zero_minimum_score_is_preserved() -> None:
     assert retriever.requests[0][-1] == 0.0
 
 
-def test_empty_retrieval_result_is_forwarded_safely() -> None:
-    orchestrator, _, prompt_builder, _, calls = dependencies()
+def test_empty_retrieval_result_short_circuits_generation() -> None:
+    orchestrator, retriever, prompt_builder, llm_gateway, calls = dependencies()
+    request = orchestration_request(minimum_score=0.65)
 
-    result = orchestrator.run(orchestration_request())
+    result = orchestrator.run(request)
 
-    assert prompt_builder.requests[0].retrieved_context == ()
-    assert result.generated_text == "Synthetic generated response."
-    assert calls == ["retriever", "prompt_builder", "llm_gateway"]
+    assert result is None
+    assert calls == ["retriever"]
+    assert retriever.requests == [
+        (
+            "tenant_alpha",
+            "kb_support",
+            "Synthetic user input.",
+            3,
+            0.65,
+        )
+    ]
+    assert prompt_builder.requests == []
+    assert llm_gateway.requests == []
 
 
 def test_prompt_output_is_translated_to_llm_request() -> None:
-    orchestrator, _, _, llm_gateway, _ = dependencies()
+    orchestrator, _, _, llm_gateway, _ = dependencies((document(),))
 
     orchestrator.run(orchestration_request())
 
@@ -203,3 +215,17 @@ def test_repeated_identical_requests_are_deterministic() -> None:
     second = orchestrator.run(request)
 
     assert first == second
+
+
+def test_repeated_identical_empty_requests_deterministically_return_none() -> None:
+    orchestrator, retriever, prompt_builder, llm_gateway, calls = dependencies()
+    request = orchestration_request()
+
+    first = orchestrator.run(request)
+    second = orchestrator.run(request)
+
+    assert first is second is None
+    assert len(retriever.requests) == 2
+    assert calls == ["retriever", "retriever"]
+    assert prompt_builder.requests == []
+    assert llm_gateway.requests == []
