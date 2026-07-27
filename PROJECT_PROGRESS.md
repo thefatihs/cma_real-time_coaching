@@ -717,3 +717,35 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Ayni 7/13/15 akisini gercek dashboard smoke testinde
   yeniden dogrulamak.
+
+## 55. Fail-Closed Coaching Processor Adapter
+
+- Mevcut senkron coaching processor seam'i korunarak `CoachingCoordinator`
+  guvenli scope ve sonuc dogrulamali fail-closed adapter ile sarildi.
+- Delegate exception, malformed sonuc ve tenant/call/revision uyusmazliginda
+  coaching-only state geri alinir; transcript ve diger pipeline state'i korunur.
+- Runtime wiring dogrudan coordinator yerine adapter uretir; basarili rule ve
+  classification coaching davranisi degismeden devam eder.
+- Degisen dosyalar: `app/coaching/coordinator.py`,
+  `app/coaching/safe_processor.py`, `live_dashboard/runtime_wiring.py`,
+  `tests/test_safe_coaching_processor_adapter.py`,
+  `tests/test_live_dashboard_runtime_wiring.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 82 passed; full 508 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Fail-closed adapter failure metadata'sini sentetik
+  dashboard akisi ile operator seviyesinde dogrulamak.
+
+## 56. Saf LLM Coaching Result Gate
+
+- Untrusted LLM JSON ciktisini immutable suggestion, no-suggestion veya sabit
+  reason-code'lu rejected sonuca donusturen saf ve deterministik gate eklendi.
+- Strict JSON object, duplicate key, 8192 karakter, derinlik, extra alan,
+  tenant/call/revision ve izinli document/chunk citation kontrolleri eklendi.
+- Gate network veya state mutation yapmaz; mevcut coaching action, priority ve
+  LLM provenance modellerini yeniden kullanir.
+- Degisen dosyalar: `app/coaching/llm_result_gate.py`,
+  `tests/test_llm_coaching_result_gate.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 42 passed; full 553 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gate yalnizca bu gorevin saf validation sinirinda
+  tamamlandi.

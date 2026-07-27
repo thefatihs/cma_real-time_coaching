@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 
-from app.calls.models import CallState
+from app.calls.models import (
+    CallCoachingMetadata,
+    CallDetectedLabelMetadata,
+    CallRevisionLabelDiagnostic,
+    CallState,
+)
 from app.coaching.rule_engine import RuleBasedCoachingEngine
 from app.events.labels import canonical_label
 from app.events.models import (
@@ -60,6 +65,22 @@ class StableCoachingOutcome:
 SuggestionFingerprint = tuple[str, str, str, tuple[str, ...]]
 
 
+@dataclass(frozen=True, slots=True)
+class CoachingStateSnapshot:
+    active_labels: tuple[str, ...]
+    detected_labels: tuple[CallDetectedLabelMetadata, ...]
+    label_revision_timeline: tuple[CallRevisionLabelDiagnostic, ...]
+    shown_suggestion_ids: tuple[str, ...]
+    last_coaching_trigger_seconds: float | None
+    coaching_suggestions: tuple[CallCoachingMetadata, ...]
+    active_coaching_suggestions: tuple[CallCoachingMetadata, ...]
+    coaching_suggestion_history: tuple[CallCoachingMetadata, ...]
+    coaching_transcript_revision: int | None
+    displayed_fingerprints: frozenset[SuggestionFingerprint]
+    displayed_candidate_times: tuple[tuple[str, float], ...]
+    processed_revisions: frozenset[int]
+
+
 class CoachingCoordinator:
     def __init__(
         self,
@@ -83,6 +104,58 @@ class CoachingCoordinator:
         self._displayed_candidate_times: dict[str, float] = {}
         self._processed_revisions: set[int] = set()
         self._logger = logger or logging.getLogger(__name__)
+
+    @property
+    def call_state(self) -> CallState:
+        return self._call_state
+
+    def snapshot_coaching_state(self) -> CoachingStateSnapshot:
+        return CoachingStateSnapshot(
+            active_labels=tuple(self._call_state.active_labels),
+            detected_labels=tuple(self._call_state.detected_labels),
+            label_revision_timeline=tuple(self._call_state.label_revision_timeline),
+            shown_suggestion_ids=tuple(self._call_state.shown_suggestion_ids),
+            last_coaching_trigger_seconds=(
+                self._call_state.last_coaching_trigger_seconds
+            ),
+            coaching_suggestions=tuple(self._call_state.coaching_suggestions),
+            active_coaching_suggestions=tuple(
+                self._call_state.active_coaching_suggestions
+            ),
+            coaching_suggestion_history=tuple(
+                self._call_state.coaching_suggestion_history
+            ),
+            coaching_transcript_revision=self._call_state.coaching_transcript_revision,
+            displayed_fingerprints=frozenset(self._displayed_fingerprints),
+            displayed_candidate_times=tuple(
+                sorted(self._displayed_candidate_times.items())
+            ),
+            processed_revisions=frozenset(self._processed_revisions),
+        )
+
+    def restore_coaching_state(self, snapshot: CoachingStateSnapshot) -> None:
+        self._call_state.active_labels = list(snapshot.active_labels)
+        self._call_state.detected_labels = list(snapshot.detected_labels)
+        self._call_state.label_revision_timeline = list(
+            snapshot.label_revision_timeline
+        )
+        self._call_state.shown_suggestion_ids = list(snapshot.shown_suggestion_ids)
+        self._call_state.last_coaching_trigger_seconds = (
+            snapshot.last_coaching_trigger_seconds
+        )
+        self._call_state.coaching_suggestions = list(snapshot.coaching_suggestions)
+        self._call_state.active_coaching_suggestions = list(
+            snapshot.active_coaching_suggestions
+        )
+        self._call_state.coaching_suggestion_history = list(
+            snapshot.coaching_suggestion_history
+        )
+        self._call_state.coaching_transcript_revision = (
+            snapshot.coaching_transcript_revision
+        )
+        self._displayed_fingerprints = set(snapshot.displayed_fingerprints)
+        self._displayed_candidate_times = dict(snapshot.displayed_candidate_times)
+        self._processed_revisions = set(snapshot.processed_revisions)
 
     def process(
         self,

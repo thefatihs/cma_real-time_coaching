@@ -4,6 +4,7 @@ from typing import cast
 from app.calls.models import CallState
 from app.classification.runtime import RuntimeSetFitClassifier
 from app.coaching.coordinator import CoachingCoordinator
+from app.coaching.safe_processor import SafeCoachingProcessorAdapter
 from app.events.models import TranscriptEvent, TranscriptKind
 from app.streaming.pipeline import WindowTranscriberProtocol
 from live_dashboard.demo_data import tenant_demos
@@ -74,26 +75,31 @@ def test_missing_artifacts_are_safe_and_keep_rule_coaching() -> None:
     coordinator = pipeline._coaching_coordinator_factory(  # noqa: SLF001
         CallState(tenant_id="tenant_alpha", call_id="synthetic-call")
     )
-    assert isinstance(coordinator, CoachingCoordinator)
-    rule_only = coordinator.process(
-        TranscriptEvent(
-            tenant_id="tenant_alpha",
-            call_id="synthetic-call",
-            event_id="stable-1",
-            kind=TranscriptKind.STABLE,
-            text="Aboneliğimi iptal etmek istiyorum.",
-            start_seconds=0,
-            end_seconds=1,
-            revision=1,
-            created_at_utc=tenant_demos()["tenant_alpha"]
-            .scenarios[0]
-            .events[0]
-            .created_at_utc,
-        ),
+    assert isinstance(coordinator, SafeCoachingProcessorAdapter)
+    call_state = coordinator._call_state  # noqa: SLF001
+    stable_event = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="synthetic-call",
+        event_id="stable-1",
+        kind=TranscriptKind.STABLE,
+        text="Aboneliğimi iptal etmek istiyorum.",
+        start_seconds=0,
+        end_seconds=1,
+        revision=1,
+        created_at_utc=tenant_demos()["tenant_alpha"]
+        .scenarios[0]
+        .events[0]
+        .created_at_utc,
+    )
+    call_state.apply_transcript(stable_event)
+    rule_only = coordinator.process_safely(
+        stable_event,
         1,
         active_labels=(),
     )
-    assert rule_only.displayed_suggestions
+    assert isinstance(coordinator._coordinator, CoachingCoordinator)  # noqa: SLF001
+    assert rule_only.result is not None
+    assert rule_only.result.displayed_suggestions
     tabs = dashboard_tabs(subject)
     assert ("SetFit", "failed") in tabs.technical.pipeline_statuses
     assert ("Coaching", "active") in tabs.technical.pipeline_statuses

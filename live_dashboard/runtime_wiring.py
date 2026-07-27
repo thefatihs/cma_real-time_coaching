@@ -18,7 +18,12 @@ from app.classification.runtime import (
 from app.classification.threshold_profiles import load_threshold_profile
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.rule_engine import RuleBasedCoachingEngine
-from app.streaming.pipeline import StreamingASRPipeline, WindowTranscriberProtocol
+from app.coaching.safe_processor import SafeCoachingProcessorAdapter
+from app.streaming.pipeline import (
+    CoachingProcessorProtocol,
+    StreamingASRPipeline,
+    WindowTranscriberProtocol,
+)
 from live_dashboard.demo_data import TenantDemo
 from live_dashboard.view_models import DashboardRuntime
 
@@ -121,12 +126,15 @@ def build_live_pipeline(
     )
 
 
-def _coaching_factory(tenant: TenantDemo) -> Callable[[CallState], CoachingCoordinator]:
-    def create(call_state: CallState) -> CoachingCoordinator:
-        return CoachingCoordinator(
+def _coaching_factory(
+    tenant: TenantDemo,
+) -> Callable[[CallState], CoachingProcessorProtocol]:
+    def create(call_state: CallState) -> CoachingProcessorProtocol:
+        coordinator = CoachingCoordinator(
             tenant.config,
             call_state,
             RuleBasedCoachingEngine(tenant.config, tenant.rules),
         )
+        return SafeCoachingProcessorAdapter(coordinator)
 
     return create
