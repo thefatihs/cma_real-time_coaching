@@ -15,6 +15,7 @@ class VectorRecord(BaseModel):
     knowledge_base_id: str
     document_id: str
     chunk_id: str
+    text: str
     embedding: tuple[float, ...]
     metadata: Metadata = ()
 
@@ -23,6 +24,7 @@ class VectorRecord(BaseModel):
         "knowledge_base_id",
         "document_id",
         "chunk_id",
+        "text",
     )
     @classmethod
     def validate_required_text(cls, value: str, info: object) -> str:
@@ -55,6 +57,7 @@ class SearchRequest(BaseModel):
     knowledge_base_id: str
     query_embedding: tuple[float, ...]
     top_k: int
+    minimum_score: float = 0.0
 
     @field_validator("tenant_id", "knowledge_base_id")
     @classmethod
@@ -76,13 +79,30 @@ class SearchRequest(BaseModel):
             raise ValueError("top_k must be positive")
         return value
 
+    @field_validator("minimum_score")
+    @classmethod
+    def validate_minimum_score(cls, value: float) -> float:
+        return _validated_score(value, "minimum_score")
+
+
+class VectorSearchHit(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    record: VectorRecord
+    score: float
+
+    @field_validator("score")
+    @classmethod
+    def validate_score(cls, value: float) -> float:
+        return _validated_score(value, "score")
+
 
 class SearchResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     tenant_id: str
     knowledge_base_id: str
-    records: tuple[VectorRecord, ...] = ()
+    hits: tuple[VectorSearchHit, ...] = ()
 
     @field_validator("tenant_id", "knowledge_base_id")
     @classmethod
@@ -90,16 +110,20 @@ class SearchResult(BaseModel):
         return _required_text(value, getattr(info, "field_name", "value"))
 
     @model_validator(mode="after")
-    def validate_record_scope(self) -> Self:
-        if any(record.tenant_id != self.tenant_id for record in self.records):
+    def validate_hit_scope_and_identity(self) -> Self:
+        if any(hit.record.tenant_id != self.tenant_id for hit in self.hits):
             raise ValueError("vector record tenant_id does not match search result")
         if any(
-            record.knowledge_base_id != self.knowledge_base_id
-            for record in self.records
+            hit.record.knowledge_base_id != self.knowledge_base_id for hit in self.hits
         ):
             raise ValueError(
                 "vector record knowledge_base_id does not match search result"
             )
+        identities = tuple(
+            (hit.record.document_id, hit.record.chunk_id) for hit in self.hits
+        )
+        if len(identities) != len(set(identities)):
+            raise ValueError("vector search hit identities must be unique")
         return self
 
 
@@ -111,6 +135,12 @@ def _validated_embedding(
         raise ValueError(f"{field_name} cannot be empty")
     if any(not isfinite(item) for item in value):
         raise ValueError(f"{field_name} must contain only finite values")
+    return value
+
+
+def _validated_score(value: float, field_name: str) -> float:
+    if not isfinite(value) or not 0 <= value <= 1:
+        raise ValueError(f"{field_name} must be finite and between 0 and 1")
     return value
 
 

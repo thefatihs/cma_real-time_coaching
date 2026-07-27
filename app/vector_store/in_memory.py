@@ -2,7 +2,12 @@
 
 from math import fsum
 
-from app.vector_store.models import SearchRequest, SearchResult, VectorRecord
+from app.vector_store.models import (
+    SearchRequest,
+    SearchResult,
+    VectorRecord,
+    VectorSearchHit,
+)
 
 RecordKey = tuple[str, str, str]
 ScopeKey = tuple[str, str]
@@ -29,19 +34,29 @@ class InMemoryVectorStore:
                 "query embedding dimension does not match vector-store scope"
             )
 
-        scoped = (record for key, record in self._records.items() if key[:2] == scope)
+        hits: list[VectorSearchHit] = []
+        for key, record in self._records.items():
+            if key[:2] != scope:
+                continue
+            score = _dot_product(request.query_embedding, record.embedding)
+            if not 0 <= score <= 1:
+                raise ValueError(
+                    "computed relevance score must be finite and between 0 and 1"
+                )
+            if score >= request.minimum_score:
+                hits.append(VectorSearchHit(record=record, score=score))
         ranked = sorted(
-            scoped,
-            key=lambda record: (
-                -_dot_product(request.query_embedding, record.embedding),
-                record.document_id,
-                record.chunk_id,
+            hits,
+            key=lambda hit: (
+                -hit.score,
+                hit.record.document_id,
+                hit.record.chunk_id,
             ),
         )
         return SearchResult(
             tenant_id=request.tenant_id,
             knowledge_base_id=request.knowledge_base_id,
-            records=tuple(ranked[: request.top_k]),
+            hits=tuple(ranked[: request.top_k]),
         )
 
 
