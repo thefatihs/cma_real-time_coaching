@@ -1,0 +1,7 @@
+warning: in the working copy of 'PROJECT_PROGRESS.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'live_dashboard/runtime_wiring.py', LF will be replaced by CRLF the next time Git touches it
+ PROJECT_PROGRESS.md                         | 17 [32m+++++++[m
+ app/coaching/coordinator.py                 | 75 [32m++++++++++++++++++++++++++++[m[31m-[m
+ live_dashboard/runtime_wiring.py            | 16 [32m++++[m[31m--[m
+ tests/test_live_dashboard_runtime_wiring.py | 40 [32m++++++++[m[31m-------[m
+ 4 files changed, 126 insertions(+), 22 deletions(-)
