@@ -618,12 +618,16 @@ _COACHING_PRIORITY_RANK = {
 }
 
 
-def _coaching_rank(metadata: "CallCoachingMetadata") -> tuple[int, int, int]:
+def _coaching_rank(metadata: "CallCoachingMetadata") -> tuple[int, int, str]:
     return (
         _COACHING_PRIORITY_RANK[metadata.priority],
         metadata.transcript_revision,
-        -metadata.display_order,
+        _reverse_lexical_key(metadata.label_id or metadata.suggestion_id),
     )
+
+
+def _reverse_lexical_key(value: str) -> str:
+    return "".join(chr(0x10FFFF - ord(character)) for character in value.casefold())
 
 
 class CallClassificationMetadata(BaseModel):

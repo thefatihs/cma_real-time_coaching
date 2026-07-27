@@ -200,9 +200,9 @@ def _render_representative(
         feedback = st.session_state.setdefault("suggestion_feedback", {})
         for message in representative.safe_messages:
             st.warning(message)
-        if not representative.suggestions:
+        if not representative.active_suggestions:
             st.info(representative.empty_suggestion_message)
-        for index, card in enumerate(representative.suggestions):
+        for index, card in enumerate(representative.active_suggestions):
             key = f"{card.timestamp}-{card.title}-{index}"
             with st.container(border=True):
                 st.markdown(
@@ -229,9 +229,10 @@ def _render_representative(
                         st.session_state.suggestion_feedback = feedback
                 if key in feedback:
                     st.caption(f"Geri bildirim: {feedback[key]}")
-        if representative.suggestion_history:
+        suggestion_history = getattr(representative, "suggestion_history", ())
+        if suggestion_history:
             st.caption("Önceki Öneriler")
-            for card in representative.suggestion_history:
+            for card in suggestion_history:
                 st.caption(
                     f"{card.priority_symbol} {card.title} · "
                     f"{card.related_label or '—'} · Revizyon "

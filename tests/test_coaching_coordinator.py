@@ -186,20 +186,20 @@ def test_duplicate_suggestion_is_suppressed_and_classification_preserved() -> No
     assert result.classification_event is not None
     assert result.displayed_suggestions == ()
     assert len(result.suppressed_suggestions) == 1
-    assert result.suppression_reasons == ("duplicate",)
+    assert result.suppression_reasons == ("duplicate_same_revision",)
 
 
 def test_cooldown_suppression_then_allowed_after_cooldown() -> None:
     subject, state = coordinator(
         rule("first", phrase="iade"),
-        rule("second", label="acil", phrase="acil", title="Acil destek"),
+        rule("second", phrase="acil", title="Acil destek"),
     )
     first = subject.process(event(text="iade"), 1.0)
     assert len(first.displayed_suggestions) == 1
     blocked = subject.process(
         event(event_id="transcript_2", text="acil", revision=2), 5.0
     )
-    assert blocked.suppression_reasons == ("cooldown",)
+    assert blocked.suppression_reasons == ("cooldown_previously_displayed",)
     allowed = subject.process(
         event(event_id="transcript_3", text="acil", revision=3), 11.0
     )
@@ -217,7 +217,7 @@ def test_maximum_suggestion_count_suppresses_excess() -> None:
     result = subject.process(event(), 1.0)
     assert len(result.displayed_suggestions) == 2
     assert len(result.suppressed_suggestions) == 1
-    assert result.suppression_reasons == ("max_active_suggestions",)
+    assert result.suppression_reasons == ("rejected_by_capacity",)
 
 
 def test_rag_classification_passes_without_suggestion() -> None:
@@ -406,7 +406,7 @@ def test_cancellation_suggestion_is_not_displayed_twice() -> None:
     assert len(first.displayed_suggestions) == 1
     assert first.suppressed_suggestions == ()
     assert duplicate.displayed_suggestions == ()
-    assert duplicate.suppression_reasons == ("duplicate",)
+    assert duplicate.suppression_reasons == ("duplicate_same_revision",)
 
 
 def test_short_call_suggestion_provenance_and_deduplication_are_unchanged() -> None:
@@ -432,7 +432,7 @@ def test_short_call_suggestion_provenance_and_deduplication_are_unchanged() -> N
 
     assert first.displayed_suggestions[0].source is CoachingSuggestionSource.BOTH
     assert repeated.displayed_suggestions == ()
-    assert repeated.suppression_reasons == ("duplicate",)
+    assert repeated.suppression_reasons == ("duplicate_same_revision",)
 
 
 def test_accumulated_old_label_does_not_trigger_new_coaching() -> None:
@@ -455,31 +455,31 @@ def test_accumulated_old_label_does_not_trigger_new_coaching() -> None:
 
 
 def test_long_call_current_critical_suggestions_replace_older_active_cards() -> None:
-    subject, state = coordinator(tenant=config(cooldown=0, maximum=2))
+    subject, state = coordinator(tenant=config(cooldown=20, maximum=2))
     price = subject.process(
-        event(text="Bu ücret çok pahalı.", revision=1),
-        1.0,
+        event(text="Bu ücret çok pahalı.", revision=7),
+        7.0,
         classification_event=classification("price_objection"),
         active_labels=("price_objection",),
     )
     complaint = subject.process(
-        event(event_id="transcript_2", text="Şikayetçiyim.", revision=2),
-        2.0,
+        event(event_id="transcript_13", text="Şikayetçiyim.", revision=13),
+        13.0,
         classification_event=classification("complaint").model_copy(
-            update={"transcript_event_id": "transcript_2"}
+            update={"transcript_event_id": "transcript_13"}
         ),
         active_labels=("complaint",),
     )
     final = subject.process(
         event(
-            event_id="transcript_3",
+            event_id="transcript_15",
             text=EXACT_CANCELLATION,
-            revision=3,
+            revision=15,
         ),
-        3.0,
+        15.0,
         classification_event=classification(
             "churn_risk", "cancellation_request"
-        ).model_copy(update={"transcript_event_id": "transcript_3"}),
+        ).model_copy(update={"transcript_event_id": "transcript_15"}),
         active_labels=("churn_risk", "cancellation_request"),
     )
 
@@ -496,8 +496,15 @@ def test_long_call_current_critical_suggestions_replace_older_active_cards() -> 
     assert len(final.displayed_suggestions) == 2
     assert len(final.replaced_suggestion_ids) == 2
     assert all(
-        decision.reason == "replaced_by_higher_rank" and decision.moved_to_history
+        item.priority is SuggestionPriority.HIGH for item in state.coaching_suggestions
+    )
+    assert not {
+        item.suggestion_id for item in state.active_coaching_suggestions
+    }.intersection(item.suggestion_id for item in state.coaching_suggestion_history)
+    assert all(
+        decision.reason == "replaced_by_newer_priority" and decision.moved_to_history
         for decision in final.suggestion_decisions
+        if decision.moved_to_history
     )
     assert (
         next(
@@ -546,5 +553,38 @@ def test_equal_priority_capacity_order_is_stable() -> None:
     assert [item.label_id for item in result.suppressed_suggestions] == [
         "renewal_interest"
     ]
-    assert result.suppression_reasons == ("max_active_suggestions",)
+    assert result.suppression_reasons == ("rejected_by_capacity",)
     assert state.active_coaching_suggestions[0].label_id == "product_information"
+
+
+def test_capacity_rejection_does_not_start_candidate_cooldown() -> None:
+    subject, state = coordinator(tenant=config(cooldown=60, maximum=1))
+    first = subject.process(
+        event(text="Eşleşmeyen ifade."),
+        1.0,
+        classification_event=classification(
+            "product_information",
+            "renewal_interest",
+        ),
+        active_labels=("product_information", "renewal_interest"),
+    )
+    assert [item.label_id for item in first.suppressed_suggestions] == [
+        "renewal_interest"
+    ]
+    assert first.suppression_reasons == ("rejected_by_capacity",)
+
+    retried = subject.process(
+        event(event_id="transcript_2", text="Eşleşmeyen yeni ifade.", revision=2),
+        2.0,
+        classification_event=classification("renewal_interest").model_copy(
+            update={"transcript_event_id": "transcript_2"}
+        ),
+        active_labels=("renewal_interest",),
+    )
+
+    assert [item.label_id for item in retried.displayed_suggestions] == [
+        "renewal_interest"
+    ]
+    assert retried.suppression_reasons == ()
+    assert state.active_coaching_suggestions[0].label_id == "renewal_interest"
+    assert state.last_coaching_trigger_seconds == 2.0

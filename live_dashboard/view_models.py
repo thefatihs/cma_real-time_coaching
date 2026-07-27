@@ -48,9 +48,9 @@ PRIORITY_RANK = {
 }
 CRITICAL_LABEL_MARKERS = ("kritik", "risk", "eskalasyon", "aktarim", "aktarımı")
 SUPPRESSION_LABELS = {
-    "duplicate": "yinelenen öneri",
-    "cooldown": "bekleme süresi",
-    "max_active_suggestions": "aktif öneri sınırı",
+    "duplicate_same_revision": "yinelenen öneri",
+    "cooldown_previously_displayed": "bekleme süresi",
+    "rejected_by_capacity": "aktif öneri sınırı",
 }
 ACTION_LABELS = {
     CoachingAction.NO_ACTION: "Aksiyon yok",
@@ -180,13 +180,18 @@ class RepresentativeTabViewModel:
     status: tuple[StatusCardViewModel, ...]
     progress: ProgressViewModel
     transcript: TranscriptViewModel
-    suggestions: tuple[SuggestionCardViewModel, ...]
-    suggestion_history: tuple[SuggestionCardViewModel, ...]
     intent_chips: tuple[IntentChipViewModel, ...]
     detected_intent_chips: tuple[IntentChipViewModel, ...]
     suppressed_count: int
     empty_suggestion_message: str
     safe_messages: tuple[str, ...]
+    active_suggestions: tuple[SuggestionCardViewModel, ...] = ()
+    suggestion_history: tuple[SuggestionCardViewModel, ...] = ()
+
+    @property
+    def suggestions(self) -> tuple[SuggestionCardViewModel, ...]:
+        """Compatibility alias for callers that still read active cards."""
+        return self.active_suggestions
 
 
 @dataclass(frozen=True, slots=True)
@@ -847,13 +852,13 @@ def dashboard_tabs(
             status=status,
             progress=progress,
             transcript=transcript_view(runtime),
-            suggestions=representative_suggestions,
-            suggestion_history=tuple(ordered_suggestions(runtime.suggestion_history)),
             intent_chips=chips,
             detected_intent_chips=result_chips,
             suppressed_count=len(runtime.suppression_reasons),
             empty_suggestion_message="Şu anda gösterilecek yeni bir koçluk önerisi yok.",
             safe_messages=safe_messages,
+            active_suggestions=representative_suggestions,
+            suggestion_history=tuple(ordered_suggestions(runtime.suggestion_history)),
         ),
         technical=TechnicalTabViewModel(
             progress=progress,

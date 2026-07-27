@@ -6,9 +6,11 @@ import logging
 
 from app.calls.models import CallState
 from app.coaching.rule_engine import RuleBasedCoachingEngine
+from app.events.labels import canonical_label
 from app.events.models import (
     ClassificationResultEvent,
     CoachingSuggestionEvent,
+    CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
     TranscriptKind,
@@ -78,6 +80,7 @@ class CoachingCoordinator:
         self._call_state = call_state
         self._rule_engine = rule_engine
         self._displayed_fingerprints: set[SuggestionFingerprint] = set()
+        self._displayed_candidate_times: dict[str, float] = {}
         self._processed_revisions: set[int] = set()
         self._logger = logger or logging.getLogger(__name__)
 
@@ -127,13 +130,9 @@ class CoachingCoordinator:
         reasons: list[str] = []
         replaced_ids: list[str] = []
         decisions: list[SafeSuggestionDecision] = []
-        cooldown_available = self._call_state.can_trigger_coaching(
-            current_seconds,
-            self._tenant_config.coaching.cooldown_seconds,
-        )
         maximum = self._tenant_config.coaching.max_active_suggestions
 
-        for suggestion in evaluation.suggestion_events:
+        for suggestion in _merge_current_candidates(evaluation.suggestion_events):
             if suggestion.label_id is not None:
                 self._call_state.record_detected_labels(
                     [suggestion.label_id],
@@ -151,17 +150,32 @@ class CoachingCoordinator:
                     ),
                 )
             fingerprint = _suggestion_fingerprint(suggestion)
+            candidate_key = _candidate_key(suggestion)
             if fingerprint in self._displayed_fingerprints:
                 suppressed.append(suggestion)
-                reasons.append("duplicate")
+                reasons.append("duplicate_same_revision")
                 decisions.append(
-                    _decision(suggestion, event.revision, "duplicate", False)
+                    _decision(
+                        suggestion,
+                        event.revision,
+                        "duplicate_same_revision",
+                        False,
+                    )
                 )
-            elif not cooldown_available:
+            elif not _cooldown_available(
+                self._displayed_candidate_times.get(candidate_key),
+                current_seconds,
+                self._tenant_config.coaching.cooldown_seconds,
+            ):
                 suppressed.append(suggestion)
-                reasons.append("cooldown")
+                reasons.append("cooldown_previously_displayed")
                 decisions.append(
-                    _decision(suggestion, event.revision, "cooldown", False)
+                    _decision(
+                        suggestion,
+                        event.revision,
+                        "cooldown_previously_displayed",
+                        False,
+                    )
                 )
             else:
                 admitted, replaced = self._call_state.admit_coaching_suggestion(
@@ -181,19 +195,23 @@ class CoachingCoordinator:
                 )
                 if not admitted:
                     suppressed.append(suggestion)
-                    reasons.append("max_active_suggestions")
+                    reasons.append("rejected_by_capacity")
                     decisions.append(
                         _decision(
                             suggestion,
                             event.revision,
-                            "active_capacity",
+                            "rejected_by_capacity",
                             False,
                         )
                     )
                     continue
                 displayed.append(suggestion)
                 self._displayed_fingerprints.add(fingerprint)
+                self._displayed_candidate_times[candidate_key] = current_seconds
                 self._call_state.mark_suggestion_shown(suggestion.suggestion_id)
+                decisions.append(
+                    _decision(suggestion, event.revision, "admitted", False)
+                )
                 if replaced is not None:
                     replaced_ids.append(replaced.suggestion_id)
                     decisions.append(
@@ -201,7 +219,7 @@ class CoachingCoordinator:
                             transcript_revision=replaced.transcript_revision,
                             label_id=replaced.label_id,
                             priority=replaced.priority,
-                            reason="replaced_by_higher_rank",
+                            reason="replaced_by_newer_priority",
                             moved_to_history=True,
                         )
                     )
@@ -275,6 +293,7 @@ class CoachingCoordinator:
         ]
         self._call_state.active_coaching_suggestions = []
         self._displayed_fingerprints.clear()
+        self._displayed_candidate_times.clear()
         self._processed_revisions.clear()
 
 
@@ -287,6 +306,42 @@ def _suggestion_fingerprint(
         suggestion.suggestion,
         tuple(suggestion.evidence_ids),
     )
+
+
+def _candidate_key(suggestion: CoachingSuggestionEvent) -> str:
+    label = canonical_label(suggestion.label_id) if suggestion.label_id else None
+    return label or suggestion.label_id or repr(_suggestion_fingerprint(suggestion))
+
+
+def _cooldown_available(
+    displayed_seconds: float | None,
+    current_seconds: float,
+    cooldown_seconds: float,
+) -> bool:
+    return (
+        displayed_seconds is None
+        or current_seconds - displayed_seconds >= cooldown_seconds
+    )
+
+
+def _merge_current_candidates(
+    suggestions: tuple[CoachingSuggestionEvent, ...],
+) -> tuple[CoachingSuggestionEvent, ...]:
+    by_key: dict[str, CoachingSuggestionEvent] = {}
+    for suggestion in suggestions:
+        key = _candidate_key(suggestion)
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = suggestion
+            continue
+        sources = {existing.source, suggestion.source}
+        source = (
+            CoachingSuggestionSource.BOTH
+            if len(sources) > 1 or CoachingSuggestionSource.BOTH in sources
+            else existing.source
+        )
+        by_key[key] = existing.model_copy(update={"source": source})
+    return tuple(by_key[key] for key in sorted(by_key, key=str.casefold))
 
 
 def _decision(

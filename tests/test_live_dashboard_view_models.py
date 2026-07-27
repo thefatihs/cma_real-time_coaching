@@ -47,6 +47,7 @@ from live_dashboard.view_models import (
     LabelViewModel,
     ordered_suggestions,
     progress_view,
+    RepresentativeTabViewModel,
     reset_runtime,
     reset_local_execution,
     responsive_rows,
@@ -118,7 +119,9 @@ def test_duplicate_suppression_reason_is_displayed() -> None:
     while advance_runtime(subject) is not None:
         pass
     assert subject.suppression_reasons == ["yinelenen öneri"]
-    assert suppression_reason_display("cooldown") == "bekleme süresi"
+    assert (
+        suppression_reason_display("cooldown_previously_displayed") == "bekleme süresi"
+    )
 
 
 def test_tenant_labels_rules_and_state_are_isolated() -> None:
@@ -837,7 +840,7 @@ def test_representative_shows_current_critical_cards_before_compact_history() ->
             transcript_revision=7,
             label_id="price_objection",
             priority=SuggestionPriority.HIGH,
-            reason="replaced_by_higher_rank",
+            reason="replaced_by_newer_priority",
             moved_to_history=True,
         )
     )
@@ -851,10 +854,33 @@ def test_representative_shows_current_critical_cards_before_compact_history() ->
         "Fiyat İtirazı",
         "Şikâyet",
     }
+    assert {
+        card.suggestion_id for card in tabs.representative.active_suggestions
+    }.isdisjoint(card.suggestion_id for card in tabs.representative.suggestion_history)
     assert "synthetic-internal-rule" not in repr(tabs.representative)
     technical = repr(tabs.technical.suggestion_decisions)
     assert "PRIVATE_TRANSCRIPT" not in technical
     assert "C:/CallMetricPrivate" not in technical
+
+
+def test_representative_view_model_defaults_to_empty_active_and_history() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    built = dashboard_tabs(state.runtime, state).representative
+
+    representative = RepresentativeTabViewModel(
+        status=built.status,
+        progress=built.progress,
+        transcript=built.transcript,
+        intent_chips=built.intent_chips,
+        detected_intent_chips=built.detected_intent_chips,
+        suppressed_count=built.suppressed_count,
+        empty_suggestion_message=built.empty_suggestion_message,
+        safe_messages=built.safe_messages,
+    )
+
+    assert representative.active_suggestions == ()
+    assert representative.suggestion_history == ()
+    assert representative.suggestions == ()
 
 
 def test_live_outcomes_are_deduplicated_and_technical_metadata_is_separated() -> None:
