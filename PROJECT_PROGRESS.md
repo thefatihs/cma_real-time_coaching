@@ -749,3 +749,18 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Gate yalnizca bu gorevin saf validation sinirinda
   tamamlandi.
+
+## 57. Saf LLM Coaching Decision Gate
+
+- Yalnizca yeni canonical label kanitina ve caller tarafindan verilen tenant
+  politikasina gore RAG/LLM istegi, local coaching, skip veya rejected karari
+  ureten immutable ve deterministik gate eklendi.
+- Unknown label, no_action conflict, inconsistent current/new state, bos scope
+  ve negatif revision sabit reason code'larla fail-closed reddedilir.
+- Gate transcript, prompt, CallState, network veya process-local history almaz
+  ve streaming/runtime entegrasyonu yapmaz.
+- Degisen dosyalar: `app/coaching/llm_decision_gate.py`,
+  `tests/test_llm_coaching_decision_gate.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 22 passed; full 575 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Gate bu gorevin saf karar sinirinda tamamlandi.
