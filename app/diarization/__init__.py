@@ -10,6 +10,12 @@ from app.diarization.models import (
     SpeakerRole,
 )
 from app.diarization.protocols import SpeakerDiarizerProtocol
+from app.diarization.pyannote_backend import (
+    DEFAULT_PYANNOTE_MODEL_ID,
+    PyannoteDiarizationError,
+    PyannoteDiarizationErrorCategory,
+    PyannoteSpeakerDiarizer,
+)
 
 __all__ = [
     "DiarizationRequest",
@@ -17,7 +23,11 @@ __all__ = [
     "DiarizationTurn",
     "DiarizedTranscriptEvent",
     "DiarizedWord",
+    "DEFAULT_PYANNOTE_MODEL_ID",
     "FakeSpeakerDiarizer",
+    "PyannoteDiarizationError",
+    "PyannoteDiarizationErrorCategory",
+    "PyannoteSpeakerDiarizer",
     "SpeakerDiarizerProtocol",
     "SpeakerRole",
 ]
