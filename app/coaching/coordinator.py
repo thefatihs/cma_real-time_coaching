@@ -79,6 +79,16 @@ class CoachingStateSnapshot:
     displayed_fingerprints: frozenset[SuggestionFingerprint]
     displayed_candidate_times: tuple[tuple[str, float], ...]
     processed_revisions: frozenset[int]
+    processed_external_revisions: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _SuggestionAdmission:
+    displayed: tuple[CoachingSuggestionEvent, ...]
+    suppressed: tuple[CoachingSuggestionEvent, ...]
+    suppression_reasons: tuple[str, ...]
+    replaced_suggestion_ids: tuple[str, ...]
+    decisions: tuple[SafeSuggestionDecision, ...]
 
 
 class CoachingCoordinator:
@@ -103,6 +113,7 @@ class CoachingCoordinator:
         self._displayed_fingerprints: set[SuggestionFingerprint] = set()
         self._displayed_candidate_times: dict[str, float] = {}
         self._processed_revisions: set[int] = set()
+        self._processed_external_revisions: set[int] = set()
         self._logger = logger or logging.getLogger(__name__)
 
     @property
@@ -131,6 +142,7 @@ class CoachingCoordinator:
                 sorted(self._displayed_candidate_times.items())
             ),
             processed_revisions=frozenset(self._processed_revisions),
+            processed_external_revisions=frozenset(self._processed_external_revisions),
         )
 
     def restore_coaching_state(self, snapshot: CoachingStateSnapshot) -> None:
@@ -156,6 +168,7 @@ class CoachingCoordinator:
         self._displayed_fingerprints = set(snapshot.displayed_fingerprints)
         self._displayed_candidate_times = dict(snapshot.displayed_candidate_times)
         self._processed_revisions = set(snapshot.processed_revisions)
+        self._processed_external_revisions = set(snapshot.processed_external_revisions)
 
     def process(
         self,
@@ -198,6 +211,115 @@ class CoachingCoordinator:
             labels = [label for label in labels if label != "no_action"]
         self._call_state.update_active_labels(labels)
 
+        admission = self._apply_suggestion_policy(
+            event,
+            _merge_current_candidates(evaluation.suggestion_events),
+            current_seconds,
+            model_id=(
+                classification_event.model_id
+                if classification_event is not None
+                else None
+            ),
+            threshold_profile_id=(
+                classification_event.threshold_profile_id
+                if classification_event is not None
+                else None
+            ),
+        )
+
+        return CoachingCoordinatorResult(
+            classification_event=classification,
+            displayed_suggestions=admission.displayed,
+            suppressed_suggestions=admission.suppressed,
+            matched_rule_ids=evaluation.matched_rule_ids,
+            suppression_reasons=admission.suppression_reasons,
+            transcript_revision=event.revision,
+            current_revision_labels=tuple(labels),
+            replaced_suggestion_ids=admission.replaced_suggestion_ids,
+            suggestion_decisions=admission.decisions,
+        )
+
+    def process_external_suggestion(
+        self,
+        event: TranscriptEvent,
+        suggestion: CoachingSuggestionEvent,
+        current_seconds: float,
+    ) -> CoachingCoordinatorResult:
+        if current_seconds < 0:
+            raise ValueError("current_seconds cannot be negative")
+        ensure_same_tenant(self._tenant_config.context, self._call_state, event)
+        ensure_same_call(self._call_state, event)
+        ensure_same_tenant(event, suggestion)
+        ensure_same_call(event, suggestion)
+        if event.kind is TranscriptKind.PARTIAL:
+            raise ValueError("external suggestion requires a stable transcript")
+        if event.revision != self._call_state.transcript_revision:
+            raise ValueError("external suggestion transcript revision does not match")
+        if suggestion.source_transcript_event_id != event.event_id:
+            raise ValueError("external suggestion source transcript does not match")
+        if suggestion.action.value not in self._tenant_config.coaching.allowed_actions:
+            return CoachingCoordinatorResult(
+                classification_event=None,
+                displayed_suggestions=(),
+                suppressed_suggestions=(suggestion,),
+                matched_rule_ids=(),
+                suppression_reasons=("action_not_allowed",),
+                transcript_revision=event.revision,
+                suggestion_decisions=(
+                    _decision(
+                        suggestion,
+                        event.revision,
+                        "action_not_allowed",
+                        False,
+                    ),
+                ),
+            )
+        if event.revision in self._processed_external_revisions:
+            return CoachingCoordinatorResult(
+                classification_event=None,
+                displayed_suggestions=(),
+                suppressed_suggestions=(suggestion,),
+                matched_rule_ids=(),
+                suppression_reasons=("duplicate_external_revision",),
+                transcript_revision=event.revision,
+                suggestion_decisions=(
+                    _decision(
+                        suggestion,
+                        event.revision,
+                        "duplicate_external_revision",
+                        False,
+                    ),
+                ),
+            )
+
+        self._processed_external_revisions.add(event.revision)
+        admission = self._apply_suggestion_policy(
+            event,
+            (suggestion,),
+            current_seconds,
+            model_id=None,
+            threshold_profile_id=None,
+        )
+        return CoachingCoordinatorResult(
+            classification_event=None,
+            displayed_suggestions=admission.displayed,
+            suppressed_suggestions=admission.suppressed,
+            matched_rule_ids=(),
+            suppression_reasons=admission.suppression_reasons,
+            transcript_revision=event.revision,
+            replaced_suggestion_ids=admission.replaced_suggestion_ids,
+            suggestion_decisions=admission.decisions,
+        )
+
+    def _apply_suggestion_policy(
+        self,
+        event: TranscriptEvent,
+        suggestions: tuple[CoachingSuggestionEvent, ...],
+        current_seconds: float,
+        *,
+        model_id: str | None,
+        threshold_profile_id: str | None,
+    ) -> _SuggestionAdmission:
         displayed: list[CoachingSuggestionEvent] = []
         suppressed: list[CoachingSuggestionEvent] = []
         reasons: list[str] = []
@@ -205,22 +327,14 @@ class CoachingCoordinator:
         decisions: list[SafeSuggestionDecision] = []
         maximum = self._tenant_config.coaching.max_active_suggestions
 
-        for suggestion in _merge_current_candidates(evaluation.suggestion_events):
+        for suggestion in suggestions:
             if suggestion.label_id is not None:
                 self._call_state.record_detected_labels(
                     [suggestion.label_id],
                     transcript_revision=event.revision,
                     source=suggestion.source,
-                    model_id=(
-                        classification_event.model_id
-                        if classification_event is not None
-                        else None
-                    ),
-                    threshold_profile_id=(
-                        classification_event.threshold_profile_id
-                        if classification_event is not None
-                        else None
-                    ),
+                    model_id=model_id,
+                    threshold_profile_id=threshold_profile_id,
                 )
             fingerprint = _suggestion_fingerprint(suggestion)
             candidate_key = _candidate_key(suggestion)
@@ -254,16 +368,8 @@ class CoachingCoordinator:
                 admitted, replaced = self._call_state.admit_coaching_suggestion(
                     suggestion,
                     transcript_revision=event.revision,
-                    model_id=(
-                        classification_event.model_id
-                        if classification_event is not None
-                        else None
-                    ),
-                    threshold_profile_id=(
-                        classification_event.threshold_profile_id
-                        if classification_event is not None
-                        else None
-                    ),
+                    model_id=model_id,
+                    threshold_profile_id=threshold_profile_id,
                     maximum_active_suggestions=maximum,
                 )
                 if not admitted:
@@ -300,16 +406,12 @@ class CoachingCoordinator:
         if displayed:
             self._call_state.mark_coaching_triggered(current_seconds)
 
-        return CoachingCoordinatorResult(
-            classification_event=classification,
-            displayed_suggestions=tuple(displayed),
-            suppressed_suggestions=tuple(suppressed),
-            matched_rule_ids=evaluation.matched_rule_ids,
+        return _SuggestionAdmission(
+            displayed=tuple(displayed),
+            suppressed=tuple(suppressed),
             suppression_reasons=tuple(reasons),
-            transcript_revision=event.revision,
-            current_revision_labels=tuple(labels),
             replaced_suggestion_ids=tuple(replaced_ids),
-            suggestion_decisions=tuple(decisions),
+            decisions=tuple(decisions),
         )
 
     def process_safely(
@@ -368,6 +470,7 @@ class CoachingCoordinator:
         self._displayed_fingerprints.clear()
         self._displayed_candidate_times.clear()
         self._processed_revisions.clear()
+        self._processed_external_revisions.clear()
 
 
 def _suggestion_fingerprint(
