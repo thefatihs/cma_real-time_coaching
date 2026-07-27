@@ -4,7 +4,11 @@ from itertools import count
 import pytest
 
 from app.calls.models import CallState
-from app.coaching.coordinator import CoachingCoordinator
+from app.coaching.coordinator import (
+    CoachingCoordinator,
+    ExternalSuggestionAdmissionReason,
+    ExternalSuggestionAdmissionStatus,
+)
 from app.coaching.rule_engine import CoachingRule, RuleBasedCoachingEngine
 from app.events.models import (
     ClassificationLabel,
@@ -121,6 +125,22 @@ def classification(*labels: str) -> ClassificationResultEvent:
         threshold_profile_id="common_turkish_setfit_v2:calibrated:v1",
         created_at_utc=NOW,
     )
+
+
+def external_candidate(**changes: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "tenant_id": "tenant_alpha",
+        "call_id": "call_001",
+        "transcript_revision": 1,
+        "label_id": "cancellation_request",
+        "action": CoachingAction.TEMPLATE_ACTION,
+        "title": "Synthetic retention guidance",
+        "suggestion": "Apply the approved synthetic retention steps.",
+        "priority": SuggestionPriority.HIGH,
+        "source": CoachingSuggestionSource.LLM,
+    }
+    values.update(changes)
+    return values
 
 
 def test_partial_is_ignored() -> None:
@@ -588,3 +608,209 @@ def test_capacity_rejection_does_not_start_candidate_cooldown() -> None:
     assert retried.suppression_reasons == ()
     assert state.active_coaching_suggestions[0].label_id == "renewal_interest"
     assert state.last_coaching_trigger_seconds == 2.0
+
+
+def test_valid_external_llm_candidate_uses_existing_admission_lifecycle() -> None:
+    subject, state = coordinator(tenant=config(cooldown=10, maximum=2))
+    state.transcript_revision = 1
+
+    result = subject.admit_external_suggestion(
+        external_candidate(),
+        current_seconds=1.0,
+    )
+
+    assert result.status is ExternalSuggestionAdmissionStatus.ADMITTED
+    assert result.reason is ExternalSuggestionAdmissionReason.ADMITTED
+    assert len(state.active_coaching_suggestions) == 1
+    stored = state.active_coaching_suggestions[0]
+    assert stored.label_id == "cancellation_request"
+    assert stored.source is CoachingSuggestionSource.LLM
+    assert state.shown_suggestion_ids == [stored.suggestion_id]
+    assert state.last_coaching_trigger_seconds == 1.0
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"tenant_id": "tenant_beta"}, ExternalSuggestionAdmissionReason.INVALID_SCOPE),
+        ({"call_id": "call_002"}, ExternalSuggestionAdmissionReason.INVALID_SCOPE),
+        (
+            {"transcript_revision": 0},
+            ExternalSuggestionAdmissionReason.INVALID_REVISION,
+        ),
+    ],
+)
+def test_external_candidate_wrong_scope_or_revision_is_rejected_without_mutation(
+    changes: dict[str, object],
+    reason: ExternalSuggestionAdmissionReason,
+) -> None:
+    subject, state = coordinator()
+    state.transcript_revision = 1
+    before = subject.snapshot_coaching_state()
+
+    result = subject.admit_external_suggestion(
+        external_candidate(**changes),
+        current_seconds=1.0,
+    )
+
+    assert result.status is ExternalSuggestionAdmissionStatus.REJECTED
+    assert result.reason is reason
+    assert subject.snapshot_coaching_state() == before
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"title": " "}, ExternalSuggestionAdmissionReason.INVALID_CANDIDATE),
+        ({"suggestion": ""}, ExternalSuggestionAdmissionReason.INVALID_CANDIDATE),
+        (
+            {"source": CoachingSuggestionSource.RULE},
+            ExternalSuggestionAdmissionReason.INVALID_CANDIDATE,
+        ),
+        ({"label_id": "not_a_label"}, ExternalSuggestionAdmissionReason.UNKNOWN_LABEL),
+        ({"label_id": "iptal_riski"}, ExternalSuggestionAdmissionReason.UNKNOWN_LABEL),
+        ({"label_id": "no_action"}, ExternalSuggestionAdmissionReason.UNKNOWN_LABEL),
+    ],
+)
+def test_malformed_or_noncanonical_external_candidate_is_rejected_without_mutation(
+    changes: dict[str, object],
+    reason: ExternalSuggestionAdmissionReason,
+) -> None:
+    subject, state = coordinator()
+    state.transcript_revision = 1
+    before = subject.snapshot_coaching_state()
+
+    result = subject.admit_external_suggestion(
+        external_candidate(**changes),
+        current_seconds=1.0,
+    )
+
+    assert result.status is ExternalSuggestionAdmissionStatus.REJECTED
+    assert result.reason is reason
+    assert subject.snapshot_coaching_state() == before
+
+
+def test_external_duplicate_and_cooldown_apply_only_to_displayed_candidates() -> None:
+    subject, state = coordinator(tenant=config(cooldown=10, maximum=3))
+    state.transcript_revision = 1
+    admitted = subject.admit_external_suggestion(
+        external_candidate(),
+        current_seconds=1.0,
+    )
+    duplicate = subject.admit_external_suggestion(
+        external_candidate(),
+        current_seconds=2.0,
+    )
+    cooldown = subject.admit_external_suggestion(
+        external_candidate(
+            title="Different synthetic guidance",
+            suggestion="Use different approved synthetic steps.",
+        ),
+        current_seconds=2.0,
+    )
+
+    assert admitted.status is ExternalSuggestionAdmissionStatus.ADMITTED
+    assert duplicate.reason is (
+        ExternalSuggestionAdmissionReason.DUPLICATE_PREVIOUSLY_DISPLAYED
+    )
+    assert cooldown.reason is (
+        ExternalSuggestionAdmissionReason.COOLDOWN_PREVIOUSLY_DISPLAYED
+    )
+    assert len(state.coaching_suggestions) == 1
+
+
+def test_capacity_rejected_external_candidate_does_not_start_cooldown() -> None:
+    subject, state = coordinator(tenant=config(cooldown=60, maximum=1))
+    state.transcript_revision = 1
+    subject.admit_external_suggestion(
+        external_candidate(
+            label_id="complaint",
+            title="Synthetic complaint guidance",
+            suggestion="Apply approved complaint steps.",
+            priority=SuggestionPriority.CRITICAL,
+        ),
+        current_seconds=1.0,
+    )
+    rejected = subject.admit_external_suggestion(
+        external_candidate(),
+        current_seconds=1.0,
+    )
+    state.transcript_revision = 2
+    retried = subject.admit_external_suggestion(
+        external_candidate(
+            transcript_revision=2,
+            priority=SuggestionPriority.CRITICAL,
+        ),
+        current_seconds=2.0,
+    )
+
+    assert rejected.reason is ExternalSuggestionAdmissionReason.REJECTED_BY_CAPACITY
+    assert retried.status is ExternalSuggestionAdmissionStatus.ADMITTED
+    assert state.active_coaching_suggestions[0].label_id == "cancellation_request"
+
+
+def test_newer_high_external_candidate_replaces_active_card_and_preserves_history() -> (
+    None
+):
+    subject, state = coordinator(tenant=config(cooldown=0, maximum=1))
+    state.transcript_revision = 1
+    subject.process(
+        event(text="Ürün bilgisi.", revision=1),
+        1.0,
+        classification_event=classification("product_information"),
+        active_labels=("product_information",),
+    )
+    state.transcript_revision = 2
+
+    result = subject.admit_external_suggestion(
+        external_candidate(transcript_revision=2),
+        current_seconds=2.0,
+    )
+
+    assert result.status is ExternalSuggestionAdmissionStatus.ADMITTED
+    assert [item.label_id for item in state.active_coaching_suggestions] == [
+        "cancellation_request"
+    ]
+    assert [item.label_id for item in state.coaching_suggestion_history] == [
+        "product_information"
+    ]
+    active_ids = {item.suggestion_id for item in state.active_coaching_suggestions}
+    history_ids = {item.suggestion_id for item in state.coaching_suggestion_history}
+    assert active_ids.isdisjoint(history_ids)
+
+
+def test_external_equal_rank_order_is_deterministic() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0, maximum=2))
+    state.transcript_revision = 1
+
+    subject.admit_external_suggestion(
+        external_candidate(
+            label_id="complaint",
+            title="Synthetic complaint guidance",
+            suggestion="Apply approved complaint steps.",
+        ),
+        current_seconds=1.0,
+    )
+    subject.admit_external_suggestion(
+        external_candidate(),
+        current_seconds=1.0,
+    )
+
+    assert [item.label_id for item in state.active_coaching_suggestions] == [
+        "cancellation_request",
+        "complaint",
+    ]
+
+
+def test_external_admission_diagnostics_contain_only_fixed_safe_values() -> None:
+    subject, state = coordinator()
+    state.transcript_revision = 1
+    sensitive_marker = "PRIVATE_SYNTHETIC_MARKER"
+
+    result = subject.admit_external_suggestion(
+        external_candidate(suggestion=sensitive_marker),
+        current_seconds=1.0,
+    )
+
+    assert set(result.__dataclass_fields__) == {"status", "reason"}
+    assert sensitive_marker not in repr(result)

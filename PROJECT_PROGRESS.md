@@ -783,3 +783,21 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors; `git diff --check` passed.
 - Sonraki planli adim: Trusted orchestration sonucunu ayri, onayli bir coaching
   adapter gorevinde kullanmak.
+
+## 59. Guvenli Harici Coaching Adayi Admission API
+
+- Onceden dogrulanmis tek bir LLM coaching adayini tenant, call, current
+  transcript revision, canonical label ve LLM source kontrollerinden sonra
+  mevcut coordinator lifecycle'ina alan immutable contract eklendi.
+- Kabul edilen adaylar mevcut deduplication, cooldown, priority/revision,
+  capacity replacement ve active/history akisini kullanir; reddedilen adaylar
+  coaching state'i degistirmez.
+- Sonuc yalnizca sabit admitted/suppressed/rejected status ve guvenli reason
+  code tasir; prompt, transcript, ham LLM ciktisi veya citation saklanmaz.
+- Degisen dosyalar: `app/coaching/coordinator.py`,
+  `tests/test_coaching_coordinator.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused coaching 89 passed; full 598 passed
+  (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: API'yi ayri ve onayli bir coaching adapter gorevinde
+  validated LLM sonucuna baglamak.
