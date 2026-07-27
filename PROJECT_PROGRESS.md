@@ -881,3 +881,24 @@ Tarih: 27 Temmuz 2026
 - Kalite: scoped Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Ingestion servisini provider-neutral composition
   seviyesinde sentetik hazir chunk'larla kullanmayi degerlendirmek.
+## 64. Opsiyonel In-Memory Pyannote Diarization Backend
+
+- Mevcut tenant/call kapsamli diarization request'ini yalnizca mono in-memory
+  float32 tensor olarak pyannote community-1 pipeline'ina aktaran senkron backend
+  eklendi.
+- Opsiyonel pyannote/Torch importlari ve model yukleme ilk istege ertelendi;
+  pipeline backend instance'i icinde tekrar kullanilir ve varsayilan CPU ile
+  sabit iki konusmaci ipucu desteklenir.
+- Exclusive diarization tercih edilir, regular cikti fallback olarak kullanilir;
+  turn zamanlari mutlak pencere zamanina deterministik cevrilir.
+- Scope, dependency, model, inference ve malformed output hatalari yalnizca sabit
+  guvenli kategorilerle fail-closed reddedilir; PCM veya provider hata ayrintisi
+  saklanmaz.
+- Degisen dosyalar: `app/diarization/pyannote_backend.py`,
+  `app/diarization/__init__.py`,
+  `tests/test_pyannote_diarization_backend.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 66 passed; full 812 passed
+  (1 dependency warning); gercek model indirilmedi.
+- Sonraki planli adim: Backend'i ayri bir gorevde window-to-diarization
+  orchestration sinirina baglamadan once overlap ve gercek ses
+  degerlendirmesini tasarlamak.
