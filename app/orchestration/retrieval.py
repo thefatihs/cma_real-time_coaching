@@ -19,7 +19,7 @@ class RetrievalOrchestrator:
         self._prompt_builder = prompt_builder
         self._llm_gateway = llm_gateway
 
-    def run(self, request: OrchestrationRequest) -> OrchestrationResult:
+    def run(self, request: OrchestrationRequest) -> OrchestrationResult | None:
         retrieval = self._retriever.retrieve(
             tenant_id=request.tenant_id,
             knowledge_base_id=request.knowledge_base_id,
@@ -27,6 +27,8 @@ class RetrievalOrchestrator:
             top_k=request.top_k,
             minimum_score=request.minimum_score,
         )
+        if not retrieval.documents:
+            return None
         prompt = self._prompt_builder.build(
             PromptBuildRequest(
                 tenant_id=request.tenant_id,
