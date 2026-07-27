@@ -9,6 +9,7 @@ from app.events.models import (
     ClassificationResultEvent,
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionSource,
     RetrievalRequestEvent,
     SuggestionPriority,
     TranscriptEvent,
@@ -163,3 +164,24 @@ def test_coaching_evidence_ids_are_normalized() -> None:
     )
 
     assert event.evidence_ids == ["doc_1", "doc_2"]
+
+
+def test_llm_coaching_source_validates_and_serializes() -> None:
+    event = CoachingSuggestionEvent.model_validate(
+        {
+            "tenant_id": "tenant_alpha",
+            "call_id": "call_001",
+            "suggestion_id": "suggestion_llm",
+            "source_transcript_event_id": "transcript_001",
+            "action": CoachingAction.RAG_ACTION,
+            "priority": SuggestionPriority.HIGH,
+            "source": "llm",
+            "title": "Synthetic guidance",
+            "suggestion": "Apply the synthetic guidance.",
+            "created_at_utc": NOW,
+        }
+    )
+
+    assert CoachingSuggestionSource.LLM.value == "llm"
+    assert event.source is CoachingSuggestionSource.LLM
+    assert event.model_dump(mode="json")["source"] == "llm"
