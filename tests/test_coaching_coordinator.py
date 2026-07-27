@@ -14,6 +14,7 @@ from app.events.models import (
     ClassificationLabel,
     ClassificationResultEvent,
     CoachingAction,
+    CoachingSuggestionEvent,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -33,7 +34,11 @@ NOW = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
 
 
 def config(
-    *, cooldown: float = 10.0, maximum: int = 2, tenant_id: str = "tenant_alpha"
+    *,
+    cooldown: float = 10.0,
+    maximum: int = 2,
+    tenant_id: str = "tenant_alpha",
+    allowed_actions: list[str] | None = None,
 ) -> TenantConfig:
     return TenantConfig(
         context=TenantContext(tenant_id=tenant_id, tenant_name="Synthetic"),
@@ -54,7 +59,8 @@ def config(
         coaching=TenantCoachingConfig(
             cooldown_seconds=cooldown,
             max_active_suggestions=maximum,
-            allowed_actions=[action.value for action in CoachingAction],
+            allowed_actions=allowed_actions
+            or [action.value for action in CoachingAction],
         ),
     )
 
@@ -141,6 +147,32 @@ def external_candidate(**changes: object) -> dict[str, object]:
     }
     values.update(changes)
     return values
+
+
+def external_suggestion(
+    transcript: TranscriptEvent,
+    **changes: object,
+) -> CoachingSuggestionEvent:
+    values: dict[str, object] = {
+        "tenant_id": transcript.tenant_id,
+        "call_id": transcript.call_id,
+        "suggestion_id": f"external_{transcript.revision}",
+        "source_transcript_event_id": transcript.event_id,
+        "action": CoachingAction.TEMPLATE_ACTION,
+        "priority": SuggestionPriority.HIGH,
+        "source": CoachingSuggestionSource.LLM,
+        "label_id": "complaint",
+        "title": "Synthetic external guidance",
+        "suggestion": "Use the synthetic external guidance.",
+        "evidence_ids": ["document_1:chunk_1"],
+        "created_at_utc": NOW,
+    }
+    values.update(changes)
+    return CoachingSuggestionEvent.model_validate(values)
+
+
+def apply_current_transcript(state: CallState, transcript: TranscriptEvent) -> None:
+    state.apply_transcript(transcript)
 
 
 def test_partial_is_ignored() -> None:
@@ -814,3 +846,283 @@ def test_external_admission_diagnostics_contain_only_fixed_safe_values() -> None
 
     assert set(result.__dataclass_fields__) == {"status", "reason"}
     assert sensitive_marker not in repr(result)
+
+
+def test_external_llm_suggestion_is_admitted_with_exact_scope_and_source() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0))
+    transcript = event()
+    apply_current_transcript(state, transcript)
+    suggestion = external_suggestion(transcript)
+
+    result = subject.process_external_suggestion(transcript, suggestion, 1.0)
+
+    assert result.displayed_suggestions == (suggestion,)
+    assert result.suppressed_suggestions == ()
+    assert result.transcript_revision == transcript.revision
+    admitted = result.displayed_suggestions[0]
+    assert admitted.tenant_id == transcript.tenant_id
+    assert admitted.call_id == transcript.call_id
+    assert admitted.source_transcript_event_id == transcript.event_id
+    assert admitted.source is CoachingSuggestionSource.LLM
+    assert state.active_coaching_suggestions[0].source is CoachingSuggestionSource.LLM
+
+
+@pytest.mark.parametrize(
+    ("suggestion_changes", "message"),
+    [
+        ({"tenant_id": "tenant_beta"}, "tenant_id"),
+        ({"call_id": "call_002"}, "call_id"),
+        ({"source_transcript_event_id": "transcript_other"}, "source transcript"),
+    ],
+)
+def test_invalid_external_scope_fails_without_state_mutation(
+    suggestion_changes: dict[str, object],
+    message: str,
+) -> None:
+    subject, state = coordinator()
+    transcript = event()
+    apply_current_transcript(state, transcript)
+    before = subject.snapshot_coaching_state()
+
+    with pytest.raises(ValueError, match=message):
+        subject.process_external_suggestion(
+            transcript,
+            external_suggestion(transcript, **suggestion_changes),
+            1.0,
+        )
+
+    assert subject.snapshot_coaching_state() == before
+
+
+def test_stale_external_revision_fails_without_state_mutation() -> None:
+    subject, state = coordinator()
+    current = event(event_id="transcript_2", revision=2)
+    apply_current_transcript(state, current)
+    stale = event()
+    before = subject.snapshot_coaching_state()
+
+    with pytest.raises(ValueError, match="revision"):
+        subject.process_external_suggestion(
+            stale,
+            external_suggestion(stale),
+            1.0,
+        )
+
+    assert subject.snapshot_coaching_state() == before
+
+
+def test_external_and_rule_revision_tracking_are_independent() -> None:
+    rule_first, rule_first_state = coordinator(rule(), tenant=config(cooldown=0))
+    transcript = event()
+    apply_current_transcript(rule_first_state, transcript)
+    rule_result = rule_first.process(transcript, 1.0)
+    external_result = rule_first.process_external_suggestion(
+        transcript,
+        external_suggestion(
+            transcript,
+            title="Different synthetic external guidance",
+        ),
+        2.0,
+    )
+
+    external_first, external_first_state = coordinator(
+        rule(),
+        tenant=config(cooldown=0),
+    )
+    apply_current_transcript(external_first_state, transcript)
+    first_external_result = external_first.process_external_suggestion(
+        transcript,
+        external_suggestion(
+            transcript,
+            title="Different synthetic external guidance",
+        ),
+        1.0,
+    )
+    later_rule_result = external_first.process(transcript, 2.0)
+
+    assert rule_result.displayed_suggestions
+    assert external_result.suppression_reasons != ("duplicate_external_revision",)
+    assert first_external_result.displayed_suggestions
+    assert later_rule_result.suppression_reasons != ("duplicate_revision",)
+
+
+def test_repeated_external_revision_is_suppressed_deterministically() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0))
+    transcript = event()
+    apply_current_transcript(state, transcript)
+    suggestion = external_suggestion(transcript)
+    subject.process_external_suggestion(transcript, suggestion, 1.0)
+
+    first_repeat = subject.process_external_suggestion(transcript, suggestion, 2.0)
+    second_repeat = subject.process_external_suggestion(transcript, suggestion, 3.0)
+
+    assert first_repeat == second_repeat
+    assert first_repeat.displayed_suggestions == ()
+    assert first_repeat.suppressed_suggestions == (suggestion,)
+    assert first_repeat.suppression_reasons == ("duplicate_external_revision",)
+
+
+def test_external_disallowed_action_uses_normal_suppression_result() -> None:
+    subject, state = coordinator(
+        tenant=config(
+            allowed_actions=[CoachingAction.TEMPLATE_ACTION.value],
+        )
+    )
+    transcript = event()
+    apply_current_transcript(state, transcript)
+    suggestion = external_suggestion(
+        transcript,
+        action=CoachingAction.ESCALATE,
+    )
+    coordinator_before = subject.snapshot_coaching_state()
+    state_before = state.model_copy(deep=True)
+
+    first = subject.process_external_suggestion(transcript, suggestion, 1.0)
+    second = subject.process_external_suggestion(transcript, suggestion, 2.0)
+
+    assert first == second
+    assert first.displayed_suggestions == ()
+    assert first.suppressed_suggestions == (suggestion,)
+    assert first.suppression_reasons == ("action_not_allowed",)
+    assert first.suggestion_decisions[0].reason == "action_not_allowed"
+    assert not first.suggestion_decisions[0].moved_to_history
+    assert subject.snapshot_coaching_state() == coordinator_before
+    assert subject.snapshot_coaching_state().processed_external_revisions == frozenset()
+    assert state == state_before
+
+
+def test_classification_template_preserves_head_allowed_action_behavior() -> None:
+    tenant = config(allowed_actions=[CoachingAction.NO_ACTION.value])
+    subject, state = coordinator(tenant=tenant)
+    transcript = event(text="Synthetic unmatched text.")
+
+    result = subject.process(
+        transcript,
+        1.0,
+        classification_event=classification("cancellation_request"),
+        active_labels=("cancellation_request",),
+    )
+
+    assert result.displayed_suggestions
+    assert result.displayed_suggestions[0].action.value not in (
+        tenant.coaching.allowed_actions
+    )
+    assert result.suppression_reasons == ()
+    assert state.active_coaching_suggestions
+
+
+def test_configured_rule_with_disallowed_action_keeps_constructor_validation() -> None:
+    tenant = config(allowed_actions=[CoachingAction.NO_ACTION.value])
+
+    with pytest.raises(ValueError, match="Rule action is not allowed"):
+        coordinator(rule(), tenant=tenant)
+
+
+def test_external_duplicate_fingerprint_uses_shared_policy() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0))
+    first = event()
+    apply_current_transcript(state, first)
+    subject.process_external_suggestion(first, external_suggestion(first), 1.0)
+    second = event(event_id="transcript_2", revision=2)
+    apply_current_transcript(state, second)
+
+    result = subject.process_external_suggestion(
+        second,
+        external_suggestion(second),
+        2.0,
+    )
+
+    assert result.displayed_suggestions == ()
+    assert result.suppression_reasons == ("duplicate_same_revision",)
+
+
+def test_external_cooldown_uses_shared_policy() -> None:
+    subject, state = coordinator(tenant=config(cooldown=10))
+    first = event()
+    apply_current_transcript(state, first)
+    subject.process_external_suggestion(first, external_suggestion(first), 1.0)
+    second = event(event_id="transcript_2", revision=2)
+    apply_current_transcript(state, second)
+
+    result = subject.process_external_suggestion(
+        second,
+        external_suggestion(
+            second,
+            title="Updated synthetic external guidance",
+        ),
+        5.0,
+    )
+
+    assert result.displayed_suggestions == ()
+    assert result.suppression_reasons == ("cooldown_previously_displayed",)
+
+
+def test_external_capacity_rejection_and_replacement_use_call_state_policy() -> None:
+    rejected_subject, rejected_state = coordinator(tenant=config(cooldown=0, maximum=1))
+    first = event()
+    apply_current_transcript(rejected_state, first)
+    rejected_subject.process_external_suggestion(
+        first,
+        external_suggestion(first, priority=SuggestionPriority.CRITICAL),
+        1.0,
+    )
+    second = event(event_id="transcript_2", revision=2)
+    apply_current_transcript(rejected_state, second)
+    rejected = rejected_subject.process_external_suggestion(
+        second,
+        external_suggestion(
+            second,
+            priority=SuggestionPriority.LOW,
+            title="Lower priority synthetic guidance",
+        ),
+        2.0,
+    )
+
+    replacing_subject, replacing_state = coordinator(
+        tenant=config(cooldown=0, maximum=1)
+    )
+    apply_current_transcript(replacing_state, first)
+    replacing_subject.process_external_suggestion(
+        first,
+        external_suggestion(first, priority=SuggestionPriority.LOW),
+        1.0,
+    )
+    apply_current_transcript(replacing_state, second)
+    replacement = external_suggestion(
+        second,
+        priority=SuggestionPriority.CRITICAL,
+        title="Critical synthetic guidance",
+    )
+    replaced = replacing_subject.process_external_suggestion(
+        second,
+        replacement,
+        2.0,
+    )
+
+    assert rejected.suppression_reasons == ("rejected_by_capacity",)
+    assert rejected_state.active_coaching_suggestions[0].priority is (
+        SuggestionPriority.CRITICAL
+    )
+    assert replaced.displayed_suggestions == (replacement,)
+    assert replaced.replaced_suggestion_ids == ("external_1",)
+    assert replacing_state.active_coaching_suggestions[0].suggestion_id == "external_2"
+    assert replacing_state.coaching_suggestion_history[0].suggestion_id == "external_1"
+    assert [decision.reason for decision in replaced.suggestion_decisions] == [
+        "admitted",
+        "replaced_by_newer_priority",
+    ]
+
+
+def test_snapshot_restore_includes_external_revision_state() -> None:
+    subject, state = coordinator(tenant=config(cooldown=0))
+    transcript = event()
+    apply_current_transcript(state, transcript)
+    before = subject.snapshot_coaching_state()
+    suggestion = external_suggestion(transcript)
+    subject.process_external_suggestion(transcript, suggestion, 1.0)
+
+    subject.restore_coaching_state(before)
+    restored = subject.process_external_suggestion(transcript, suggestion, 1.0)
+
+    assert restored.displayed_suggestions == (suggestion,)
+    assert restored.suppression_reasons == ()
