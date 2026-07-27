@@ -801,3 +801,20 @@ Tarih: 22 Temmuz 2026
 - Kalite: Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: API'yi ayri ve onayli bir coaching adapter gorevinde
   validated LLM sonucuna baglamak.
+
+## 60. Iki Konusmacili Diarization Model ve Protocol Temeli
+
+- Tenant/call scope, absolute zaman, local/global speaker kimligi,
+  AGENT/CUSTOMER/UNKNOWN/OVERLAP rol ve bounded confidence alanlarini tasiyan
+  immutable turn, word ve companion transcript event modelleri eklendi.
+- Mono in-memory audio request'i, immutable result ve senkron diarizer protocol'u
+  eklendi; timestamp, revision, scope, child range, ordering ve overlap
+  cardinality kontrolleri fail-closed uygulanir.
+- Model, network veya dosya erisimi yapmayan ve request audio tutmayan
+  deterministic fake backend yalnizca sentetik testlerle dogrulandi.
+- Eklenen dosyalar: `app/diarization/`, `tests/test_diarization_models.py`,
+  `tests/test_diarization_protocols.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused 47 passed; full 748 passed (1 dependency warning).
+- Kalite: Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Ayrica onaylanan bir gorevde offline diarization backend
+  tasarimini bu protocol uzerinde uygulamak.
