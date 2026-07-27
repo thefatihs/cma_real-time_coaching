@@ -3,6 +3,7 @@
 from app.integration.llm_suggestion_factory import (
     DeterministicLLMCoachingSuggestionFactory,
 )
+from app.integration.policy import RAGCoachingIntegrationPolicy
 from app.integration.rag_coaching import (
     CoachingSuggestionFactory,
     OrchestrationRunner,
@@ -13,5 +14,6 @@ __all__ = [
     "CoachingSuggestionFactory",
     "DeterministicLLMCoachingSuggestionFactory",
     "OrchestrationRunner",
+    "RAGCoachingIntegrationPolicy",
     "RAGCoachingProcessorDecorator",
 ]
