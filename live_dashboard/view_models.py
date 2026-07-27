@@ -19,6 +19,7 @@ from app.coaching.coordinator import (
     CoachingCoordinator,
     CoachingCoordinatorResult,
     CoachingProcessingStatus,
+    SafeSuggestionDecision,
     StableCoachingOutcome,
 )
 from app.coaching.rule_engine import RuleBasedCoachingEngine
@@ -47,9 +48,9 @@ PRIORITY_RANK = {
 }
 CRITICAL_LABEL_MARKERS = ("kritik", "risk", "eskalasyon", "aktarim", "aktarımı")
 SUPPRESSION_LABELS = {
-    "duplicate": "yinelenen öneri",
-    "cooldown": "bekleme süresi",
-    "max_active_suggestions": "aktif öneri sınırı",
+    "duplicate_same_revision": "yinelenen öneri",
+    "cooldown_previously_displayed": "bekleme süresi",
+    "rejected_by_capacity": "aktif öneri sınırı",
 }
 ACTION_LABELS = {
     CoachingAction.NO_ACTION: "Aksiyon yok",
@@ -179,12 +180,18 @@ class RepresentativeTabViewModel:
     status: tuple[StatusCardViewModel, ...]
     progress: ProgressViewModel
     transcript: TranscriptViewModel
-    suggestions: tuple[SuggestionCardViewModel, ...]
     intent_chips: tuple[IntentChipViewModel, ...]
     detected_intent_chips: tuple[IntentChipViewModel, ...]
     suppressed_count: int
     empty_suggestion_message: str
     safe_messages: tuple[str, ...]
+    active_suggestions: tuple[SuggestionCardViewModel, ...] = ()
+    suggestion_history: tuple[SuggestionCardViewModel, ...] = ()
+
+    @property
+    def suggestions(self) -> tuple[SuggestionCardViewModel, ...]:
+        """Compatibility alias for callers that still read active cards."""
+        return self.active_suggestions
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +212,7 @@ class TechnicalTabViewModel:
     current_labels: tuple[str, ...] = ()
     detected_labels: tuple[str, ...] = ()
     revision_label_timeline: tuple[CallRevisionLabelDiagnostic, ...] = ()
+    suggestion_decisions: tuple[SafeSuggestionDecision, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +248,7 @@ class DashboardRuntime:
     latest_action: CoachingAction = CoachingAction.NO_ACTION
     latest_labels: tuple[LabelViewModel, ...] = ()
     suggestions: list[SuggestionCardViewModel] = field(default_factory=list)
+    suggestion_history: list[SuggestionCardViewModel] = field(default_factory=list)
     timeline: list[TimelineItem] = field(default_factory=list)
     suppression_reasons: list[str] = field(default_factory=list)
     latency: LatencyViewModel | None = None
@@ -254,6 +263,7 @@ class DashboardRuntime:
     consumed_suggestion_ids: set[str] = field(default_factory=set)
     consumed_classification_event_ids: set[str] = field(default_factory=set)
     consumed_coaching_revisions: set[int] = field(default_factory=set)
+    suggestion_decisions: list[SafeSuggestionDecision] = field(default_factory=list)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -587,7 +597,14 @@ def suggestion_card(
 def ordered_suggestions(
     cards: list[SuggestionCardViewModel],
 ) -> list[SuggestionCardViewModel]:
-    return sorted(cards, key=lambda card: PRIORITY_RANK[card.priority], reverse=True)
+    return sorted(
+        cards,
+        key=lambda card: (
+            PRIORITY_RANK[card.priority],
+            card.transcript_revision if card.transcript_revision is not None else -1,
+        ),
+        reverse=True,
+    )
 
 
 def suppression_reason_display(reason: str) -> str:
@@ -835,12 +852,13 @@ def dashboard_tabs(
             status=status,
             progress=progress,
             transcript=transcript_view(runtime),
-            suggestions=representative_suggestions,
             intent_chips=chips,
             detected_intent_chips=result_chips,
             suppressed_count=len(runtime.suppression_reasons),
             empty_suggestion_message="Şu anda gösterilecek yeni bir koçluk önerisi yok.",
             safe_messages=safe_messages,
+            active_suggestions=representative_suggestions,
+            suggestion_history=tuple(ordered_suggestions(runtime.suggestion_history)),
         ),
         technical=TechnicalTabViewModel(
             progress=progress,
@@ -1006,6 +1024,7 @@ def dashboard_tabs(
             current_labels=current_names,
             detected_labels=tuple(detected_names),
             revision_label_timeline=classification_metadata.revision_label_timeline,
+            suggestion_decisions=tuple(runtime.suggestion_decisions),
         ),
         result=CallResultTabViewModel(
             completed=complete,
@@ -1221,6 +1240,18 @@ def _apply_coaching_result(
     apply_state_metadata: bool = False,
 ) -> None:
     classification = result.classification_event
+    replaced_ids = set(result.replaced_suggestion_ids)
+    if replaced_ids:
+        replaced_cards = [
+            card for card in runtime.suggestions if card.suggestion_id in replaced_ids
+        ]
+        runtime.suggestion_history.extend(replaced_cards)
+        runtime.suggestions = [
+            card
+            for card in runtime.suggestions
+            if card.suggestion_id not in replaced_ids
+        ]
+    runtime.suggestion_decisions.extend(result.suggestion_decisions)
     if apply_state_metadata:
         runtime.call_state.update_active_labels(list(result.current_revision_labels))
     if classification is not None and not apply_state_metadata:

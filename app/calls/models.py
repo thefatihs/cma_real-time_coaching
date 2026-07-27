@@ -119,6 +119,12 @@ class CallState(BaseModel):
     classification_delta_labels: list[str] = Field(default_factory=list)
     classification_context_labels: list[str] = Field(default_factory=list)
     coaching_suggestions: list["CallCoachingMetadata"] = Field(default_factory=list)
+    active_coaching_suggestions: list["CallCoachingMetadata"] = Field(
+        default_factory=list
+    )
+    coaching_suggestion_history: list["CallCoachingMetadata"] = Field(
+        default_factory=list
+    )
     coaching_transcript_revision: int | None = None
 
     @field_validator("tenant_id", "call_id")
@@ -458,7 +464,9 @@ class CallState(BaseModel):
             action=event.action,
             priority=event.priority,
             source=event.source,
+            label_id=event.label_id,
             transcript_revision=transcript_revision,
+            display_order=len(self.coaching_suggestions),
             created_at_utc=event.created_at_utc,
             model_id=model_id if event.source.value != "rule" else None,
             threshold_profile_id=(
@@ -478,6 +486,71 @@ class CallState(BaseModel):
                 threshold_profile_id=threshold_profile_id,
             )
         self.coaching_transcript_revision = transcript_revision
+
+    def admit_coaching_suggestion(
+        self,
+        event: CoachingSuggestionEvent,
+        *,
+        transcript_revision: int,
+        model_id: str | None,
+        threshold_profile_id: str | None,
+        maximum_active_suggestions: int,
+    ) -> tuple[bool, "CallCoachingMetadata | None"]:
+        if maximum_active_suggestions <= 0:
+            raise ValueError("maximum_active_suggestions must be positive")
+        self._ensure_same_scope(event)
+        candidate = CallCoachingMetadata(
+            suggestion_id=event.suggestion_id,
+            action=event.action,
+            priority=event.priority,
+            source=event.source,
+            label_id=event.label_id,
+            transcript_revision=transcript_revision,
+            display_order=len(self.coaching_suggestions),
+            created_at_utc=event.created_at_utc,
+            model_id=model_id if event.source.value != "rule" else None,
+            threshold_profile_id=(
+                threshold_profile_id if event.source.value != "rule" else None
+            ),
+        )
+        replaced: CallCoachingMetadata | None = None
+        if len(self.active_coaching_suggestions) >= maximum_active_suggestions:
+            weakest = min(
+                self.active_coaching_suggestions,
+                key=_coaching_rank,
+            )
+            if _coaching_rank(candidate) <= _coaching_rank(weakest):
+                return False, None
+            replaced = weakest
+            self.active_coaching_suggestions = [
+                item
+                for item in self.active_coaching_suggestions
+                if item.suggestion_id != weakest.suggestion_id
+            ]
+            self.coaching_suggestion_history = [
+                *self.coaching_suggestion_history,
+                weakest,
+            ]
+
+        self.coaching_suggestions = [*self.coaching_suggestions, candidate]
+        self.active_coaching_suggestions = [
+            *self.active_coaching_suggestions,
+            candidate,
+        ]
+        self.active_coaching_suggestions.sort(
+            key=_coaching_rank,
+            reverse=True,
+        )
+        if event.label_id is not None:
+            self.record_detected_labels(
+                [event.label_id],
+                transcript_revision=transcript_revision,
+                source=event.source,
+                model_id=model_id,
+                threshold_profile_id=threshold_profile_id,
+            )
+        self.coaching_transcript_revision = transcript_revision
+        return True, replaced
 
     def mark_suggestion_shown(self, suggestion_id: str) -> None:
         cleaned = suggestion_id.strip()
@@ -537,6 +610,26 @@ def _combined_source(
     return CoachingSuggestionSource.BOTH
 
 
+_COACHING_PRIORITY_RANK = {
+    SuggestionPriority.LOW: 0,
+    SuggestionPriority.MEDIUM: 1,
+    SuggestionPriority.HIGH: 2,
+    SuggestionPriority.CRITICAL: 3,
+}
+
+
+def _coaching_rank(metadata: "CallCoachingMetadata") -> tuple[int, int, str]:
+    return (
+        _COACHING_PRIORITY_RANK[metadata.priority],
+        metadata.transcript_revision,
+        _reverse_lexical_key(metadata.label_id or metadata.suggestion_id),
+    )
+
+
+def _reverse_lexical_key(value: str) -> str:
+    return "".join(chr(0x10FFFF - ord(character)) for character in value.casefold())
+
+
 class CallClassificationMetadata(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -579,7 +672,9 @@ class CallCoachingMetadata(BaseModel):
     action: CoachingAction
     priority: SuggestionPriority
     source: CoachingSuggestionSource
+    label_id: str | None = None
     transcript_revision: int
+    display_order: int = 0
     created_at_utc: datetime
     model_id: str | None = None
     threshold_profile_id: str | None = None

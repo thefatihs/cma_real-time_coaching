@@ -11,6 +11,7 @@ from app.classification.streaming import (
 from app.coaching.coordinator import (
     CoachingCoordinatorResult,
     CoachingProcessingStatus,
+    SafeSuggestionDecision,
     StableCoachingOutcome,
 )
 from app.events.models import (
@@ -46,11 +47,13 @@ from live_dashboard.view_models import (
     LabelViewModel,
     ordered_suggestions,
     progress_view,
+    RepresentativeTabViewModel,
     reset_runtime,
     reset_local_execution,
     responsive_rows,
     status_cards,
     suggestion_card,
+    SuggestionCardViewModel,
     suppression_reason_display,
     transcript_view,
     UploadedAudioSession,
@@ -116,7 +119,9 @@ def test_duplicate_suppression_reason_is_displayed() -> None:
     while advance_runtime(subject) is not None:
         pass
     assert subject.suppression_reasons == ["yinelenen öneri"]
-    assert suppression_reason_display("cooldown") == "bekleme süresi"
+    assert (
+        suppression_reason_display("cooldown_previously_displayed") == "bekleme süresi"
+    )
 
 
 def test_tenant_labels_rules_and_state_are_isolated() -> None:
@@ -796,6 +801,86 @@ def test_simultaneous_suggestions_keep_their_own_label_metadata() -> None:
         ("Fiyat itirazını karşılayın", "Fiyat İtirazı", SuggestionPriority.HIGH),
         ("Ürün bilgisini açıklayın", "Ürün Bilgisi", SuggestionPriority.MEDIUM),
     ]
+
+
+def test_representative_shows_current_critical_cards_before_compact_history() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    outcome = fake_pipeline_result().coaching_outcomes[0].result
+    assert outcome is not None
+    base = outcome.displayed_suggestions[0]
+
+    def card(label: str, revision: int) -> SuggestionCardViewModel:
+        return suggestion_card(
+            base.model_copy(
+                update={
+                    "suggestion_id": f"{label}-{revision}",
+                    "label_id": label,
+                    "title": f"{label} guidance",
+                    "suggestion": "Safe synthetic guidance.",
+                    "priority": SuggestionPriority.HIGH,
+                    "evidence_ids": ["synthetic-internal-rule"],
+                }
+            ),
+            transcript_revision=revision,
+        )
+
+    state.runtime.suggestions = [
+        card("churn_risk", 15),
+        card("cancellation_request", 15),
+    ]
+    state.runtime.suggestion_history = [
+        card("price_objection", 7),
+        card("complaint", 13),
+    ]
+    state.runtime.call_state.update_active_labels(
+        ["churn_risk", "cancellation_request"]
+    )
+    state.runtime.suggestion_decisions.append(
+        SafeSuggestionDecision(
+            transcript_revision=7,
+            label_id="price_objection",
+            priority=SuggestionPriority.HIGH,
+            reason="replaced_by_newer_priority",
+            moved_to_history=True,
+        )
+    )
+
+    tabs = dashboard_tabs(state.runtime, state)
+    assert {card.related_label for card in tabs.representative.suggestions} == {
+        "Müşteri Kaybı Riski",
+        "İptal Talebi",
+    }
+    assert {card.related_label for card in tabs.representative.suggestion_history} == {
+        "Fiyat İtirazı",
+        "Şikâyet",
+    }
+    assert {
+        card.suggestion_id for card in tabs.representative.active_suggestions
+    }.isdisjoint(card.suggestion_id for card in tabs.representative.suggestion_history)
+    assert "synthetic-internal-rule" not in repr(tabs.representative)
+    technical = repr(tabs.technical.suggestion_decisions)
+    assert "PRIVATE_TRANSCRIPT" not in technical
+    assert "C:/CallMetricPrivate" not in technical
+
+
+def test_representative_view_model_defaults_to_empty_active_and_history() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    built = dashboard_tabs(state.runtime, state).representative
+
+    representative = RepresentativeTabViewModel(
+        status=built.status,
+        progress=built.progress,
+        transcript=built.transcript,
+        intent_chips=built.intent_chips,
+        detected_intent_chips=built.detected_intent_chips,
+        suppressed_count=built.suppressed_count,
+        empty_suggestion_message=built.empty_suggestion_message,
+        safe_messages=built.safe_messages,
+    )
+
+    assert representative.active_suggestions == ()
+    assert representative.suggestion_history == ()
+    assert representative.suggestions == ()
 
 
 def test_live_outcomes_are_deduplicated_and_technical_metadata_is_separated() -> None:
