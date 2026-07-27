@@ -1,6 +1,6 @@
 """Provider-neutral embedding boundaries."""
 
-from app.embeddings.protocols import QueryEmbedder
+from app.embeddings.protocols import DocumentEmbedder, QueryEmbedder
 from app.embeddings.sentence_transformers import (
     SentenceTransformerBackend,
     SentenceTransformerQueryEmbedder,
@@ -8,6 +8,7 @@ from app.embeddings.sentence_transformers import (
 )
 
 __all__ = [
+    "DocumentEmbedder",
     "QueryEmbedder",
     "SentenceTransformerBackend",
     "SentenceTransformerQueryEmbedder",

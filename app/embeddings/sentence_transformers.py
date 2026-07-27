@@ -73,6 +73,7 @@ class SentenceTransformerQueryEmbedder:
             _default_backend_factory if backend_factory is None else backend_factory
         )
         self._backend: SentenceTransformerBackend | None = None
+        self._embedding_dimension: int | None = None
         self._lock = Lock()
 
     def embed_query(
@@ -82,22 +83,55 @@ class SentenceTransformerQueryEmbedder:
         knowledge_base_id: str,
         text: str,
     ) -> tuple[float, ...]:
+        self._validate_scope(tenant_id, knowledge_base_id)
+        normalized_text = _required_text(text, "text")
+        return self._embed_texts((normalized_text,))[0]
+
+    def embed_documents(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        texts: tuple[str, ...],
+    ) -> tuple[tuple[float, ...], ...]:
+        self._validate_scope(tenant_id, knowledge_base_id)
+        if not texts:
+            raise ValueError("texts cannot be empty")
+        normalized_texts = tuple(
+            _required_text(text, f"texts[{index}]") for index, text in enumerate(texts)
+        )
+        return self._embed_texts(normalized_texts)
+
+    def _validate_scope(self, tenant_id: str, knowledge_base_id: str) -> None:
         tenant = _required_text(tenant_id, "tenant_id")
         knowledge_base = _required_text(knowledge_base_id, "knowledge_base_id")
-        normalized_text = _required_text(text, "text")
         if tenant != self._config.expected_tenant_id:
             raise ValueError("tenant_id does not match query embedder scope")
         if knowledge_base != self._config.expected_knowledge_base_id:
             raise ValueError("knowledge_base_id does not match query embedder scope")
 
+    def _embed_texts(
+        self,
+        texts: tuple[str, ...],
+    ) -> tuple[tuple[float, ...], ...]:
         with self._lock:
             if self._backend is None:
                 self._backend = self._backend_factory(self._config)
             output = self._backend.encode(
-                [normalized_text],
+                list(texts),
                 normalize_embeddings=self._config.normalize_embeddings,
             )
-        return _single_vector(output)
+            vectors = _vectors(output, expected_rows=len(texts))
+            dimension = len(vectors[0])
+            if (
+                self._embedding_dimension is not None
+                and dimension != self._embedding_dimension
+            ):
+                raise ValueError(
+                    "embedding dimension does not match provider dimension"
+                )
+            self._embedding_dimension = dimension
+            return vectors
 
 
 class _SentenceTransformerBackendAdapter:
@@ -136,34 +170,46 @@ def _default_backend_factory(
     return _SentenceTransformerBackendAdapter(model)
 
 
-def _single_vector(output: object) -> tuple[float, ...]:
+def _vectors(
+    output: object,
+    *,
+    expected_rows: int,
+) -> tuple[tuple[float, ...], ...]:
     to_list = getattr(output, "tolist", None)
     if callable(to_list):
         output = to_list()
     if (
         isinstance(output, (str, bytes))
         or not isinstance(output, Sequence)
-        or len(output) != 1
+        or len(output) != expected_rows
     ):
-        raise ValueError("embedding backend must return exactly one row")
-    row = output[0]
-    row_to_list = getattr(row, "tolist", None)
-    if callable(row_to_list):
-        row = row_to_list()
-    if isinstance(row, (str, bytes)) or not isinstance(row, Sequence):
-        raise ValueError("embedding backend row must be a vector")
-    if not row:
-        raise ValueError("embedding backend vector cannot be empty")
+        raise ValueError("embedding backend row count does not match input count")
 
-    values: list[float] = []
-    for item in row:
-        if isinstance(item, bool) or not isinstance(item, Real):
-            raise ValueError("embedding backend vector must contain real numbers")
-        value = float(item)
-        if not isfinite(value):
-            raise ValueError("embedding backend vector must contain finite values")
-        values.append(value)
-    return tuple(values)
+    vectors: list[tuple[float, ...]] = []
+    dimension: int | None = None
+    for row in output:
+        row_to_list = getattr(row, "tolist", None)
+        if callable(row_to_list):
+            row = row_to_list()
+        if isinstance(row, (str, bytes)) or not isinstance(row, Sequence):
+            raise ValueError("embedding backend row must be a vector")
+        if not row:
+            raise ValueError("embedding backend vector cannot be empty")
+
+        values: list[float] = []
+        for item in row:
+            if isinstance(item, bool) or not isinstance(item, Real):
+                raise ValueError("embedding backend vector must contain real numbers")
+            value = float(item)
+            if not isfinite(value):
+                raise ValueError("embedding backend vector must contain finite values")
+            values.append(value)
+        vector = tuple(values)
+        if dimension is not None and len(vector) != dimension:
+            raise ValueError("embedding backend vectors must have equal dimensions")
+        dimension = len(vector)
+        vectors.append(vector)
+    return tuple(vectors)
 
 
 def _required_text(value: str, field_name: str) -> str:
