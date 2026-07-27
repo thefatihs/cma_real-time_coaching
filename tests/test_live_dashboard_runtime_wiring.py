@@ -3,6 +3,7 @@ from typing import cast
 
 from app.calls.models import CallState
 from app.classification.runtime import RuntimeSetFitClassifier
+from app.coaching.coordinator import CoachingCoordinator
 from app.events.models import TranscriptEvent, TranscriptKind
 from app.streaming.pipeline import WindowTranscriberProtocol
 from live_dashboard.demo_data import tenant_demos
@@ -73,6 +74,7 @@ def test_missing_artifacts_are_safe_and_keep_rule_coaching() -> None:
     coordinator = pipeline._coaching_coordinator_factory(  # noqa: SLF001
         CallState(tenant_id="tenant_alpha", call_id="synthetic-call")
     )
+    assert isinstance(coordinator, CoachingCoordinator)
     rule_only = coordinator.process(
         TranscriptEvent(
             tenant_id="tenant_alpha",

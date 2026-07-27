@@ -13,7 +13,9 @@ from app.classification.streaming import (
 from app.calls.models import CallState
 from app.coaching.coordinator import (
     CoachingCoordinator,
+    CoachingCoordinatorResult,
     CoachingProcessingStatus,
+    StableCoachingOutcome,
 )
 from app.coaching.rule_engine import CoachingRule, RuleBasedCoachingEngine
 from app.events.models import (
@@ -30,6 +32,7 @@ from app.events.labels import ClassificationViewSource
 from app.streaming.audio_window import ASRAudioWindow
 from app.streaming.pipeline import (
     CoachingCoordinatorFactory,
+    CoachingProcessorProtocol,
     StreamingASRPipeline,
     StreamingASRPlan,
 )
@@ -187,6 +190,44 @@ def coaching_factory(
         )
 
     return create
+
+
+class FakeCoachingProcessor:
+    def __init__(self) -> None:
+        self.calls: list[
+            tuple[
+                TranscriptEvent,
+                float,
+                ClassificationResultEvent | None,
+                tuple[str, ...] | None,
+            ]
+        ] = []
+        self.outcomes: list[StableCoachingOutcome] = []
+
+    def process_safely(
+        self,
+        event: TranscriptEvent,
+        current_seconds: float,
+        *,
+        classification_event: ClassificationResultEvent | None = None,
+        active_labels: tuple[str, ...] | None = None,
+    ) -> StableCoachingOutcome:
+        self.calls.append((event, current_seconds, classification_event, active_labels))
+        outcome = StableCoachingOutcome(
+            status=CoachingProcessingStatus.PROCESSED,
+            transcript_revision=event.revision,
+            result=CoachingCoordinatorResult(
+                classification_event=classification_event,
+                displayed_suggestions=(),
+                suppressed_suggestions=(),
+                matched_rule_ids=(),
+                suppression_reasons=(),
+                transcript_revision=event.revision,
+                current_revision_labels=active_labels or (),
+            ),
+        )
+        self.outcomes.append(outcome)
+        return outcome
 
 
 class FakeRuntimeClassifier:
@@ -637,6 +678,82 @@ def test_stable_pipeline_combines_rule_and_classification_coaching() -> None:
         "call_001",
     )
     assert outcome.transcript_revision == result.final_event.revision  # type: ignore[union-attr]
+
+
+def test_structural_coaching_processor_is_injected_with_exact_arguments() -> None:
+    processor: CoachingProcessorProtocol = FakeCoachingProcessor()
+    factory_states: list[CallState] = []
+
+    def factory(state: CallState) -> CoachingProcessorProtocol:
+        factory_states.append(state)
+        return processor
+
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("synthetic stable text", 0.0, 1.0)]]),
+        coaching_factory=factory,
+    ).run(Path("synthetic.wav"), "call_001")
+
+    assert len(factory_states) == 1
+    assert (factory_states[0].tenant_id, factory_states[0].call_id) == (
+        "tenant_alpha",
+        "call_001",
+    )
+    assert isinstance(processor, FakeCoachingProcessor)
+    assert len(processor.calls) == 1
+    event, current_seconds, classification_event, active_labels = processor.calls[0]
+    assert event is result.final_event
+    assert current_seconds == event.end_seconds
+    assert classification_event is None
+    assert active_labels == ()
+    assert result.coaching_outcomes == (processor.outcomes[0],)
+    assert result.coaching_outcomes[0] is processor.outcomes[0]
+
+
+@pytest.mark.parametrize(
+    ("kind", "stable_changed"),
+    [
+        (TranscriptKind.PARTIAL, True),
+        (TranscriptKind.STABLE, False),
+    ],
+)
+def test_suppressed_transcript_does_not_invoke_structural_coaching_processor(
+    kind: TranscriptKind,
+    stable_changed: bool,
+) -> None:
+    processor = FakeCoachingProcessor()
+    event = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        event_id="synthetic-event",
+        kind=kind,
+        text="synthetic text",
+        start_seconds=0.0,
+        end_seconds=1.0,
+        revision=1,
+        created_at_utc=NOW,
+    )
+
+    outcome = StreamingASRPipeline._process_coaching(
+        coordinator=processor,
+        event=event,
+        stable_changed=stable_changed,
+        classification_outcome=StableClassificationOutcome(
+            ClassificationProcessingStatus.DISABLED,
+            event.revision,
+            event.source_chunk_sequence,
+        ),
+    )
+
+    assert outcome is None
+    assert processor.calls == []
+
+
+def test_concrete_coaching_coordinator_satisfies_processor_protocol() -> None:
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    processor: CoachingProcessorProtocol = coaching_factory()(state)
+
+    assert isinstance(processor, CoachingCoordinator)
 
 
 def test_classifier_failure_still_allows_rule_only_coaching() -> None:
