@@ -18,7 +18,10 @@ from app.classification.runtime import (
 from app.classification.threshold_profiles import load_threshold_profile
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.rule_engine import RuleBasedCoachingEngine
-from app.coaching.safe_processor import SafeCoachingProcessorAdapter
+from app.integration import (
+    RAGCoachingIntegrationDependencies,
+    compose_rag_coaching_processor,
+)
 from app.streaming.pipeline import (
     CoachingProcessorProtocol,
     StreamingASRPipeline,
@@ -98,6 +101,7 @@ def build_live_pipeline(
     selection: DashboardServiceSelection,
     availability: ArtifactAvailability,
     classifier_provider: ClassifierProvider,
+    integration: RAGCoachingIntegrationDependencies | None = None,
 ) -> StreamingASRPipeline:
     """Build one uploaded-audio pipeline with optional existing services."""
     classifier = (
@@ -106,7 +110,9 @@ def build_live_pipeline(
         else None
     )
     coaching_factory = (
-        _coaching_factory(runtime.tenant) if selection.enable_coaching else None
+        _coaching_factory(runtime.tenant, integration=integration)
+        if selection.enable_coaching
+        else None
     )
     runtime.setfit_enabled = classifier is not None
     runtime.coaching_enabled = coaching_factory is not None
@@ -128,6 +134,8 @@ def build_live_pipeline(
 
 def _coaching_factory(
     tenant: TenantDemo,
+    *,
+    integration: RAGCoachingIntegrationDependencies | None,
 ) -> Callable[[CallState], CoachingProcessorProtocol]:
     def create(call_state: CallState) -> CoachingProcessorProtocol:
         coordinator = CoachingCoordinator(
@@ -135,6 +143,10 @@ def _coaching_factory(
             call_state,
             RuleBasedCoachingEngine(tenant.config, tenant.rules),
         )
-        return SafeCoachingProcessorAdapter(coordinator)
+        return compose_rag_coaching_processor(
+            coordinator=coordinator,
+            tenant_config=tenant.config,
+            integration=integration,
+        )
 
     return create

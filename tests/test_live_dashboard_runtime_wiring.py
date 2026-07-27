@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -5,9 +7,24 @@ from app.calls.models import CallState
 from app.classification.runtime import RuntimeSetFitClassifier
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.safe_processor import SafeCoachingProcessorAdapter
-from app.events.models import TranscriptEvent, TranscriptKind
-from app.streaming.pipeline import WindowTranscriberProtocol
-from live_dashboard.demo_data import tenant_demos
+from app.events.models import (
+    CoachingAction,
+    SuggestionPriority,
+    TranscriptEvent,
+    TranscriptKind,
+)
+from app.integration import (
+    DeterministicLLMCoachingSuggestionFactory,
+    RAGCoachingIntegrationDependencies,
+    RAGCoachingIntegrationPolicy,
+    RAGCoachingProcessorDecorator,
+)
+from app.orchestration import OrchestrationRequest, OrchestrationResult
+from app.streaming.audio_window import ASRAudioWindow
+from app.streaming.pipeline import CoachingProcessorProtocol, WindowTranscriberProtocol
+from app.streaming.window_transcriber import WindowTranscriptionResult
+from app.tenancy.models import TenantCoachingConfig, TenantRAGConfig
+from live_dashboard.demo_data import TenantDemo, tenant_demos
 from live_dashboard.runtime_wiring import (
     ArtifactAvailability,
     DashboardServiceSelection,
@@ -25,6 +42,82 @@ class FakeTranscriber:
 
 class FakeClassifier:
     pass
+
+
+class TypedFakeTranscriber:
+    def transcribe(self, window: ASRAudioWindow) -> WindowTranscriptionResult:
+        raise AssertionError("transcription must not run in wiring tests")
+
+
+class FakeRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, request: OrchestrationRequest) -> OrchestrationResult | None:
+        self.calls += 1
+        raise AssertionError("runner must not execute during construction")
+
+
+@dataclass
+class CallbackTracker:
+    id_calls: int = 0
+    clock_calls: int = 0
+
+    def suggestion_id(self) -> str:
+        self.id_calls += 1
+        return "synthetic-llm-suggestion"
+
+    def now(self) -> datetime:
+        self.clock_calls += 1
+        return datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
+
+
+def integration_dependencies() -> tuple[
+    RAGCoachingIntegrationDependencies,
+    FakeRunner,
+    CallbackTracker,
+]:
+    runner = FakeRunner()
+    callbacks = CallbackTracker()
+    policy = RAGCoachingIntegrationPolicy(
+        rag_llm_enabled_labels=("product_information",),
+        title="Synthetic guidance",
+        action=CoachingAction.RAG_ACTION,
+        priority=SuggestionPriority.HIGH,
+        label_id="product_information",
+        expires_after_seconds=30.0,
+    )
+    return (
+        RAGCoachingIntegrationDependencies(
+            orchestration_runner=runner,
+            policy=policy,
+            suggestion_id_factory=callbacks.suggestion_id,
+            utc_datetime_factory=callbacks.now,
+        ),
+        runner,
+        callbacks,
+    )
+
+
+def enabled_tenant() -> TenantDemo:
+    base = tenant_demos()["tenant_alpha"]
+    config = base.config.model_copy(
+        update={
+            "rag": TenantRAGConfig(
+                enabled=True,
+                knowledge_base_id="kb_synthetic",
+                top_k=3,
+                minimum_score=0.7,
+            ),
+            "coaching": TenantCoachingConfig(
+                cooldown_seconds=8.0,
+                max_active_suggestions=2,
+                enable_llm=True,
+                allowed_actions=[action.value for action in CoachingAction],
+            ),
+        }
+    )
+    return TenantDemo(config=config, rules=base.rules, scenarios=base.scenarios)
 
 
 def runtime():
@@ -173,3 +266,119 @@ def test_dashboard_reruns_reuse_cached_classifier_instance() -> None:
     assert first._classification_stage._classifier is (  # noqa: SLF001
         second._classification_stage._classifier  # noqa: SLF001
     )
+
+
+def test_explicit_none_preserves_base_processor() -> None:
+    subject = runtime()
+    pipeline = build_live_pipeline(
+        subject,
+        TypedFakeTranscriber(),
+        selection=DashboardServiceSelection(False, True),
+        availability=ArtifactAvailability(True),
+        classifier_provider=RuntimeSetFitClassifier,
+        integration=None,
+    )
+    factory = pipeline._coaching_coordinator_factory  # noqa: SLF001
+    assert factory is not None
+    call_state = CallState(tenant_id="tenant_alpha", call_id="synthetic-call")
+
+    processor = factory(call_state)
+
+    assert isinstance(processor, SafeCoachingProcessorAdapter)
+    assert processor._coordinator.call_state is call_state  # noqa: SLF001
+
+
+def test_disabled_demo_with_bundle_remains_base_only() -> None:
+    subject = runtime()
+    integration, runner, callbacks = integration_dependencies()
+    pipeline = build_live_pipeline(
+        subject,
+        TypedFakeTranscriber(),
+        selection=DashboardServiceSelection(False, True),
+        availability=ArtifactAvailability(True),
+        classifier_provider=RuntimeSetFitClassifier,
+        integration=integration,
+    )
+    factory = pipeline._coaching_coordinator_factory  # noqa: SLF001
+    assert factory is not None
+
+    processor = factory(CallState(tenant_id="tenant_alpha", call_id="synthetic-call"))
+
+    assert isinstance(processor, SafeCoachingProcessorAdapter)
+    assert runner.calls == callbacks.id_calls == callbacks.clock_calls == 0
+
+
+def test_enabled_bundle_maps_exact_dependencies_without_invocation() -> None:
+    tenant = enabled_tenant()
+    subject = create_local_execution(tenant, "synthetic-call").runtime
+    integration, runner, callbacks = integration_dependencies()
+    pipeline = build_live_pipeline(
+        subject,
+        TypedFakeTranscriber(),
+        selection=DashboardServiceSelection(False, True),
+        availability=ArtifactAvailability(True),
+        classifier_provider=RuntimeSetFitClassifier,
+        integration=integration,
+    )
+    factory = pipeline._coaching_coordinator_factory  # noqa: SLF001
+    assert factory is not None
+    call_state = CallState(tenant_id="tenant_alpha", call_id="call-one")
+
+    processor = factory(call_state)
+
+    assert isinstance(processor, RAGCoachingProcessorDecorator)
+    coordinator = processor._coordinator  # noqa: SLF001
+    suggestion_factory = processor._suggestion_factory  # noqa: SLF001
+    assert isinstance(
+        suggestion_factory,
+        DeterministicLLMCoachingSuggestionFactory,
+    )
+    assert coordinator.call_state is call_state
+    assert processor._base_processor._coordinator is coordinator  # noqa: SLF001
+    assert processor._tenant_config is tenant.config  # noqa: SLF001
+    assert processor._orchestration_runner is runner  # noqa: SLF001
+    assert processor._rag_llm_enabled_labels == (  # noqa: SLF001
+        integration.policy.rag_llm_enabled_labels
+    )
+    assert suggestion_factory._title == integration.policy.title  # noqa: SLF001
+    assert suggestion_factory._action is integration.policy.action  # noqa: SLF001
+    assert suggestion_factory._priority is integration.policy.priority  # noqa: SLF001
+    assert suggestion_factory._label_id == integration.policy.label_id  # noqa: SLF001
+    assert suggestion_factory._expires_after_seconds == (  # noqa: SLF001
+        integration.policy.expires_after_seconds
+    )
+    assert suggestion_factory._suggestion_id_factory == (  # noqa: SLF001
+        integration.suggestion_id_factory
+    )
+    assert suggestion_factory._utc_datetime_factory == (  # noqa: SLF001
+        integration.utc_datetime_factory
+    )
+    assert runner.calls == callbacks.id_calls == callbacks.clock_calls == 0
+
+
+def test_factory_creates_isolated_structurally_compatible_processors() -> None:
+    tenant = enabled_tenant()
+    subject = create_local_execution(tenant, "synthetic-call").runtime
+    integration, runner, callbacks = integration_dependencies()
+    pipeline = build_live_pipeline(
+        subject,
+        TypedFakeTranscriber(),
+        selection=DashboardServiceSelection(False, True),
+        availability=ArtifactAvailability(True),
+        classifier_provider=RuntimeSetFitClassifier,
+        integration=integration,
+    )
+    factory = pipeline._coaching_coordinator_factory  # noqa: SLF001
+    assert factory is not None
+    first_state = CallState(tenant_id="tenant_alpha", call_id="call-one")
+    second_state = CallState(tenant_id="tenant_alpha", call_id="call-two")
+
+    first: CoachingProcessorProtocol = factory(first_state)
+    second: CoachingProcessorProtocol = factory(second_state)
+
+    assert isinstance(first, RAGCoachingProcessorDecorator)
+    assert isinstance(second, RAGCoachingProcessorDecorator)
+    assert first._coordinator is not second._coordinator  # noqa: SLF001
+    assert first._coordinator.call_state is first_state  # noqa: SLF001
+    assert second._coordinator.call_state is second_state  # noqa: SLF001
+    assert runner.calls == callbacks.id_calls == callbacks.clock_calls == 0
