@@ -27,6 +27,10 @@ from live_dashboard.runtime_wiring import (  # noqa: E402
     default_service_selection,
     inspect_default_artifacts,
 )
+from live_dashboard.presentation import (  # noqa: E402
+    call_status_header,
+    representative_kpis,
+)
 from live_dashboard.uploaded_audio import (  # noqa: E402
     SUPPORTED_UPLOAD_SUFFIXES,
     SafeUploadMetadata,
@@ -55,9 +59,11 @@ st.html("""
 <style>
 div[data-testid="stMetric"] {background:#f7f8fa;border:1px solid #e6e8eb;padding:10px;border-radius:10px}
 div[data-testid="stMetricValue"] {font-size:1.1rem;white-space:normal;overflow-wrap:anywhere}
-.stable {border-left:4px solid #2563eb;padding:.9rem;background:#eff6ff;min-height:90px}
-.partial {border-left:4px solid #94a3b8;padding:.75rem;background:#f8fafc;color:#64748b}
-.chip {display:inline-block;padding:.28rem .62rem;margin:.15rem;border:1px solid #cbd5e1;border-radius:999px;background:#f8fafc;font-size:.88rem}
+div[data-testid="stVerticalBlock"] {gap:.75rem}
+@media (max-width: 760px) {
+  div[data-testid="stHorizontalBlock"] {flex-wrap:wrap}
+  div[data-testid="column"] {min-width:100%}
+}
 </style>
 """)
 
@@ -156,62 +162,77 @@ def _render_representative(
     runtime: DashboardRuntime, view: DashboardTabsViewModel
 ) -> None:
     representative = view.representative
-    _metric_rows(representative.status)
-    progress = representative.progress
     with st.container(border=True):
-        st.markdown(f"**İşlem aşaması:** {progress.stage}")
-        st.progress(progress.percentage / 100)
-        st.caption(f"{progress.eta} · {progress.time_range}")
-    if runtime.latest_event is None:
-        st.info("Görüşmeyi başlatın; transkript ve koçluk önerileri burada görünecek.")
-    left, right = st.columns([1.2, 1])
+        header = call_status_header(
+            view,
+            call_id=runtime.call_id,
+            transcript_revision=runtime.call_state.transcript_revision,
+        )
+        st.caption("CANLI GÖRÜŞME")
+        header_columns = st.columns(5)
+        for column, (label, value) in zip(
+            header_columns,
+            (
+                ("Durum", header.state),
+                ("Çağrı", header.masked_call_id),
+                ("İlerleme", header.progress),
+                ("Revizyon", header.transcript_revision),
+                ("Risk durumu", header.current_risk),
+            ),
+            strict=True,
+        ):
+            column.metric(label, value)
+
+    kpi_columns = st.columns(4)
+    for column, kpi in zip(kpi_columns, representative_kpis(view), strict=True):
+        column.metric(kpi.label, kpi.value)
+
+    left, right = st.columns(
+        [1.65, 1],
+        gap="large",
+        vertical_alignment="top",
+    )
     with left:
         transcript = representative.transcript
         st.subheader("Canlı Transkript")
-        st.markdown(
-            f'<div class="stable"><b>Kesinleşen konuşma</b><br>{transcript.stable_text or "Henüz kesinleşen konuşma yok."}</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="partial"><b>Son bölüm — değişebilir</b><br><i>{transcript.partial_text or "Henüz kısmi metin yok."}</i></div>',
-            unsafe_allow_html=True,
-        )
-        st.caption(f"Son olay türü: {transcript.latest_event_type}")
+        with st.container(height=420, border=True):
+            if transcript.stable_text:
+                st.caption("KESİNLEŞEN KONUŞMA")
+                st.write(transcript.stable_text)
+            else:
+                st.info(
+                    "Henüz kesinleşen konuşma yok. Ses işleme başladığında "
+                    "transkript burada görünecek."
+                )
+            st.divider()
+            st.caption("SON BÖLÜM · DEĞİŞEBİLİR")
+            if transcript.partial_text:
+                st.write(transcript.partial_text)
+            else:
+                st.caption("Henüz kısmi metin yok.")
+            st.caption(f"Son olay türü: {transcript.latest_event_type}")
     with right:
-        st.subheader("Anlık Koçluk")
-        st.caption("Şu Anki Etiketler")
-        if representative.intent_chips:
-            chips = " ".join(
-                f'<span class="chip">{chip.symbol} {chip.text}</span>'
-                for chip in representative.intent_chips
-            )
-            st.markdown(chips, unsafe_allow_html=True)
-        else:
-            st.caption("Aktif niyet veya risk bulunmuyor.")
-        st.caption("Görüşmede Tespit Edilenler")
-        if representative.detected_intent_chips:
-            detected_chips = " ".join(
-                f'<span class="chip">{chip.symbol} {chip.text}</span>'
-                for chip in representative.detected_intent_chips
-            )
-            st.markdown(detected_chips, unsafe_allow_html=True)
-        else:
-            st.caption("Görüşmede henüz etiket tespit edilmedi.")
+        st.subheader("Öncelikli Koçluk")
+        st.caption("ŞU ANKİ NİYET VE RİSKLER")
+        if not representative.intent_chips:
+            st.info("Henüz güncel bir niyet veya risk tespit edilmedi.")
+        for chip in representative.intent_chips:
+            st.write(f"{chip.symbol} {chip.text}")
         feedback = st.session_state.setdefault("suggestion_feedback", {})
         for message in representative.safe_messages:
             st.warning(message)
         if not representative.active_suggestions:
-            st.info(representative.empty_suggestion_message)
+            st.info(
+                "Şu anda aktif bir koçluk önerisi yok. Yeni bir sinyal "
+                "oluştuğunda öneri burada görünecek."
+            )
         for index, card in enumerate(representative.active_suggestions):
             key = f"{card.timestamp}-{card.title}-{index}"
             with st.container(border=True):
-                st.markdown(
-                    f"**{card.priority_symbol} {card.priority_text} · {card.title}**"
-                )
+                st.caption(f"{card.priority_symbol} {card.priority_text}")
+                st.write(card.title)
                 st.write(card.suggestion)
                 details = [
-                    f"Öncelik: {card.priority_text}",
-                    f"Aksiyon: {card.action}",
                     f"Kaynak: {card.source}",
                     f"Saat: {card.timestamp}",
                     "Durum: Yeni" if card.is_new else "Durum: Daha önce gösterildi",
@@ -238,7 +259,10 @@ def _render_representative(
                     f"{card.related_label or '—'} · Revizyon "
                     f"{card.transcript_revision if card.transcript_revision is not None else '—'}"
                 )
-        st.caption(f"Bastırılan öneri sayısı: {representative.suppressed_count}")
+        if representative.detected_intent_chips:
+            with st.expander("Görüşmede tespit edilenler", expanded=False):
+                for chip in representative.detected_intent_chips:
+                    st.write(f"{chip.symbol} {chip.text}")
 
 
 def _render_technical(view: DashboardTabsViewModel) -> None:
@@ -448,11 +472,14 @@ with st.sidebar:
                         st.session_state.suggestion_feedback = {}
                     st.success("Dosya hazır; Başlat komutu bekleniyor.")
                     st.caption(
-                        f"{metadata.filename} · {metadata.format_name} · "
+                        f"Yüklenen ses · {metadata.format_name} · "
                         f"{metadata.size_bytes / 1024:.1f} KB"
                     )
             else:
-                audio_path_text = st.text_input("Yerel ses dosyası yolu")
+                audio_path_text = st.text_input(
+                    "Yerel ses dosyası yolu",
+                    type="password",
+                )
             playback_mode = st.radio(
                 "Oynatma", ("Hızlı analiz", "Gerçek zaman simülasyonu")
             )

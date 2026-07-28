@@ -783,7 +783,7 @@ def dashboard_tabs(
     )
     metadata = (
         (
-            ("Dosya", audio_metadata.filename),
+            ("Kaynak", "Yüklenen ses"),
             ("Biçim", audio_metadata.format_name),
             ("Boyut", f"{audio_metadata.size_bytes / 1024:.1f} KB"),
         )
