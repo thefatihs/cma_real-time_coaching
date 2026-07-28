@@ -13,6 +13,7 @@ from typing import Any
 import psycopg
 import pytest
 from psycopg import Connection
+from pydantic import SecretStr
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -38,6 +39,9 @@ from app.vector_store.postgres.contracts import (  # noqa: E402
 )
 from app.vector_store.postgres.profile_repository import (  # noqa: E402
     PostgreSQLEmbeddingProfileRepository,
+)
+from app.vector_store.postgres.readiness import (  # noqa: E402
+    PostgreSQLSchemaReadinessChecker,
 )
 from app.vector_store.postgres.runner import (  # noqa: E402
     PsycopgPostgreSQLVectorTransactionRunner,
@@ -217,6 +221,61 @@ def test_migration_extension_schema_ledger_and_tables(
             ("schema_migrations",),
             ("vector_records",),
         ]
+
+
+def test_schema_readiness_and_explicit_composed_profile_provisioning(
+    settings: PostgreSQLTestSettings,
+) -> None:
+    from app.composition.postgres_rag import (
+        KnowledgeBaseRAGProviderSettings,
+        PostgreSQLVectorStoreSettings,
+        compose_profile_bound_postgres_rag,
+    )
+
+    checker = PostgreSQLSchemaReadinessChecker(
+        connection_factory=lambda: _connect(settings)
+    )
+    assert checker.verify() is None
+
+    dsn = (
+        f"host={settings.host} port={settings.port} "
+        f"dbname={settings.database} user={settings.user} "
+        f"password={settings.password}"
+    )
+    composition = compose_profile_bound_postgres_rag(
+        postgres_settings=PostgreSQLVectorStoreSettings(
+            dsn=SecretStr(dsn),
+            connect_timeout_seconds=settings.connect_timeout,
+            ssl_mode="require",
+            application_name="callmetric-pr38-integration",
+        ),
+        knowledge_base_settings=KnowledgeBaseRAGProviderSettings(
+            tenant_id="tenant-readiness",
+            knowledge_base_id="kb-readiness",
+            model_id="model-readiness",
+            model_name_or_path="synthetic-local-model",
+            vector_dimension=2,
+            normalize_embeddings=True,
+            device="cpu",
+            local_files_only=True,
+        ),
+        psycopg_connect=psycopg.connect,
+        embedding_backend_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("embedding backend must not load")
+        ),
+    )
+    repository = composition.profile_repository
+    assert (
+        repository.get_profile(
+            tenant_id=composition.profile.tenant_id,
+            knowledge_base_id=composition.profile.knowledge_base_id,
+        )
+        is None
+    )
+    first = repository.register_profile(composition.profile)
+    second = repository.register_profile(composition.profile)
+    assert first is composition.profile
+    assert second == composition.profile
 
 
 def test_profile_registration_idempotency_conflict_and_persistence(

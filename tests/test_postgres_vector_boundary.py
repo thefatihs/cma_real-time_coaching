@@ -593,6 +593,7 @@ def test_postgres_package_exports_are_exact() -> None:
 
     assert postgres.__all__ == [
         "PostgreSQLCosineSearchRow",
+        "PostgreSQLSchemaReadinessChecker",
         "PostgreSQLStoredVectorRow",
         "PostgreSQLVectorTransaction",
         "PostgreSQLVectorTransactionRunner",
