@@ -1065,3 +1065,23 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Role resolution, speaker embedding ve streaming wiring
   ayri ve onayli gorevlere ertelendi.
+
+## 73. Conservative Call-Scoped Speaker Role Resolution
+
+- Immutable speaker-attributed bounded text, role-resolution request/result ve
+  synchronous resolver protocol contract'lari eklendi.
+- Kucuk deterministic Turkce phrase set'leri strong agent/customer evidence
+  uretir; call-opening konumu yalnizca weak evidence olarak kaydedilir ve tek
+  basina rol belirlemez.
+- Conflicting veya yetersiz evidence UNKNOWN kalir; iki speaker call'unda
+  yalnizca tek high-confidence direct rol ve conflict bulunmamasi halinde
+  opposite rol inferred evidence olarak atanir.
+- OVERLAP text role evidence disinda tutulur; text result/diagnostic repr'lerine
+  tasinmaz ve toplam islenen text fail-closed bir limit ile sinirlanir.
+- Eklenen/degisen dosyalar: `app/diarization/role_resolver.py`,
+  `app/diarization/__init__.py`, `tests/test_diarization_role_resolver.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 109 passed; full 1169 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Streaming wiring, coaching/classification routing ve
+  dashboard rendering ayri ve onayli gorevlere ertelendi.

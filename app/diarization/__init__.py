@@ -29,6 +29,17 @@ from app.diarization.pyannote_backend import (
     PyannoteDiarizationErrorCategory,
     PyannoteSpeakerDiarizer,
 )
+from app.diarization.role_resolver import (
+    RoleEvidenceCode,
+    RuleBasedSpeakerRoleResolver,
+    SpeakerAttributedTextSpan,
+    SpeakerRoleAssignment,
+    SpeakerRoleResolutionError,
+    SpeakerRoleResolutionErrorCategory,
+    SpeakerRoleResolutionRequest,
+    SpeakerRoleResolutionResult,
+    SpeakerRoleResolverProtocol,
+)
 
 __all__ = [
     "DiarizationRequest",
@@ -47,6 +58,15 @@ __all__ = [
     "SpeakerIdentityTrackingErrorCategory",
     "SpeakerIdentityTrackingRequest",
     "SpeakerRole",
+    "SpeakerAttributedTextSpan",
+    "SpeakerRoleAssignment",
+    "SpeakerRoleResolutionError",
+    "SpeakerRoleResolutionErrorCategory",
+    "SpeakerRoleResolutionRequest",
+    "SpeakerRoleResolutionResult",
+    "SpeakerRoleResolverProtocol",
+    "RoleEvidenceCode",
+    "RuleBasedSpeakerRoleResolver",
     "UNKNOWN_LOCAL_SPEAKER_ID",
     "WordAlignmentError",
     "WordAlignmentErrorCategory",
