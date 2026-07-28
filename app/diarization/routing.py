@@ -118,10 +118,7 @@ class CustomerSpeechProjector:
         self,
         request: CustomerSpeechProjectionRequest,
     ) -> CustomerSpeechProjection:
-        self._validate_scope(request)
-        words = self._validate_and_order_words(request)
-        role_map = self._validate_role_map(request.role_resolution, words)
-        tagged_words = tuple(self._apply_role(word, role_map) for word in words)
+        tagged_words = self.apply_roles(request)
 
         customer_words: list[RoleTaggedWord] = []
         excluded_agent = 0
@@ -173,6 +170,15 @@ class CustomerSpeechProjector:
                 else CustomerProjectionReason.NO_TRUSTED_CUSTOMER_SPEECH
             ),
         )
+
+    def apply_roles(
+        self,
+        request: CustomerSpeechProjectionRequest,
+    ) -> tuple[RoleTaggedWord, ...]:
+        self._validate_scope(request)
+        words = self._validate_and_order_words(request)
+        role_map = self._validate_role_map(request.role_resolution, words)
+        return tuple(self._apply_role(word, role_map) for word in words)
 
     @staticmethod
     def _validate_scope(request: CustomerSpeechProjectionRequest) -> None:

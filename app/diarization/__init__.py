@@ -8,8 +8,17 @@ from app.diarization.alignment import (
     align_words_to_speakers,
 )
 from app.diarization.fake_backend import FakeSpeakerDiarizer
+from app.diarization.composition import (
+    CustomerSpeechProjectorProtocol,
+    DiarizationCompositionOutcome,
+    DiarizationCompositionReason,
+    DiarizationCompositionRequest,
+    DiarizationCompositionStatus,
+    OfflineDiarizationComposer,
+)
 from app.diarization.identity_tracker import (
     SpeakerIdentityTracker,
+    SpeakerIdentityTrackerCheckpoint,
     SpeakerIdentityTrackingError,
     SpeakerIdentityTrackingErrorCategory,
     SpeakerIdentityTrackingRequest,
@@ -53,6 +62,10 @@ from app.diarization.routing import (
 
 __all__ = [
     "DiarizationRequest",
+    "DiarizationCompositionOutcome",
+    "DiarizationCompositionReason",
+    "DiarizationCompositionRequest",
+    "DiarizationCompositionStatus",
     "DiarizationResult",
     "DiarizationTurn",
     "DiarizedTranscriptEvent",
@@ -64,6 +77,7 @@ __all__ = [
     "PyannoteSpeakerDiarizer",
     "SpeakerDiarizerProtocol",
     "SpeakerIdentityTracker",
+    "SpeakerIdentityTrackerCheckpoint",
     "SpeakerIdentityTrackingError",
     "SpeakerIdentityTrackingErrorCategory",
     "SpeakerIdentityTrackingRequest",
@@ -85,6 +99,8 @@ __all__ = [
     "DiarizationRoutingError",
     "DiarizationRoutingErrorCategory",
     "RoleTaggedWord",
+    "CustomerSpeechProjectorProtocol",
+    "OfflineDiarizationComposer",
     "UNKNOWN_LOCAL_SPEAKER_ID",
     "WordAlignmentError",
     "WordAlignmentErrorCategory",

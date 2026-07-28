@@ -1125,3 +1125,24 @@ Tarih: 28 Temmuz 2026
   full 1193 passed (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Real diarization projection provider wiring ve dashboard
   speaker rendering ayri ve onayli gorevlere ertelendi.
+
+## 76. Safe Offline Diarization Composition
+
+- Injectable offline composer mevcut diarizer, call-scoped identity tracker,
+  word alignment, role resolver ve customer projector contract'larini tek
+  deterministic akis icinde birlestirir.
+- Her component sinirinda exact tenant/call/revision/window scope fail-closed
+  dogrulanir; ordinary exception ve malformed output yalnizca sabit safe reason
+  ile partial-result icermeyen failure outcome uretir.
+- Tracker'a exact-call checkpoint/restore eklendi; downstream failure yeni
+  history veya global speaker ordinal'larini transactionally geri alir.
+- Empty turn/word girdileri valid empty customer projection uretir; exact
+  request tekrar islemesi global identity ve history acisindan idempotenttir.
+- Eklenen/degisen dosyalar: `app/diarization/composition.py`,
+  `app/diarization/identity_tracker.py`, `app/diarization/alignment.py`,
+  `app/diarization/routing.py`, `app/diarization/__init__.py`,
+  `tests/test_diarization_composition.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 131 passed; full 1204 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Offline composer'i streaming/runtime veya dashboard'a
+  baglamak ayri ve onayli gorevlere ertelendi.

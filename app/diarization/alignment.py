@@ -151,12 +151,14 @@ def _align_word(
         )
         local_speaker_ids = winner.local_speaker_ids
         global_speaker_id = winner.global_speaker_id
+        global_speaker_ids = winner.global_speaker_ids
         role = winner.role
         speaker_confidence = winner.speaker_confidence
         role_confidence = winner.role_confidence
     else:
         local_speaker_ids = (UNKNOWN_LOCAL_SPEAKER_ID,)
         global_speaker_id = None
+        global_speaker_ids = ()
         role = SpeakerRole.UNKNOWN
         speaker_confidence = None
         role_confidence = None
@@ -169,6 +171,7 @@ def _align_word(
         text=word.text,
         local_speaker_ids=local_speaker_ids,
         global_speaker_id=global_speaker_id,
+        global_speaker_ids=global_speaker_ids,
         role=role,
         speaker_confidence=speaker_confidence,
         role_confidence=role_confidence,

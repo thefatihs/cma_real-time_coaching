@@ -1,5 +1,6 @@
 """Deterministic call-scoped speaker identity tracking."""
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
@@ -71,6 +72,13 @@ class _CallTrackingState:
     next_global_ordinal: int = 1
     creation_order: dict[str, int] = field(default_factory=dict)
     windows: list[_ProcessedWindow] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerIdentityTrackerCheckpoint:
+    tenant_id: str
+    call_id: str
+    _state: _CallTrackingState | None = field(repr=False)
 
 
 class SpeakerIdentityTracker:
@@ -175,6 +183,29 @@ class SpeakerIdentityTracker:
     def retained_window_count(self, *, tenant_id: str, call_id: str) -> int:
         state = self._states.get((tenant_id, call_id))
         return 0 if state is None else len(state.windows)
+
+    def checkpoint(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> SpeakerIdentityTrackerCheckpoint:
+        if not tenant_id.strip() or not call_id.strip():
+            raise SpeakerIdentityTrackingError(
+                SpeakerIdentityTrackingErrorCategory.INVALID_SCOPE
+            )
+        return SpeakerIdentityTrackerCheckpoint(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            _state=deepcopy(self._states.get((tenant_id, call_id))),
+        )
+
+    def restore(self, checkpoint: SpeakerIdentityTrackerCheckpoint) -> None:
+        scope = (checkpoint.tenant_id, checkpoint.call_id)
+        if checkpoint._state is None:
+            self._states.pop(scope, None)
+        else:
+            self._states[scope] = deepcopy(checkpoint._state)
 
     def _validate_turns(
         self,
