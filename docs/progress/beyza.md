@@ -99,3 +99,26 @@ Tarih: 28 Temmuz 2026
   script passed ve conflict-marker testleri 5 passed.
 - Sonraki planli adim: complete Psycopg SQL transaction implementation'i ayri
   onayli PR35 kapsaminda ele alinacak.
+
+## PR35 - Psycopg/pgvector Transaction Implementation
+
+Tarih: 28 Temmuz 2026
+
+- Lazy callable connection factory ile pgvector kaydi ve complete
+  `PsycopgPostgreSQLVectorTransaction` implementasyonu eklendi.
+- Scope lock, profile read/insert, record read/insert/replace ve cosine search
+  olmak uzere mevcut yedi transaction operation'i parameterized SQL ile
+  uygulandi; transaction lifecycle'i runner sorumlulugunda kaldi.
+- Dogrudan runtime dependency olarak `pgvector>=0.5,<0.6` eklendi.
+- Degisen dosyalar: `pyproject.toml`, `uv.lock`, `docs/progress/beyza.md`;
+  eklenen dosyalar: `app/vector_store/postgres/connection_factory.py`,
+  `app/vector_store/postgres/transaction.py`,
+  `tests/test_pgvector_connection_factory.py`,
+  `tests/test_postgres_transaction.py`.
+- Focused PostgreSQL testleri: 242 passed.
+- Full suite mevcut Torch `c10.dll` WinError 1114 nedeniyle dort
+  ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
+- Ruff check/format passed; Pyright 0 errors; conflict-marker script passed ve
+  conflict-marker testleri 5 passed.
+- Sonraki planli adim: gercek PostgreSQL/Docker integration'i ayri ve onayli
+  PR36 kapsaminda ele alinacak.
