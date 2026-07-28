@@ -1081,6 +1081,7 @@ Tarih: 28 Temmuz 2026
 - Eklenen/degisen dosyalar: `app/diarization/role_resolver.py`,
   `app/diarization/__init__.py`, `tests/test_diarization_role_resolver.py`,
   `PROJECT_PROGRESS.md`.
+
 - Testler: focused diarization 109 passed; full 1169 passed
   (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Streaming wiring, coaching/classification routing ve
@@ -1191,3 +1192,40 @@ Tarih: 28 Temmuz 2026
   1220 passed (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Full offline Stage 8B evaluation ayri ve onayli bir
   execution gorevine ertelendi.
+
+## 79. Complete PostgreSQL Cosine Search-Row Contract
+
+Tarih: 28 Temmuz 2026
+
+- PostgreSQL cosine search row contract'ina complete `VectorRecord` ve
+  `VectorBackedRetriever` dimension dogrulamasi icin gerekli immutable
+  embedding tuple alani eklendi.
+- Frozen/slotted row, transaction signature, cosine ordering ve mevcut package
+  export davranislari degismeden korundu.
+- Degisen dosyalar: `app/vector_store/postgres/contracts.py`,
+  `tests/test_postgres_vector_boundary.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/retrieval 103 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, Psycopg ve Docker ayri ve onayli gorevlere
+  ertelendi.
+
+## 80. SQL-Free PostgreSQL Embedding-Profile Repository
+
+Tarih: 28 Temmuz 2026
+
+- Mevcut transaction runner/session contract'lari uzerinde SQL-free PostgreSQL
+  embedding-profile repository domain implementation'i eklendi.
+- Registration islemi scope lock, `for_update=True` profile read ve yalnizca
+  eksik profil icin insert sirasini izler; equal profil exact canonical object
+  olarak doner ve conflicting profil state degistirmeden reddedilir.
+- Eklenen dosyalar: `app/vector_store/postgres/profile_repository.py`,
+  `tests/test_postgres_embedding_profile_repository.py`; degisen dosyalar:
+  `app/vector_store/postgres/__init__.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL profile/boundary 163 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle dort ASR/CLI/offline-evaluation
+  testinin collection asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, batch, upsert, search, SQL, Psycopg ve Docker
+  ayri ve onayli gorevlere ertelendi.

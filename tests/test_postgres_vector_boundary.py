@@ -61,6 +61,7 @@ def _search_row(
     document_id: str,
     chunk_id: str,
     cosine_distance: float,
+    embedding: tuple[float, ...],
 ) -> PostgreSQLCosineSearchRow:
     return PostgreSQLCosineSearchRow(
         tenant_id="tenant_synthetic",
@@ -68,6 +69,7 @@ def _search_row(
         document_id=document_id,
         chunk_id=chunk_id,
         text="Synthetic search text.",
+        embedding=embedding,
         metadata_json="[]",
         cosine_distance=cosine_distance,
     )
@@ -224,7 +226,7 @@ def test_transaction_records_all_domain_operations() -> None:
     profile = _profile()
     identity = VectorRecordIdentity(document_id="document_a", chunk_id="chunk_a")
     stored_row = _stored_row()
-    search_row = _search_row("document_a", "chunk_a", 0.25)
+    search_row = _search_row("document_a", "chunk_a", 0.25, (0.25, 0.5))
     transaction.profile = profile
     transaction.records = (stored_row,)
     transaction.search_rows = (search_row,)
@@ -249,13 +251,15 @@ def test_transaction_records_all_domain_operations() -> None:
     ) == (stored_row,)
     transaction.insert_records((stored_row,))
     transaction.replace_record(stored_row)
-    assert transaction.search_cosine(
+    returned_search_rows = transaction.search_cosine(
         tenant_id="tenant_synthetic",
         knowledge_base_id="kb_synthetic",
         query_embedding=(0.25, 0.5),
         top_k=3,
         maximum_cosine_distance=0.5,
-    ) == (search_row,)
+    )
+    assert returned_search_rows == (search_row,)
+    assert returned_search_rows[0].embedding == (0.25, 0.5)
 
     assert transaction.scope_locks == [("tenant_synthetic", "kb_synthetic")]
     assert transaction.profile_reads == [("tenant_synthetic", "kb_synthetic", True)]
@@ -300,10 +304,36 @@ def test_search_row_type_is_frozen_slotted_and_has_exact_fields() -> None:
         "document_id",
         "chunk_id",
         "text",
+        "embedding",
         "metadata_json",
         "cosine_distance",
     )
     assert "__slots__" in PostgreSQLCosineSearchRow.__dict__
+
+
+def test_search_row_requires_and_preserves_tuple_embedding() -> None:
+    parameters = inspect.signature(PostgreSQLCosineSearchRow).parameters
+    embedding = (0.125, 0.75)
+
+    row = _search_row("document_a", "chunk_a", 0.25, embedding)
+
+    assert parameters["embedding"].default is inspect.Parameter.empty
+    assert get_type_hints(PostgreSQLCosineSearchRow)["embedding"] == tuple[float, ...]
+    assert row.embedding is embedding
+
+
+def test_search_row_contains_all_vector_record_stored_fields() -> None:
+    row_fields = {field.name for field in dataclasses.fields(PostgreSQLCosineSearchRow)}
+
+    assert {
+        "tenant_id",
+        "knowledge_base_id",
+        "document_id",
+        "chunk_id",
+        "text",
+        "embedding",
+        "metadata_json",
+    } <= row_fields
 
 
 def test_stored_row_is_immutable() -> None:
@@ -314,7 +344,7 @@ def test_stored_row_is_immutable() -> None:
 
 
 def test_search_row_is_immutable() -> None:
-    row = _search_row("document_a", "chunk_a", 0.25)
+    row = _search_row("document_a", "chunk_a", 0.25, (0.25, 0.5))
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         row.text = "Changed synthetic text."  # type: ignore[misc]
@@ -522,11 +552,12 @@ def test_cosine_distance_rejects_invalid_values_without_clamping(
 
 def test_search_rows_order_by_relevance_then_document_and_chunk() -> None:
     rows = (
-        _search_row("document_b", "chunk_a", 0.5),
-        _search_row("document_a", "chunk_b", 0.5),
-        _search_row("document_z", "chunk_z", 0.25),
-        _search_row("document_a", "chunk_a", 0.5),
+        _search_row("document_b", "chunk_a", 0.5, (0.1, 0.2)),
+        _search_row("document_a", "chunk_b", 0.5, (0.3, 0.4)),
+        _search_row("document_z", "chunk_z", 0.25, (0.5, 0.6)),
+        _search_row("document_a", "chunk_a", 0.5, (0.7, 0.8)),
     )
+    original_embeddings = tuple(row.embedding for row in rows)
 
     ordered = order_cosine_search_rows(rows)
 
@@ -536,14 +567,21 @@ def test_search_rows_order_by_relevance_then_document_and_chunk() -> None:
         ("document_a", "chunk_b"),
         ("document_b", "chunk_a"),
     )
+    assert tuple(row.embedding for row in ordered) == (
+        (0.5, 0.6),
+        (0.7, 0.8),
+        (0.3, 0.4),
+        (0.1, 0.2),
+    )
+    assert tuple(row.embedding for row in rows) == original_embeddings
     assert rows[0].document_id == "document_b"
     assert order_cosine_search_rows(rows) == ordered
 
 
 def test_malformed_distance_prevents_any_ordered_result() -> None:
     rows = (
-        _search_row("document_a", "chunk_a", 0.25),
-        _search_row("document_b", "chunk_b", math.nan),
+        _search_row("document_a", "chunk_a", 0.25, (0.1, 0.2)),
+        _search_row("document_b", "chunk_b", math.nan, (0.3, 0.4)),
     )
 
     with pytest.raises(ValueError):
