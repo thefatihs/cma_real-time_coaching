@@ -942,6 +942,7 @@ Tarih: 28 Temmuz 2026
   asamasinda durdu.
 - Sonraki planli adim: Persistence, SQL, migration ve deployment configuration
   ayri ve onayli gorevlere ertelendi.
+
 ## 67. Live Dashboard Visual Foundation
 
 - Representative gorunumu maskeli cagri kimligi, gercek durum/revizyon/risk
@@ -963,6 +964,7 @@ Tarih: 28 Temmuz 2026
   gelistirmek.
 
   ## 68. Provider-Neutral Embedding-Profile Repository Contract
+
 
 Tarih: 28 Temmuz 2026
 

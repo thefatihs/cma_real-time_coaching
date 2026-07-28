@@ -14,11 +14,13 @@ from app.vector_store.models import (
     VectorRecordIdentity,
     VectorSearchHit,
 )
+from app.vector_store.profile_repository import EmbeddingProfileRepository
 from app.vector_store.protocols import AtomicVectorBatchWriter, VectorStore
 
 __all__ = [
     "AtomicVectorBatchWriter",
     "EmbeddingDistanceMetric",
+    "EmbeddingProfileRepository",
     "InMemoryVectorStore",
     "KnowledgeBaseEmbeddingProfile",
     "SearchRequest",
