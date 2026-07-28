@@ -982,7 +982,31 @@ Tarih: 28 Temmuz 2026
   asamasinda durdu.
 - Sonraki planli adim: SQL, dependencies, migrations, Docker ve deployment
   configuration ayri ve onayli gorevlere ertelendi.
-## 69. Live Dashboard Operational State Hardening
+
+
+## 69. SQL-Free PostgreSQL Vector Transaction Boundary
+
+Tarih: 28 Temmuz 2026
+
+- Gelecekteki PostgreSQL vector adapter'i icin SQL ve Psycopg tipi icermeyen,
+  runner-owned transaction/session protokolleri ve immutable backend row
+  contract'lari eklendi.
+- Embedding'ler icin deterministic IEEE-754 float32 canonicalization, metadata
+  icin ordered JSON pair-array ve cosine score/distance codec politikalari
+  eklendi.
+- Eklenen dosyalar: `app/vector_store/postgres/__init__.py`,
+  `app/vector_store/postgres/contracts.py`,
+  `app/vector_store/postgres/codecs.py`,
+  `tests/test_postgres_vector_boundary.py`; degisen dosya:
+  `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/profile 126 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
+  deployment configuration ayri ve onayli gorevlere ertelendi.
+
+## 70. Live Dashboard Operational State Hardening
 
 - Tenant, call ve source mode alanlarindan yalnizca hash tabanli deterministik UI
   scope kimligi uretilir; scope degisiminde feedback, scoped widget ve stale
@@ -1005,7 +1029,7 @@ Tarih: 28 Temmuz 2026
 - Sonraki planli adim: Speaker-aware transcript ve timeline sunumunu ayri bir
   gorevde mevcut diarization companion contract'i uzerinden tasarlamak.
 
-## 70. Optional Whisper Word Timestamps and Speaker Alignment
+## 71. Optional Whisper Word Timestamps and Speaker Alignment
 
 - Immutable ASR word timestamp contract'i eklendi; faster-whisper entegrasyonu
   varsayilan davranisi koruyan acik bir secenekle word timestamp isteyebilir.
