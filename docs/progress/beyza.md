@@ -99,3 +99,49 @@ Tarih: 28 Temmuz 2026
   script passed ve conflict-marker testleri 5 passed.
 - Sonraki planli adim: complete Psycopg SQL transaction implementation'i ayri
   onayli PR35 kapsaminda ele alinacak.
+
+## PR35 - Psycopg/pgvector Transaction Implementation
+
+Tarih: 28 Temmuz 2026
+
+- Lazy callable connection factory ile pgvector kaydi ve complete
+  `PsycopgPostgreSQLVectorTransaction` implementasyonu eklendi.
+- Scope lock, profile read/insert, record read/insert/replace ve cosine search
+  olmak uzere mevcut yedi transaction operation'i parameterized SQL ile
+  uygulandi; transaction lifecycle'i runner sorumlulugunda kaldi.
+- Dogrudan runtime dependency olarak `pgvector>=0.5,<0.6` eklendi.
+- Degisen dosyalar: `pyproject.toml`, `uv.lock`, `docs/progress/beyza.md`;
+  eklenen dosyalar: `app/vector_store/postgres/connection_factory.py`,
+  `app/vector_store/postgres/transaction.py`,
+  `tests/test_pgvector_connection_factory.py`,
+  `tests/test_postgres_transaction.py`.
+- Focused PostgreSQL testleri: 242 passed.
+- Full suite mevcut Torch `c10.dll` WinError 1114 nedeniyle dort
+  ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
+- Ruff check/format passed; Pyright 0 errors; conflict-marker script passed ve
+  conflict-marker testleri 5 passed.
+- Sonraki planli adim: gercek PostgreSQL/Docker integration'i ayri ve onayli
+  PR36 kapsaminda ele alinacak.
+
+## PR36 - Docker-backed PostgreSQL/pgvector Integration
+
+Tarih: 28 Temmuz 2026
+
+- Docker 29.6.2 ve Docker Compose v5.3.1 ile
+  `pgvector/pgvector:0.8.5-pg16-bookworm` image'i kullanildi.
+- Checked-in `migrations/postgres/0001_vector_store.sql` fresh ve izole test
+  database'ine basariyla uygulandi.
+- Profile repository, profile-bound vector store, atomic batch, upsert, cosine
+  search, rollback, scope isolation ve bounded advisory-lock davranisini
+  kapsayan gercek PostgreSQL integration testleri: 9 passed.
+- Unique Compose project'ine ait container, network ve volume runner tarafindan
+  basariyla kaldirildi; cleanup sonrasinda PR36 kaynagi kalmadigi dogrulandi.
+- Degisen dosyalar: `pyproject.toml`, `docs/progress/beyza.md`; eklenen
+  dosyalar: `compose.postgres-integration.yml`,
+  `scripts/run_postgres_integration.py`,
+  `tests/integration/test_postgres_vector_integration.py`.
+- Docker-disindaki full suite onceki kosuda 1423 test toplarken bilinen Torch
+  `c10.dll` WinError 1114 nedeniyle dort ASR/CLI/offline-evaluation testinin
+  collection asamasinda durdu; 9 integration testi opt-in olarak dislandi.
+- Sonraki planli adim: production runtime configuration ve wiring ayri ve
+  onayli PR37 kapsaminda ele alinacak.

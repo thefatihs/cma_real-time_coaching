@@ -10,6 +10,7 @@ dependencies = [
     "jiwer>=4.0.0",
     "numpy>=2.5.1",
     "pandas>=3.0.3",
+    "pgvector>=0.5,<0.6",
     "psycopg[binary]>=3.3.4,<4",
     "pydantic-settings>=2.14.2",
     "scikit-learn>=1.9.0",
@@ -27,4 +28,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "ruff>=0.15.22",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "postgres_integration: requires the opt-in Docker PostgreSQL integration runner",
 ]
