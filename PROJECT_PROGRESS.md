@@ -902,3 +902,23 @@ Tarih: 27 Temmuz 2026
 - Sonraki planli adim: Backend'i ayri bir gorevde window-to-diarization
   orchestration sinirina baglamadan once overlap ve gercek ses
   degerlendirmesini tasarlamak.
+
+## 65. Live Dashboard Visual Foundation
+
+- Representative gorunumu maskeli cagri kimligi, gercek durum/revizyon/risk
+  degerleri ve tek kompakt KPI sirasi ile yeniden duzenlendi.
+- Canli transkript sinirli yukseklikte, genis ve native Streamlit alaninda;
+  aktif kocluk ise mevcut priority sirasini koruyan dar bir operasyon panelinde
+  gosterilir.
+- Dinamik transcript, label, suggestion ve durum degerleri unsafe HTML yerine
+  native component'lerle render edilir; yuklenen dosya adi genel kaynak etiketi
+  ile degistirildi ve yerel path girdisi maskelendi.
+- Bos transcript, niyet/risk, kocluk ve ASR durumlari icin profesyonel,
+  deterministik sunumlar eklendi; runtime ve session ownership degistirilmedi.
+- Degisen dosyalar: `live_dashboard/app.py`,
+  `live_dashboard/presentation.py`, `live_dashboard/view_models.py`,
+  ilgili uc dashboard test dosyasi ve `PROJECT_PROGRESS.md`.
+- Testler: focused live-dashboard 64 passed; full 950 passed
+  (1 dependency warning).
+- Sonraki planli adim: Ayri bir gorevde operasyonel panel ve durum sunumlarini
+  gelistirmek.
