@@ -961,3 +961,26 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning).
 - Sonraki planli adim: Ayri bir gorevde operasyonel panel ve durum sunumlarini
   gelistirmek.
+
+## 68. Live Dashboard Operational State Hardening
+
+- Tenant, call ve source mode alanlarindan yalnizca hash tabanli deterministik UI
+  scope kimligi uretilir; scope degisiminde feedback, scoped widget ve stale
+  presentation metadata'si temizlenirken runtime ve CallState korunur.
+- Coaching feedback key'leri call scope, suggestion kimligi, revision, source ve
+  timestamp ile display sirasindan bagimsiz ve cakismaya dayanikli hale getirildi.
+- Transcript, aktif/history coaching, intent/risk timeline, ASR chart ve teknik
+  satirlar yalnizca presentation katmaninda sinirlandi; gizlenen eski oge
+  sayilari gosterilir ve runtime koleksiyonlari degistirilmez.
+- Teknik ayrintilar varsayilan olarak kapali native kontrol arkasina alindi;
+  operasyon durumu waiting/running/degraded/failed/completed sabit guvenli
+  sunumlarla gosterilir.
+- Provider exception, path veya internal hata metni yerine sabit guvenli failure
+  kategorileri render edilir.
+- Degisen dosyalar: `live_dashboard/app.py`,
+  `live_dashboard/presentation.py`, ilgili iki dashboard test dosyasi ve
+  `PROJECT_PROGRESS.md`.
+- Testler: focused live-dashboard 72 passed; full 1029 passed
+  (1 dependency warning).
+- Sonraki planli adim: Speaker-aware transcript ve timeline sunumunu ayri bir
+  gorevde mevcut diarization companion contract'i uzerinden tasarlamak.
