@@ -1253,3 +1253,28 @@ Tarih: 28 Temmuz 2026
 - Kalite: scoped Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Adapter, batch, upsert, search, SQL, Psycopg ve Docker
   ayri ve onayli gorevlere ertelendi.
+
+## 81. Profile-Bound PostgreSQL Atomic Vector Batch Admission
+
+Tarih: 28 Temmuz 2026
+
+- Tek immutable cosine embedding profile'ina bagli, SQL-free PostgreSQL atomic
+  vector batch admission adapter'i eklendi; partial adapter package'tan export
+  edilmedi.
+- Batch transaction'dan once canonical scope, identity, float32 embedding,
+  text ve ordered metadata olarak dogrulanir; transaction scope lock, exact
+  stored-profile kontrolu, exhaustive existing-row read ve tum batch
+  dogrulandiktan sonra yalnizca eksik kayit insert sirasini izler.
+- Equal canonical kayitlar unchanged doner; duplicate, malformed veya
+  conflicting kayitlar ilk insert'ten once `ValueError` ile tum batch'i
+  reddeder. Commit, rollback ve release transaction runner sorumlulugunda
+  kalir.
+- Eklenen dosyalar: `app/vector_store/postgres/adapter.py`,
+  `tests/test_postgres_atomic_batch_writer.py`; degisen dosyalar:
+  `app/vector_store/postgres/contracts.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL/batch/ingestion 187 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle dort ASR/CLI/offline-evaluation
+  testinin collection asamasinda durdu.
+- Kalite: repository-wide Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: SQL, Psycopg, migrations, upsert ve search adapter
+  davranislari ayri ve onayli gorevlere ertelendi.

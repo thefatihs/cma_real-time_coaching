@@ -65,12 +65,25 @@ class PostgreSQLVectorTransaction(Protocol):
         tenant_id: str,
         knowledge_base_id: str,
         identities: tuple[VectorRecordIdentity, ...],
-    ) -> tuple[PostgreSQLStoredVectorRow, ...]: ...
+    ) -> tuple[PostgreSQLStoredVectorRow, ...]:
+        """Return the exhaustive unique subset of requested records.
+
+        Within the current transaction snapshot, every existing requested
+        identity is returned exactly once. Implementations must not return
+        unrequested identities; an omitted requested identity is not stored.
+        """
+        ...
 
     def insert_records(
         self,
         rows: tuple[PostgreSQLStoredVectorRow, ...],
-    ) -> None: ...
+    ) -> None:
+        """Insert all rows in the current runner-owned transaction.
+
+        Implementations must not commit or otherwise manage transaction
+        lifecycle. A later callback failure rolls back the complete insert.
+        """
+        ...
 
     def replace_record(
         self,
