@@ -10,6 +10,7 @@ import pytest
 
 from app.events.models import SuggestionPriority
 from live_dashboard.demo_data import tenant_demos
+from live_dashboard.presentation import ui_scope_identity
 from live_dashboard.view_models import (
     create_local_execution,
     dashboard_tabs,
@@ -53,6 +54,7 @@ class _RecordingStreamlit:
         self.writes: list[str] = []
         self.metrics: list[tuple[str, ...]] = []
         self.markdown_kwargs: list[dict[str, object]] = []
+        self.toggle_values: dict[str, bool] = {}
         self.sidebar = nullcontext()
 
     def container(self, **_kwargs: object) -> Any:
@@ -115,6 +117,15 @@ class _RecordingStreamlit:
     def checkbox(self, _label: str, *, value: bool, **_kwargs: object) -> bool:
         return value
 
+    def toggle(
+        self,
+        label: str,
+        *,
+        value: bool,
+        **_kwargs: object,
+    ) -> bool:
+        return self.toggle_values.get(label, value)
+
     def button(self, *_args: object, **_kwargs: object) -> bool:
         return False
 
@@ -162,6 +173,14 @@ def _history_card() -> SuggestionCardViewModel:
     )
 
 
+def _scope(call_id: str = "local-call"):
+    return ui_scope_identity(
+        tenant_id="tenant_alpha",
+        call_id=call_id,
+        source_mode="synthetic-test",
+    )
+
+
 def test_representative_renderer_handles_empty_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -170,7 +189,7 @@ def test_representative_renderer_handles_empty_history(
     recorder = _RecordingStreamlit()
     app = _load_dashboard_app(monkeypatch, recorder)
 
-    app._render_representative(state.runtime, tabs)
+    app._render_representative(state.runtime, tabs, _scope())
 
 
 def test_representative_renderer_shows_non_empty_history(
@@ -184,13 +203,15 @@ def test_representative_renderer_shows_non_empty_history(
     )
     recorder = _RecordingStreamlit()
     app = _load_dashboard_app(monkeypatch, recorder)
+    recorder.toggle_values["Önceki önerileri göster (1)"] = True
 
     app._render_representative(
         state.runtime,
         replace(tabs, representative=representative),
+        _scope(),
     )
 
-    assert "Önceki Öneriler" in recorder.captions
+    assert "Önceki güvenli öneri" in " ".join(recorder.captions)
 
 
 def test_representative_renderer_uses_native_safe_dynamic_rendering(
@@ -205,7 +226,11 @@ def test_representative_renderer_uses_native_safe_dynamic_rendering(
     app = _load_dashboard_app(monkeypatch, recorder)
     recorder.markdown_kwargs.clear()
 
-    app._render_representative(state.runtime, tabs)
+    app._render_representative(
+        state.runtime,
+        tabs,
+        _scope("sensitive-call-1234"),
+    )
 
     assert not recorder.markdown_kwargs
     rendered_metrics = " ".join(
@@ -224,7 +249,7 @@ def test_representative_renderer_has_safe_empty_states(
     app = _load_dashboard_app(monkeypatch, recorder)
     recorder.infos.clear()
 
-    app._render_representative(state.runtime, tabs)
+    app._render_representative(state.runtime, tabs, _scope())
 
     assert any("Henüz kesinleşen konuşma yok" in item for item in recorder.infos)
     assert any("Henüz güncel bir niyet" in item for item in recorder.infos)
@@ -262,9 +287,91 @@ def test_representative_renderer_preserves_card_order_and_runtime_state(
     app._render_representative(
         state.runtime,
         replace(tabs, representative=representative),
+        _scope(),
     )
 
     assert recorder.writes.index("Kritik öncelik") < recorder.writes.index(
         "Yüksek öncelik"
     )
+    assert repr(state.runtime) == runtime_before
+
+
+def test_technical_renderer_is_collapsed_and_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    tabs = dashboard_tabs(state.runtime, state)
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    runtime_before = repr(state.runtime)
+    view_before = repr(tabs)
+
+    app._render_technical(tabs, _scope())
+
+    assert any("varsayılan olarak kapalıdır" in item for item in recorder.infos)
+    assert repr(state.runtime) == runtime_before
+    assert repr(tabs) == view_before
+
+
+def test_technical_renderer_hides_raw_failure_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    tabs = dashboard_tabs(state.runtime, state)
+    technical = replace(
+        tabs.technical,
+        error="PRIVATE exception C:/secret/model-cache",
+        failure_details=(
+            ("Hata kodu", "PRIVATE_EXCEPTION"),
+            ("Bileşen", "ASR"),
+        ),
+    )
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    recorder.toggle_values["Teknik ayrıntıları göster"] = True
+
+    app._render_technical(replace(tabs, technical=technical), _scope())
+
+    rendered = " ".join([*recorder.writes, *recorder.captions, *recorder.infos])
+    assert "PRIVATE" not in rendered
+    assert "secret" not in rendered
+    assert "asr_processing_failed" in rendered
+
+
+def test_representative_renderer_bounds_transcript_and_history_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.runtime.suggestion_history = [
+        replace(
+            _history_card(),
+            suggestion_id=f"history-{index}",
+            title=f"Geçmiş {index}",
+            transcript_revision=index,
+        )
+        for index in range(8)
+    ]
+    tabs = dashboard_tabs(state.runtime, state)
+    representative = replace(
+        tabs.representative,
+        transcript=replace(
+            tabs.representative.transcript,
+            stable_text="".join(str(index % 10) for index in range(7_000)),
+        ),
+    )
+    scoped_tabs = replace(tabs, representative=representative)
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    recorder.toggle_values["Önceki önerileri göster (8)"] = True
+    runtime_before = repr(state.runtime)
+
+    app._render_representative(state.runtime, scoped_tabs, _scope())
+
+    rendered = " ".join([*recorder.writes, *recorder.captions])
+    assert "Geçmiş 7" in rendered
+    assert "Geçmiş 3" in rendered
+    assert "Geçmiş 2" not in rendered
+    assert "3 eski öneri görünüm dışında" in rendered
+    assert "1000 eski karakter" in rendered
+    assert len(state.runtime.suggestion_history) == 8
     assert repr(state.runtime) == runtime_before

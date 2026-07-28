@@ -963,7 +963,7 @@ Tarih: 28 Temmuz 2026
 - Sonraki planli adim: Ayri bir gorevde operasyonel panel ve durum sunumlarini
   gelistirmek.
 
-  ## 68. Provider-Neutral Embedding-Profile Repository Contract
+## 68. Provider-Neutral Embedding-Profile Repository Contract
 
 
 Tarih: 28 Temmuz 2026
@@ -983,7 +983,54 @@ Tarih: 28 Temmuz 2026
 - Sonraki planli adim: SQL, dependencies, migrations, Docker ve deployment
   configuration ayri ve onayli gorevlere ertelendi.
 
+
 ## 69. SQL-Free PostgreSQL Vector Transaction Boundary
+
+Tarih: 28 Temmuz 2026
+
+- Gelecekteki PostgreSQL vector adapter'i icin SQL ve Psycopg tipi icermeyen,
+  runner-owned transaction/session protokolleri ve immutable backend row
+  contract'lari eklendi.
+- Embedding'ler icin deterministic IEEE-754 float32 canonicalization, metadata
+  icin ordered JSON pair-array ve cosine score/distance codec politikalari
+  eklendi.
+- Eklenen dosyalar: `app/vector_store/postgres/__init__.py`,
+  `app/vector_store/postgres/contracts.py`,
+  `app/vector_store/postgres/codecs.py`,
+  `tests/test_postgres_vector_boundary.py`; degisen dosya:
+  `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/profile 126 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
+  deployment configuration ayri ve onayli gorevlere ertelendi.
+
+## 69. Live Dashboard Operational State Hardening
+
+- Tenant, call ve source mode alanlarindan yalnizca hash tabanli deterministik UI
+  scope kimligi uretilir; scope degisiminde feedback, scoped widget ve stale
+  presentation metadata'si temizlenirken runtime ve CallState korunur.
+- Coaching feedback key'leri call scope, suggestion kimligi, revision, source ve
+  timestamp ile display sirasindan bagimsiz ve cakismaya dayanikli hale getirildi.
+- Transcript, aktif/history coaching, intent/risk timeline, ASR chart ve teknik
+  satirlar yalnizca presentation katmaninda sinirlandi; gizlenen eski oge
+  sayilari gosterilir ve runtime koleksiyonlari degistirilmez.
+- Teknik ayrintilar varsayilan olarak kapali native kontrol arkasina alindi;
+  operasyon durumu waiting/running/degraded/failed/completed sabit guvenli
+  sunumlarla gosterilir.
+- Provider exception, path veya internal hata metni yerine sabit guvenli failure
+  kategorileri render edilir.
+- Degisen dosyalar: `live_dashboard/app.py`,
+  `live_dashboard/presentation.py`, ilgili iki dashboard test dosyasi ve
+  `PROJECT_PROGRESS.md`.
+- Testler: focused live-dashboard 72 passed; full 1029 passed
+  (1 dependency warning).
+- Sonraki planli adim: Speaker-aware transcript ve timeline sunumunu ayri bir
+  gorevde mevcut diarization companion contract'i uzerinden tasarlamak.
+
+
+## 70. SQL-Free PostgreSQL Vector Transaction Boundary
 
 Tarih: 28 Temmuz 2026
 

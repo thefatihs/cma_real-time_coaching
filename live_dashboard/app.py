@@ -28,8 +28,22 @@ from live_dashboard.runtime_wiring import (  # noqa: E402
     inspect_default_artifacts,
 )
 from live_dashboard.presentation import (  # noqa: E402
+    OperationalState,
+    UIScopeIdentity,
+    VISIBLE_ACTIVE_SUGGESTIONS,
+    VISIBLE_HISTORY_SUGGESTIONS,
+    VISIBLE_TECHNICAL_ROWS,
+    VISIBLE_TIMELINE_ROWS,
+    bounded_items,
+    bounded_text_tail,
     call_status_header,
+    coaching_feedback_key,
+    operational_status,
     representative_kpis,
+    safe_failure_rows,
+    scoped_widget_key,
+    synchronize_ui_scope,
+    ui_scope_identity,
 )
 from live_dashboard.uploaded_audio import (  # noqa: E402
     SUPPORTED_UPLOAD_SUFFIXES,
@@ -159,9 +173,12 @@ def _metric_rows(items: tuple[object, ...]) -> None:
 
 
 def _render_representative(
-    runtime: DashboardRuntime, view: DashboardTabsViewModel
+    runtime: DashboardRuntime,
+    view: DashboardTabsViewModel,
+    scope: UIScopeIdentity,
 ) -> None:
     representative = view.representative
+    operation = operational_status(view)
     with st.container(border=True):
         header = call_status_header(
             view,
@@ -182,6 +199,15 @@ def _render_representative(
             strict=True,
         ):
             column.metric(label, value)
+        status_message = f"{operation.label}: {operation.detail}"
+        if operation.state is OperationalState.FAILED:
+            st.error(status_message)
+        elif operation.state is OperationalState.DEGRADED:
+            st.warning(status_message)
+        elif operation.state is OperationalState.COMPLETED:
+            st.success(status_message)
+        else:
+            st.info(status_message)
 
     kpi_columns = st.columns(4)
     for column, kpi in zip(kpi_columns, representative_kpis(view), strict=True):
@@ -197,8 +223,14 @@ def _render_representative(
         st.subheader("Canlı Transkript")
         with st.container(height=420, border=True):
             if transcript.stable_text:
+                stable_tail = bounded_text_tail(transcript.stable_text)
                 st.caption("KESİNLEŞEN KONUŞMA")
-                st.write(transcript.stable_text)
+                st.write(stable_tail.visible_text)
+                if stable_tail.hidden_character_count:
+                    st.caption(
+                        f"{stable_tail.hidden_character_count} eski karakter "
+                        "görünüm dışında; tam metin oturumda korunuyor."
+                    )
             else:
                 st.info(
                     "Henüz kesinleşen konuşma yok. Ses işleme başladığında "
@@ -207,7 +239,13 @@ def _render_representative(
             st.divider()
             st.caption("SON BÖLÜM · DEĞİŞEBİLİR")
             if transcript.partial_text:
-                st.write(transcript.partial_text)
+                partial_tail = bounded_text_tail(transcript.partial_text)
+                st.write(partial_tail.visible_text)
+                if partial_tail.hidden_character_count:
+                    st.caption(
+                        f"{partial_tail.hidden_character_count} eski karakter "
+                        "görünüm dışında."
+                    )
             else:
                 st.caption("Henüz kısmi metin yok.")
             st.caption(f"Son olay türü: {transcript.latest_event_type}")
@@ -218,16 +256,19 @@ def _render_representative(
             st.info("Henüz güncel bir niyet veya risk tespit edilmedi.")
         for chip in representative.intent_chips:
             st.write(f"{chip.symbol} {chip.text}")
-        feedback = st.session_state.setdefault("suggestion_feedback", {})
-        for message in representative.safe_messages:
-            st.warning(message)
+        stored_feedback = st.session_state.get("suggestion_feedback", {})
+        feedback = stored_feedback if isinstance(stored_feedback, dict) else {}
         if not representative.active_suggestions:
             st.info(
                 "Şu anda aktif bir koçluk önerisi yok. Yeni bir sinyal "
                 "oluştuğunda öneri burada görünecek."
             )
-        for index, card in enumerate(representative.active_suggestions):
-            key = f"{card.timestamp}-{card.title}-{index}"
+        active = bounded_items(
+            representative.active_suggestions,
+            limit=VISIBLE_ACTIVE_SUGGESTIONS,
+        )
+        for card in active.visible_items:
+            key = coaching_feedback_key(scope, card)
             with st.container(border=True):
                 st.caption(f"{card.priority_symbol} {card.priority_text}")
                 st.write(card.title)
@@ -243,29 +284,63 @@ def _render_representative(
                     details.append(f"Etiket: {card.related_label}")
                 st.caption(" · ".join(details))
                 for column, value in zip(
-                    st.columns(3), ("Görüldü", "Uygulandı", "Uygun değil"), strict=True
+                    st.columns(3),
+                    ("Görüldü", "Uygulandı", "Uygun değil"),
+                    strict=True,
                 ):
-                    if column.button(value, key=f"feedback-{key}-{value}"):
+                    if column.button(value, key=f"{key}-{value}"):
                         feedback = apply_feedback(feedback, key, value)
                         st.session_state.suggestion_feedback = feedback
                 if key in feedback:
                     st.caption(f"Geri bildirim: {feedback[key]}")
-        suggestion_history = getattr(representative, "suggestion_history", ())
-        if suggestion_history:
-            st.caption("Önceki Öneriler")
-            for card in suggestion_history:
+        if active.hidden_item_count:
+            st.caption(f"{active.hidden_item_count} ek aktif öneri görünüm dışında.")
+        history_items = representative.suggestion_history
+        if history_items and st.toggle(
+            f"Önceki önerileri göster ({len(history_items)})",
+            value=False,
+            key=scoped_widget_key(scope, "representative_history_visible"),
+        ):
+            history = bounded_items(
+                history_items,
+                limit=VISIBLE_HISTORY_SUGGESTIONS,
+            )
+            for card in history.visible_items:
                 st.caption(
                     f"{card.priority_symbol} {card.title} · "
                     f"{card.related_label or '—'} · Revizyon "
                     f"{card.transcript_revision if card.transcript_revision is not None else '—'}"
                 )
+            if history.hidden_item_count:
+                st.caption(f"{history.hidden_item_count} eski öneri görünüm dışında.")
         if representative.detected_intent_chips:
             with st.expander("Görüşmede tespit edilenler", expanded=False):
-                for chip in representative.detected_intent_chips:
+                detected = bounded_items(
+                    representative.detected_intent_chips,
+                    limit=VISIBLE_TIMELINE_ROWS,
+                    newest=True,
+                )
+                for chip in detected.visible_items:
                     st.write(f"{chip.symbol} {chip.text}")
+                if detected.hidden_item_count:
+                    st.caption(
+                        f"{detected.hidden_item_count} eski tespit görünüm dışında."
+                    )
 
 
-def _render_technical(view: DashboardTabsViewModel) -> None:
+def _render_technical(
+    view: DashboardTabsViewModel,
+    scope: UIScopeIdentity,
+) -> None:
+    operation = operational_status(view)
+    st.caption(f"Operasyon durumu: {operation.label}")
+    if not st.toggle(
+        "Teknik ayrıntıları göster",
+        value=False,
+        key=scoped_widget_key(scope, "technical_details_visible"),
+    ):
+        st.info("Teknik izleme ayrıntıları varsayılan olarak kapalıdır.")
+        return
     technical = view.technical
     progress = technical.progress
     metrics = (
@@ -284,9 +359,9 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         for column, (label, value) in zip(columns, row, strict=True):
             column.metric(label, value)
     if technical.warning:
-        st.warning(technical.warning)
+        st.warning("Yerel CPU işleme süresi gerçek zaman hızını aşabilir.")
     if technical.error:
-        st.error(technical.error)
+        st.error("Ses işleme güvenli biçimde tamamlanamadı.")
     st.subheader("Gecikme Dağılımı")
     latency = technical.latency
     if latency:
@@ -303,7 +378,14 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
                 column.metric(label, f"{value:.0f} ms")
     st.subheader("Parça Bazında ASR Süresi")
     if technical.asr_chart:
-        st.line_chart({"ASR (ms)": [value for _, value in technical.asr_chart]})
+        chart = bounded_items(
+            technical.asr_chart,
+            limit=VISIBLE_TECHNICAL_ROWS,
+            newest=True,
+        )
+        st.line_chart({"ASR (ms)": [value for _, value in chart.visible_items]})
+        if chart.hidden_item_count:
+            st.caption(f"{chart.hidden_item_count} eski ASR ölçümü grafiğin dışında.")
     else:
         st.caption("Grafik için henüz ASR ölçümü yok.")
     st.subheader("Pipeline Durumu")
@@ -318,8 +400,16 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         st.write(f"**{component}:** {translations[status]}")
     if technical.classification_metadata:
         st.subheader("Sınıflandırma")
-        for label, value in technical.classification_metadata:
+        metadata_rows = bounded_items(
+            technical.classification_metadata,
+            limit=VISIBLE_TECHNICAL_ROWS,
+        )
+        for label, value in metadata_rows.visible_items:
             st.write(f"**{label}:** {value}")
+        if metadata_rows.hidden_item_count:
+            st.caption(
+                f"{metadata_rows.hidden_item_count} teknik satır görünüm dışında."
+            )
         st.write(
             "**Şu Anki Etiketler:** " + (", ".join(technical.current_labels) or "—")
         )
@@ -329,40 +419,65 @@ def _render_technical(view: DashboardTabsViewModel) -> None:
         )
     if technical.probabilities:
         st.caption("Geçici etiket olasılıkları")
-        for label, value in technical.probabilities:
+        probability_rows = bounded_items(
+            technical.probabilities,
+            limit=VISIBLE_TECHNICAL_ROWS,
+        )
+        for label, value in probability_rows.visible_items:
             st.write(f"{label}: {value:.3f}")
     if technical.revision_label_timeline:
         st.subheader("Revizyon Etiket Tanısı")
-        for diagnostic in technical.revision_label_timeline:
+        diagnostics = bounded_items(
+            technical.revision_label_timeline,
+            limit=VISIBLE_TIMELINE_ROWS,
+            newest=True,
+        )
+        for diagnostic in diagnostics.visible_items:
             current = ", ".join(diagnostic.current_labels) or "—"
             newly = ", ".join(diagnostic.newly_accumulated_labels) or "—"
             st.write(
                 f"**Revizyon {diagnostic.transcript_revision}:** "
                 f"güncel={current} · yeni={newly}"
             )
-            for evidence in diagnostic.evidence:
+            evidence_rows = bounded_items(
+                diagnostic.evidence,
+                limit=VISIBLE_TECHNICAL_ROWS,
+            )
+            for evidence in evidence_rows.visible_items:
                 details = [evidence.source.value]
                 if evidence.model_id:
                     details.append(f"model={evidence.model_id}")
                 if evidence.threshold_profile_id:
                     details.append(f"profile={evidence.threshold_profile_id}")
                 st.caption(f"{evidence.label}: " + " · ".join(details))
+        if diagnostics.hidden_item_count:
+            st.caption(
+                f"{diagnostics.hidden_item_count} eski revizyon görünüm dışında."
+            )
     if technical.suggestion_decisions:
         st.subheader("Öneri Kapasite Kararları")
-        for decision in technical.suggestion_decisions:
+        decisions = bounded_items(
+            technical.suggestion_decisions,
+            limit=VISIBLE_TIMELINE_ROWS,
+            newest=True,
+        )
+        for decision in decisions.visible_items:
             st.write(
                 f"Revizyon {decision.transcript_revision} · "
                 f"{decision.label_id or '—'} · {decision.priority.value} · "
                 f"{decision.reason} · "
                 f"geçmişe taşındı={decision.moved_to_history}"
             )
+        if decisions.hidden_item_count:
+            st.caption(f"{decisions.hidden_item_count} eski karar görünüm dışında.")
     if technical.coaching_metadata:
         st.subheader("Koçluk")
         for label, value in technical.coaching_metadata:
             st.write(f"**{label}:** {value}")
-    if technical.failure_details:
+    failures = safe_failure_rows(view)
+    if failures:
         st.subheader("Güvenli Hata Tanısı")
-        for label, value in technical.failure_details:
+        for label, value in failures:
             st.write(f"**{label}:** {value}")
 
 
@@ -372,7 +487,18 @@ def _render_result(runtime: DashboardRuntime, view: DashboardTabsViewModel) -> N
         st.info(result.waiting_message)
         return
     st.subheader("Final Kümülatif Transkript")
-    st.write(result.final_transcript or "Final transkript oluşmadı.")
+    final_tail = (
+        bounded_text_tail(result.final_transcript) if result.final_transcript else None
+    )
+    st.write(
+        final_tail.visible_text
+        if final_tail is not None
+        else "Final transkript oluşmadı."
+    )
+    if final_tail is not None and final_tail.hidden_character_count:
+        st.caption(
+            f"{final_tail.hidden_character_count} eski karakter görünüm dışında."
+        )
     _metric_rows(result.metrics)
     st.write(f"**Model:** {result.model_name} · **Dil:** {result.language}")
     if result.detected_labels:
@@ -381,8 +507,17 @@ def _render_result(runtime: DashboardRuntime, view: DashboardTabsViewModel) -> N
             + ", ".join(chip.text for chip in result.detected_labels)
         )
     st.write(f"**Bastırılan öneri:** {result.suppressed_count}")
-    for item in result.suggestion_timeline:
+    timeline = bounded_items(
+        result.suggestion_timeline,
+        limit=VISIBLE_TIMELINE_ROWS,
+        newest=True,
+    )
+    for item in timeline.visible_items:
         st.write(f"`{item.timestamp:%H:%M:%S}` {item.detail}")
+    if timeline.hidden_item_count:
+        st.caption(
+            f"{timeline.hidden_item_count} eski zaman çizelgesi satırı görünüm dışında."
+        )
     for label, value in result.audio_metadata:
         st.caption(f"{label}: {value}")
     if result.final_transcript:
@@ -398,15 +533,16 @@ def _render_dashboard(
     runtime: DashboardRuntime,
     local_state: LocalExecutionState | None,
     metadata: SafeUploadMetadata | None,
+    scope: UIScopeIdentity,
 ) -> None:
     view = dashboard_tabs(runtime, local_state, metadata)
     representative, technical, result = st.tabs(
         ("Temsilci Görünümü", "Teknik İzleme", "Görüşme Sonucu")
     )
     with representative:
-        _render_representative(runtime, view)
+        _render_representative(runtime, view, scope)
     with technical:
-        _render_technical(view)
+        _render_technical(view, scope)
     with result:
         _render_result(runtime, view)
 
@@ -423,6 +559,7 @@ upload_session = st.session_state.setdefault(
     "uploaded_audio_session", UploadedAudioSession()
 )
 local_state_for_render: LocalExecutionState | None = None
+ui_scope: UIScopeIdentity | None = None
 with st.sidebar:
     st.header("Kontroller")
     with st.expander("Görüşme", expanded=True):
@@ -437,6 +574,12 @@ with st.sidebar:
     with st.expander("Ses Kaynağı", expanded=True):
         if mode == "Sentetik Demo":
             source_mode = "Sentetik demo"
+            ui_scope = ui_scope_identity(
+                tenant_id=tenant_id,
+                call_id=str(st.session_state.call_id),
+                source_mode=source_mode,
+            )
+            synchronize_ui_scope(st.session_state, ui_scope)
             scenarios = {
                 item.scenario_id: item.name for item in demos[tenant_id].scenarios
             }
@@ -451,6 +594,12 @@ with st.sidebar:
             source_mode = st.radio(
                 "Ses kaynağı", ("Dosya yükle", "Yerel yol"), horizontal=True
             )
+            ui_scope = ui_scope_identity(
+                tenant_id=tenant_id,
+                call_id=str(st.session_state.call_id),
+                source_mode=source_mode,
+            )
+            synchronize_ui_scope(st.session_state, ui_scope)
             if source_mode == "Dosya yükle":
                 uploaded = st.file_uploader(
                     "Ses dosyası",
@@ -614,6 +763,9 @@ with st.sidebar:
 
 st.title("Canlı Koçluk Paneli")
 st.caption("Temsilci desteği ve güvenli teknik izleme")
+if ui_scope is None:
+    raise RuntimeError("Dashboard UI scope was not initialized")
+active_ui_scope = ui_scope
 if mode == "Sentetik Demo":
     runtime = _synthetic_runtime()
     interval = (
@@ -629,7 +781,7 @@ if mode == "Sentetik Demo":
             advance_runtime(current)
             if current.complete:
                 st.session_state.playing = False
-        _render_dashboard(current, None, None)
+        _render_dashboard(current, None, None, active_ui_scope)
 
     live_area()
 else:
@@ -640,4 +792,5 @@ else:
         local_state_for_render.runtime,
         local_state_for_render,
         safe_metadata,
+        active_ui_scope,
     )
