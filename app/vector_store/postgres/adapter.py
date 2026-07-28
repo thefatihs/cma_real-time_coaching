@@ -44,6 +44,34 @@ class ProfileBoundPostgreSQLVectorStore:
         self._expected_profile_signature = profile_signature
         self._transaction_runner = transaction_runner
 
+    def upsert(self, record: VectorRecord) -> None:
+        canonical_row = _canonical_record_row(
+            record,
+            expected_profile=self._expected_profile,
+        )
+
+        def replace(transaction: PostgreSQLVectorTransaction) -> None:
+            tenant_id = self._expected_profile.tenant_id
+            knowledge_base_id = self._expected_profile.knowledge_base_id
+            transaction.acquire_scope_lock(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+            )
+            stored_profile = transaction.get_profile(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                for_update=True,
+            )
+            if stored_profile is None:
+                raise ValueError("embedding profile is not registered")
+            if _profile_signature(stored_profile) != self._expected_profile_signature:
+                raise ValueError(
+                    "stored embedding profile conflicts with expected profile"
+                )
+            transaction.replace_record(canonical_row)
+
+        self._transaction_runner.run_in_transaction(replace)
+
     def admit_batch(
         self,
         request: VectorBatchWriteRequest,
