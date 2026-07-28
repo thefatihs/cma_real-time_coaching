@@ -963,8 +963,7 @@ Tarih: 28 Temmuz 2026
 - Sonraki planli adim: Ayri bir gorevde operasyonel panel ve durum sunumlarini
   gelistirmek.
 
-<<<<<<< HEAD
-  ## 68. Provider-Neutral Embedding-Profile Repository Contract
+## 68. Provider-Neutral Embedding-Profile Repository Contract
 
 
 Tarih: 28 Temmuz 2026
@@ -983,8 +982,7 @@ Tarih: 28 Temmuz 2026
   asamasinda durdu.
 - Sonraki planli adim: SQL, dependencies, migrations, Docker ve deployment
   configuration ayri ve onayli gorevlere ertelendi.
-=======
-## 68. Live Dashboard Operational State Hardening
+## 69. Live Dashboard Operational State Hardening
 
 - Tenant, call ve source mode alanlarindan yalnizca hash tabanli deterministik UI
   scope kimligi uretilir; scope degisiminde feedback, scoped widget ve stale
@@ -1006,4 +1004,3 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning).
 - Sonraki planli adim: Speaker-aware transcript ve timeline sunumunu ayri bir
   gorevde mevcut diarization companion contract'i uzerinden tasarlamak.
->>>>>>> fatih
