@@ -173,3 +173,32 @@ Tarih: 28 Temmuz 2026
   script passed ve conflict-marker testleri 5 passed.
 - Sonraki planli adim: migration/schema readiness ve explicit profile
   provisioning ayri ve onayli PR38 kapsaminda ele alinacak.
+
+## PR38 - PostgreSQL Schema Readiness
+
+Tarih: 28 Temmuz 2026
+
+- Side-effect-free constructor ve explicit `verify()` operation'i kullanan
+  `PostgreSQLSchemaReadinessChecker` eklendi.
+- Read-only transaction icinde exact pgvector `0.8.5`, fixed
+  `callmetric_vector` schema, `0001` migration ledger kaydi, gerekli tablolar,
+  kolonlar ve named constraint subset'leri fail-closed dogrulanir.
+- Profile provisioning composition sirasinda otomatik yapilmaz; mevcut
+  `composition.profile_repository.register_profile(composition.profile)`
+  operation'i missing profile insert ve identical repeated registration icin
+  explicit ve idempotent kalir.
+- Gercek Docker PostgreSQL/pgvector integration testleri: 10 passed.
+- Integration runner'a ait project-scoped container, network ve volume
+  basariyla kaldirildi ve cleanup dogrulandi.
+- Degisen dosyalar: `app/vector_store/postgres/__init__.py`,
+  `tests/test_postgres_embedding_profile_repository.py`,
+  `tests/test_postgres_vector_boundary.py`,
+  `tests/integration/test_postgres_vector_integration.py`,
+  `docs/progress/beyza.md`; eklenen dosyalar:
+  `app/vector_store/postgres/readiness.py`,
+  `tests/test_postgres_schema_readiness.py`.
+- Focused readiness/profile/migration/PostgreSQL unit testleri: 401 passed.
+- Full suite 1504 test toplarken mevcut Torch `c10.dll` WinError 1114 nedeniyle
+  dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
+- Sonraki planli adim: deployment/runtime readiness invocation'i ayri ve
+  ownership-onayli bir PR kapsaminda ele alinacak.

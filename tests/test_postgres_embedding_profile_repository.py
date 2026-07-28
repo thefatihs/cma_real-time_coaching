@@ -468,6 +468,7 @@ def test_new_export_preserves_existing_postgres_exports() -> None:
     )
     assert set(postgres.__all__) == {
         "PostgreSQLCosineSearchRow",
+        "PostgreSQLSchemaReadinessChecker",
         "PostgreSQLStoredVectorRow",
         "PostgreSQLVectorTransaction",
         "PostgreSQLVectorTransactionRunner",

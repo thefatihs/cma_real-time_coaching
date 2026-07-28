@@ -20,9 +20,13 @@ from app.vector_store.postgres.contracts import (
 from app.vector_store.postgres.profile_repository import (
     PostgreSQLEmbeddingProfileRepository as PostgreSQLEmbeddingProfileRepository,
 )
+from app.vector_store.postgres.readiness import (
+    PostgreSQLSchemaReadinessChecker as PostgreSQLSchemaReadinessChecker,
+)
 
 __all__ = [
     "PostgreSQLCosineSearchRow",
+    "PostgreSQLSchemaReadinessChecker",
     "PostgreSQLStoredVectorRow",
     "PostgreSQLVectorTransaction",
     "PostgreSQLVectorTransactionRunner",
