@@ -122,3 +122,26 @@ Tarih: 28 Temmuz 2026
   conflict-marker testleri 5 passed.
 - Sonraki planli adim: gercek PostgreSQL/Docker integration'i ayri ve onayli
   PR36 kapsaminda ele alinacak.
+
+## PR36 - Docker-backed PostgreSQL/pgvector Integration
+
+Tarih: 28 Temmuz 2026
+
+- Docker 29.6.2 ve Docker Compose v5.3.1 ile
+  `pgvector/pgvector:0.8.5-pg16-bookworm` image'i kullanildi.
+- Checked-in `migrations/postgres/0001_vector_store.sql` fresh ve izole test
+  database'ine basariyla uygulandi.
+- Profile repository, profile-bound vector store, atomic batch, upsert, cosine
+  search, rollback, scope isolation ve bounded advisory-lock davranisini
+  kapsayan gercek PostgreSQL integration testleri: 9 passed.
+- Unique Compose project'ine ait container, network ve volume runner tarafindan
+  basariyla kaldirildi; cleanup sonrasinda PR36 kaynagi kalmadigi dogrulandi.
+- Degisen dosyalar: `pyproject.toml`, `docs/progress/beyza.md`; eklenen
+  dosyalar: `compose.postgres-integration.yml`,
+  `scripts/run_postgres_integration.py`,
+  `tests/integration/test_postgres_vector_integration.py`.
+- Docker-disindaki full suite onceki kosuda 1423 test toplarken bilinen Torch
+  `c10.dll` WinError 1114 nedeniyle dort ASR/CLI/offline-evaluation testinin
+  collection asamasinda durdu; 9 integration testi opt-in olarak dislandi.
+- Sonraki planli adim: production runtime configuration ve wiring ayri ve
+  onayli PR37 kapsaminda ele alinacak.

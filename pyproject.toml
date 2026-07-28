@@ -29,3 +29,8 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.15.22",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "postgres_integration: requires the opt-in Docker PostgreSQL integration runner",
+]
