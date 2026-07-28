@@ -8,6 +8,12 @@ from app.diarization.alignment import (
     align_words_to_speakers,
 )
 from app.diarization.fake_backend import FakeSpeakerDiarizer
+from app.diarization.identity_tracker import (
+    SpeakerIdentityTracker,
+    SpeakerIdentityTrackingError,
+    SpeakerIdentityTrackingErrorCategory,
+    SpeakerIdentityTrackingRequest,
+)
 from app.diarization.models import (
     DiarizationRequest,
     DiarizationResult,
@@ -36,6 +42,10 @@ __all__ = [
     "PyannoteDiarizationErrorCategory",
     "PyannoteSpeakerDiarizer",
     "SpeakerDiarizerProtocol",
+    "SpeakerIdentityTracker",
+    "SpeakerIdentityTrackingError",
+    "SpeakerIdentityTrackingErrorCategory",
+    "SpeakerIdentityTrackingRequest",
     "SpeakerRole",
     "UNKNOWN_LOCAL_SPEAKER_ID",
     "WordAlignmentError",

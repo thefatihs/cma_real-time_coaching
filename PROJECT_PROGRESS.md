@@ -1046,3 +1046,22 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Streaming wiring, role resolution ve global speaker
   tracking ayri ve onayli gorevlere ertelendi.
+
+## 72. Deterministic Call-Scoped Speaker Identity Tracking
+
+- Ardışık rolling-window diarization turn'leri icin tenant/call izole,
+  deterministic ve bounded global speaker tracker eklendi.
+- Window-local speaker adlari guvenilmeden toplam pozitif absolute-time overlap
+  ile one-to-one eslestirme yapilir; esitlikler global creation order ve lexical
+  local speaker kimligiyle cozulur.
+- Yeni konusmacilar call-scoped monotonik `CALL_SPEAKER_0001` kimlikleri alir;
+  OVERLAP turn'leri tum eslesen immutable global kimlikleri korur.
+- Exact window tekrar islemesi idempotenttir; fail-closed scope/window/turn
+  dogrulamasi ve yalnizca exact call state'ini silen reset contract'i eklendi.
+- Degisen/eklenen dosyalar: `app/diarization/identity_tracker.py`,
+  `app/diarization/models.py`, `app/diarization/__init__.py`,
+  `tests/test_diarization_identity_tracker.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 94 passed; full 1154 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Role resolution, speaker embedding ve streaming wiring
+  ayri ve onayli gorevlere ertelendi.
