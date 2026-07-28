@@ -902,3 +902,24 @@ Tarih: 27 Temmuz 2026
 - Sonraki planli adim: Backend'i ayri bir gorevde window-to-diarization
   orchestration sinirina baglamadan once overlap ve gercek ses
   degerlendirmesini tasarlamak.
+
+## 65. Deterministik Trusted-Text Document Chunking
+
+Tarih: 28 Temmuz 2026
+
+- Immutable trusted-text source contract'i ve provider-neutral document chunker
+  protokolu eklendi.
+- Fixed-character chunking Python Unicode code-point pencerelerini kullanir;
+  mevcut `DocumentChunkInput` canonical-normalized text politikasini izler ve
+  exact source reconstruction iddiasi tasimaz.
+- Whitespace-only pencereler atlanir; emitted chunk'lar kaynak sirasinda,
+  bitisik `chunk_000001` ordinal kimlikleriyle ve tam normalize metadata ile
+  uretilir.
+- Eklenen dosyalar: `app/ingestion/document_source.py`,
+  `app/ingestion/chunking.py`, `tests/test_document_chunking.py`; degisen
+  dosyalar: `app/ingestion/__init__.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused chunking/ingestion 71 passed; full suite mevcut Torch
+  `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection asamasinda
+  durdu.
+- Sonraki planli adim: Loader, persistence ve runtime composition calismalari
+  ayri ve onayli gorevlere ertelendi.
