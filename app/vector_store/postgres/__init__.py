@@ -1,5 +1,8 @@
 """SQL-free PostgreSQL vector boundary contracts and codecs."""
 
+from app.vector_store.postgres.adapter import (
+    ProfileBoundPostgreSQLVectorStore as ProfileBoundPostgreSQLVectorStore,
+)
 from app.vector_store.postgres.codecs import (
     canonicalize_float32_embedding,
     cosine_distance_to_relevance,
@@ -23,6 +26,7 @@ __all__ = [
     "PostgreSQLStoredVectorRow",
     "PostgreSQLVectorTransaction",
     "PostgreSQLVectorTransactionRunner",
+    "ProfileBoundPostgreSQLVectorStore",
     "canonicalize_float32_embedding",
     "cosine_distance_to_relevance",
     "cosine_minimum_score_to_maximum_distance",
