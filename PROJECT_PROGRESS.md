@@ -1234,3 +1234,22 @@ Tarih: 28 Temmuz 2026
 - Kalite: scoped Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Adapter, SQL, Psycopg ve Docker ayri ve onayli gorevlere
   ertelendi.
+
+## 80. SQL-Free PostgreSQL Embedding-Profile Repository
+
+Tarih: 28 Temmuz 2026
+
+- Mevcut transaction runner/session contract'lari uzerinde SQL-free PostgreSQL
+  embedding-profile repository domain implementation'i eklendi.
+- Registration islemi scope lock, `for_update=True` profile read ve yalnizca
+  eksik profil icin insert sirasini izler; equal profil exact canonical object
+  olarak doner ve conflicting profil state degistirmeden reddedilir.
+- Eklenen dosyalar: `app/vector_store/postgres/profile_repository.py`,
+  `tests/test_postgres_embedding_profile_repository.py`; degisen dosyalar:
+  `app/vector_store/postgres/__init__.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL profile/boundary 163 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle dort ASR/CLI/offline-evaluation
+  testinin collection asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, batch, upsert, search, SQL, Psycopg ve Docker
+  ayri ve onayli gorevlere ertelendi.
