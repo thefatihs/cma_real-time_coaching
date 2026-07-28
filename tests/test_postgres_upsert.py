@@ -481,10 +481,26 @@ def test_admit_batch_behavior_remains_available_and_unchanged() -> None:
     ]
 
 
-def test_partial_adapter_has_no_search_and_is_not_exported() -> None:
+def test_completed_adapter_has_search_and_postgres_package_export() -> None:
+    import app.vector_store as vector_store
     import app.vector_store.postgres as postgres
 
-    concrete, _, _ = store()
+    concrete, _, transaction = store()
+    candidate = record()
 
-    assert not hasattr(concrete, "search")
-    assert "ProfileBoundPostgreSQLVectorStore" not in postgres.__all__
+    concrete.upsert(candidate)
+
+    assert callable(concrete.search)
+    assert (
+        transaction.rows[
+            (
+                "tenant_synthetic",
+                "kb_synthetic",
+                "document_synthetic",
+                "chunk_synthetic",
+            )
+        ].text
+        == candidate.text
+    )
+    assert postgres.ProfileBoundPostgreSQLVectorStore is type(concrete)
+    assert not hasattr(vector_store, "ProfileBoundPostgreSQLVectorStore")

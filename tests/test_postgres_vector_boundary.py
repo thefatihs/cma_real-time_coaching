@@ -596,6 +596,7 @@ def test_postgres_package_exports_are_exact() -> None:
         "PostgreSQLStoredVectorRow",
         "PostgreSQLVectorTransaction",
         "PostgreSQLVectorTransactionRunner",
+        "ProfileBoundPostgreSQLVectorStore",
         "canonicalize_float32_embedding",
         "cosine_distance_to_relevance",
         "cosine_minimum_score_to_maximum_distance",

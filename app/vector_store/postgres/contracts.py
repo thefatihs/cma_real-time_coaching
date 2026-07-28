@@ -105,7 +105,16 @@ class PostgreSQLVectorTransaction(Protocol):
         query_embedding: tuple[float, ...],
         top_k: int,
         maximum_cosine_distance: float,
-    ) -> tuple[PostgreSQLCosineSearchRow, ...]: ...
+    ) -> tuple[PostgreSQLCosineSearchRow, ...]:
+        """Return deterministic complete rows for one scoped cosine search.
+
+        The operation is read-only inside the current runner-owned transaction.
+        Implementations enforce exact tenant and knowledge-base scope, apply the
+        supplied query, distance threshold and top_k, and return complete rows
+        ordered by distance then document and chunk identity. They must not
+        manage transaction lifecycle independently.
+        """
+        ...
 
 
 T = TypeVar("T")

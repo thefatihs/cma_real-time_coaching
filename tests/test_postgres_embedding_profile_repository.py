@@ -471,6 +471,7 @@ def test_new_export_preserves_existing_postgres_exports() -> None:
         "PostgreSQLStoredVectorRow",
         "PostgreSQLVectorTransaction",
         "PostgreSQLVectorTransactionRunner",
+        "ProfileBoundPostgreSQLVectorStore",
         "canonicalize_float32_embedding",
         "cosine_distance_to_relevance",
         "cosine_minimum_score_to_maximum_distance",

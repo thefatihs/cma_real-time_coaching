@@ -5,17 +5,24 @@ from app.vector_store.embedding_profile import (
     KnowledgeBaseEmbeddingProfile,
 )
 from app.vector_store.models import (
+    SearchRequest,
+    SearchResult,
     VectorBatchWriteRequest,
     VectorBatchWriteResult,
     VectorRecord,
     VectorRecordIdentity,
+    VectorSearchHit,
 )
 from app.vector_store.postgres.codecs import (
     canonicalize_float32_embedding,
+    cosine_distance_to_relevance,
+    cosine_minimum_score_to_maximum_distance,
     decode_ordered_metadata,
     encode_ordered_metadata,
+    order_cosine_search_rows,
 )
 from app.vector_store.postgres.contracts import (
+    PostgreSQLCosineSearchRow,
     PostgreSQLStoredVectorRow,
     PostgreSQLVectorTransaction,
     PostgreSQLVectorTransactionRunner,
@@ -71,6 +78,54 @@ class ProfileBoundPostgreSQLVectorStore:
             transaction.replace_record(canonical_row)
 
         self._transaction_runner.run_in_transaction(replace)
+
+    def search(self, request: SearchRequest) -> SearchResult:
+        (
+            tenant_id,
+            knowledge_base_id,
+            query_embedding,
+            top_k,
+            minimum_score,
+            maximum_cosine_distance,
+        ) = _canonical_search_arguments(
+            request,
+            expected_profile=self._expected_profile,
+        )
+
+        def search_transaction(
+            transaction: PostgreSQLVectorTransaction,
+        ) -> SearchResult:
+            stored_profile = transaction.get_profile(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                for_update=False,
+            )
+            if stored_profile is None:
+                raise ValueError("embedding profile is not registered")
+            if _profile_signature(stored_profile) != self._expected_profile_signature:
+                raise ValueError(
+                    "stored embedding profile conflicts with expected profile"
+                )
+            rows = transaction.search_cosine(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                query_embedding=query_embedding,
+                top_k=top_k,
+                maximum_cosine_distance=maximum_cosine_distance,
+            )
+            hits = _validated_search_hits(
+                rows,
+                expected_profile=self._expected_profile,
+                top_k=top_k,
+                minimum_score=minimum_score,
+            )
+            return SearchResult(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                hits=hits,
+            )
+
+        return self._transaction_runner.run_in_transaction(search_transaction)
 
     def admit_batch(
         self,
@@ -156,6 +211,121 @@ class ProfileBoundPostgreSQLVectorStore:
             )
 
         return self._transaction_runner.run_in_transaction(admit)
+
+
+def _canonical_search_arguments(
+    request: object,
+    *,
+    expected_profile: KnowledgeBaseEmbeddingProfile,
+) -> tuple[str, str, tuple[float, ...], int, float, float]:
+    if not isinstance(request, SearchRequest):
+        raise ValueError("request must be a SearchRequest")
+    try:
+        tenant_id = _canonical_text(request.tenant_id, "request tenant_id")
+        knowledge_base_id = _canonical_text(
+            request.knowledge_base_id,
+            "request knowledge_base_id",
+        )
+        raw_query_embedding = request.query_embedding
+        top_k = request.top_k
+        raw_minimum_score = request.minimum_score
+    except AttributeError as error:
+        raise ValueError("search request is malformed") from error
+    if tenant_id != expected_profile.tenant_id:
+        raise ValueError("request tenant_id does not match expected profile")
+    if knowledge_base_id != expected_profile.knowledge_base_id:
+        raise ValueError("request knowledge_base_id does not match expected profile")
+    if type(top_k) is not int or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    maximum_cosine_distance = cosine_minimum_score_to_maximum_distance(
+        raw_minimum_score
+    )
+    minimum_score = float(raw_minimum_score)
+    query_embedding = canonicalize_float32_embedding(
+        raw_query_embedding,
+        expected_dimension=expected_profile.vector_dimension,
+    )
+    return (
+        tenant_id,
+        knowledge_base_id,
+        query_embedding,
+        top_k,
+        minimum_score,
+        maximum_cosine_distance,
+    )
+
+
+def _validated_search_hits(
+    rows: object,
+    *,
+    expected_profile: KnowledgeBaseEmbeddingProfile,
+    top_k: int,
+    minimum_score: float,
+) -> tuple[VectorSearchHit, ...]:
+    if not isinstance(rows, tuple):
+        raise ValueError("PostgreSQL cosine search rows must be a tuple")
+
+    metadata_by_identity: dict[RecordIdentityKey, tuple[tuple[str, str], ...]] = {}
+    identities: set[RecordIdentityKey] = set()
+    for row in rows:
+        if not isinstance(row, PostgreSQLCosineSearchRow):
+            raise ValueError("PostgreSQL cosine search row is malformed")
+        tenant_id = _canonical_text(row.tenant_id, "search row tenant_id")
+        knowledge_base_id = _canonical_text(
+            row.knowledge_base_id,
+            "search row knowledge_base_id",
+        )
+        if tenant_id != expected_profile.tenant_id:
+            raise ValueError("search row tenant_id does not match expected profile")
+        if knowledge_base_id != expected_profile.knowledge_base_id:
+            raise ValueError(
+                "search row knowledge_base_id does not match expected profile"
+            )
+        document_id = _canonical_text(row.document_id, "search row document_id")
+        chunk_id = _canonical_text(row.chunk_id, "search row chunk_id")
+        _canonical_text(row.text, "search row text")
+        embedding = canonicalize_float32_embedding(
+            row.embedding,
+            expected_dimension=expected_profile.vector_dimension,
+        )
+        if (
+            not isinstance(row.embedding, tuple)
+            or any(type(value) is not float for value in row.embedding)
+            or embedding != row.embedding
+        ):
+            raise ValueError("search row embedding is not canonical float32")
+        metadata = decode_ordered_metadata(row.metadata_json)
+        cosine_distance_to_relevance(row.cosine_distance)
+        identity = (document_id, chunk_id)
+        if identity in identities:
+            raise ValueError("PostgreSQL cosine search row identities must be unique")
+        identities.add(identity)
+        metadata_by_identity[identity] = metadata
+
+    if len(rows) > top_k:
+        raise ValueError("PostgreSQL cosine search returned more than top_k rows")
+
+    hits: list[VectorSearchHit] = []
+    for row in order_cosine_search_rows(rows):
+        score = cosine_distance_to_relevance(row.cosine_distance)
+        if score < minimum_score:
+            continue
+        identity = (row.document_id, row.chunk_id)
+        hits.append(
+            VectorSearchHit(
+                record=VectorRecord(
+                    tenant_id=row.tenant_id,
+                    knowledge_base_id=row.knowledge_base_id,
+                    document_id=row.document_id,
+                    chunk_id=row.chunk_id,
+                    text=row.text,
+                    embedding=row.embedding,
+                    metadata=metadata_by_identity[identity],
+                ),
+                score=score,
+            )
+        )
+    return tuple(hits)
 
 
 def _canonical_batch_rows(
