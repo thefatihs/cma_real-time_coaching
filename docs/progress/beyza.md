@@ -145,3 +145,31 @@ Tarih: 28 Temmuz 2026
   collection asamasinda durdu; 9 integration testi opt-in olarak dislandi.
 - Sonraki planli adim: production runtime configuration ve wiring ayri ve
   onayli PR37 kapsaminda ele alinacak.
+
+## PR37 - Production PostgreSQL RAG Composition
+
+Tarih: 28 Temmuz 2026
+
+- SecretStr DSN, bounded connect timeout, secure SSL mode ve safe application
+  name kullanan frozen `PostgreSQLVectorStoreSettings` eklendi.
+- Tenant/knowledge-base, model identity/path, dimension, normalization,
+  CPU/CUDA ve local-files-only politikasini acikca tasiyan frozen
+  `KnowledgeBaseRAGProviderSettings` eklendi.
+- Tek transaction runner ve tek lazy query/document embedder paylasan frozen
+  `PostgreSQLRAGComposition` ile side-effect-free
+  `compose_profile_bound_postgres_rag` factory'si eklendi.
+- Composition sirasinda connection, pgvector registration, transaction,
+  migration, profile registration, backend/model load, network veya GPU
+  aktivitesi yapilmaz.
+- Eklenen dosyalar: `app/composition/__init__.py`,
+  `app/composition/postgres_rag.py`,
+  `tests/test_postgres_rag_composition.py`; degisen dosya:
+  `docs/progress/beyza.md`.
+- Focused composition testleri: 43 passed; ilgili
+  composition/PostgreSQL/embedding/ingestion/retrieval testleri: 500 passed.
+- Full suite 1466 test toplarken mevcut Torch `c10.dll` WinError 1114 nedeniyle
+  dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
+  script passed ve conflict-marker testleri 5 passed.
+- Sonraki planli adim: migration/schema readiness ve explicit profile
+  provisioning ayri ve onayli PR38 kapsaminda ele alinacak.
