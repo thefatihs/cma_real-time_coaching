@@ -1,5 +1,12 @@
 """Provider-neutral, tenant-safe speaker diarization contracts."""
 
+from app.diarization.alignment import (
+    UNKNOWN_LOCAL_SPEAKER_ID,
+    WordAlignmentError,
+    WordAlignmentErrorCategory,
+    WordAlignmentRequest,
+    align_words_to_speakers,
+)
 from app.diarization.fake_backend import FakeSpeakerDiarizer
 from app.diarization.models import (
     DiarizationRequest,
@@ -30,4 +37,9 @@ __all__ = [
     "PyannoteSpeakerDiarizer",
     "SpeakerDiarizerProtocol",
     "SpeakerRole",
+    "UNKNOWN_LOCAL_SPEAKER_ID",
+    "WordAlignmentError",
+    "WordAlignmentErrorCategory",
+    "WordAlignmentRequest",
+    "align_words_to_speakers",
 ]

@@ -1004,3 +1004,21 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning).
 - Sonraki planli adim: Speaker-aware transcript ve timeline sunumunu ayri bir
   gorevde mevcut diarization companion contract'i uzerinden tasarlamak.
+
+## 70. Optional Whisper Word Timestamps and Speaker Alignment
+
+- Immutable ASR word timestamp contract'i eklendi; faster-whisper entegrasyonu
+  varsayilan davranisi koruyan acik bir secenekle word timestamp isteyebilir.
+- Word timestamp'lari parent segment icinde fail-closed dogrulanir; eksik word
+  verisi geriye uyumlu bos immutable tuple olarak korunur.
+- Saf diarization aligner'i en buyuk pozitif overlap'i kullanir; esitlikleri
+  erken turn ve speaker kimligiyle deterministik cozer, overlap yoksa UNKNOWN
+  atar ve coklu-speaker OVERLAP bilgisini korur.
+- Degisen/eklenen dosyalar: `app/asr/models.py`,
+  `app/asr/faster_whisper_engine.py`, `app/diarization/alignment.py`,
+  `app/diarization/__init__.py`, ilgili iki test dosyasi ve
+  `PROJECT_PROGRESS.md`.
+- Testler: focused ASR/diarization 114 passed; full 1063 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Streaming wiring, role resolution ve global speaker
+  tracking ayri ve onayli gorevlere ertelendi.

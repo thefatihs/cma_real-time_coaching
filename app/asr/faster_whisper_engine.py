@@ -1,11 +1,18 @@
 from pathlib import Path
+from math import isfinite
 from time import perf_counter
 from typing import Any
 
 from faster_whisper import WhisperModel
 from numpy.typing import NDArray
 
-from app.asr.models import TranscriptionResult, TranscriptionSegment
+from app.asr.models import (
+    ASRWordTimestamp,
+    ASRWordTimestampError,
+    ASRWordTimestampErrorCategory,
+    TranscriptionResult,
+    TranscriptionSegment,
+)
 
 
 class FasterWhisperEngine:
@@ -22,6 +29,7 @@ class FasterWhisperEngine:
         vad_filter: bool = False,
         condition_on_previous_text: bool = True,
         initial_prompt: str | None = None,
+        word_timestamps: bool = False,
     ) -> None:
         self.model_size = model_size
         self.device = device
@@ -32,6 +40,7 @@ class FasterWhisperEngine:
         self.vad_filter = vad_filter
         self.condition_on_previous_text = condition_on_previous_text
         self.initial_prompt = initial_prompt
+        self.word_timestamps = word_timestamps
         self._model: WhisperModel | None = None
 
     def _create_model(self) -> WhisperModel:
@@ -58,23 +67,27 @@ class FasterWhisperEngine:
 
     def _transcribe(self, audio: str | NDArray[Any]) -> TranscriptionResult:
         started_at = perf_counter()
-        raw_segments, info = self._get_model().transcribe(
-            audio,
-            vad_filter=self.vad_filter,
-            condition_on_previous_text=self.condition_on_previous_text,
-            initial_prompt=self.initial_prompt,
-            language=self.language,
-            beam_size=self.beam_size,
-        )
-
-        segments = [
-            TranscriptionSegment(
-                start_seconds=float(segment.start),
-                end_seconds=float(segment.end),
-                text=segment.text.strip(),
+        if self.word_timestamps:
+            raw_segments, info = self._get_model().transcribe(
+                audio,
+                vad_filter=self.vad_filter,
+                condition_on_previous_text=self.condition_on_previous_text,
+                initial_prompt=self.initial_prompt,
+                language=self.language,
+                beam_size=self.beam_size,
+                word_timestamps=True,
             )
-            for segment in raw_segments
-        ]
+        else:
+            raw_segments, info = self._get_model().transcribe(
+                audio,
+                vad_filter=self.vad_filter,
+                condition_on_previous_text=self.condition_on_previous_text,
+                initial_prompt=self.initial_prompt,
+                language=self.language,
+                beam_size=self.beam_size,
+            )
+
+        segments = [self._convert_segment(segment) for segment in raw_segments]
         transcript = " ".join(segment.text for segment in segments if segment.text)
         processing_time = perf_counter() - started_at
 
@@ -90,6 +103,67 @@ class FasterWhisperEngine:
             processing_time_seconds=processing_time,
             segments=segments,
         )
+
+    def _convert_segment(self, segment: object) -> TranscriptionSegment:
+        try:
+            start = float(getattr(segment, "start"))
+            end = float(getattr(segment, "end"))
+            text = str(getattr(segment, "text")).strip()
+        except Exception:
+            raise ASRWordTimestampError(
+                ASRWordTimestampErrorCategory.MALFORMED_PROVIDER_OUTPUT
+            ) from None
+        words = self._convert_words(segment, start=start, end=end)
+        return TranscriptionSegment(
+            start_seconds=start,
+            end_seconds=end,
+            text=text,
+            words=words,
+        )
+
+    def _convert_words(
+        self,
+        segment: object,
+        *,
+        start: float,
+        end: float,
+    ) -> tuple[ASRWordTimestamp, ...]:
+        if not self.word_timestamps:
+            return ()
+        if not isfinite(start) or not isfinite(end) or start < 0 or end <= start:
+            raise ASRWordTimestampError(
+                ASRWordTimestampErrorCategory.MALFORMED_PROVIDER_OUTPUT
+            )
+        raw_words = getattr(segment, "words", None)
+        if raw_words is None:
+            return ()
+        converted: list[ASRWordTimestamp] = []
+        try:
+            for raw_word in raw_words:
+                probability = getattr(raw_word, "probability", None)
+                word = ASRWordTimestamp(
+                    text=str(getattr(raw_word, "word")),
+                    start_seconds=float(getattr(raw_word, "start")),
+                    end_seconds=float(getattr(raw_word, "end")),
+                    probability=(None if probability is None else float(probability)),
+                )
+                if word.start_seconds < start or word.end_seconds > end:
+                    raise ASRWordTimestampError(
+                        ASRWordTimestampErrorCategory.OUTSIDE_PARENT_SEGMENT
+                    )
+                converted.append(word)
+        except ASRWordTimestampError:
+            raise
+        except Exception:
+            raise ASRWordTimestampError(
+                ASRWordTimestampErrorCategory.MALFORMED_PROVIDER_OUTPUT
+            ) from None
+        keys = [(word.start_seconds, word.end_seconds, word.text) for word in converted]
+        if keys != sorted(keys):
+            raise ASRWordTimestampError(
+                ASRWordTimestampErrorCategory.NONDETERMINISTIC_ORDER
+            )
+        return tuple(converted)
 
     def _validate_audio_path(self, audio_path: Path) -> None:
         if not audio_path.exists():
