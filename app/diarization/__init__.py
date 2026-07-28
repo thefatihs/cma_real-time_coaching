@@ -40,6 +40,16 @@ from app.diarization.role_resolver import (
     SpeakerRoleResolutionResult,
     SpeakerRoleResolverProtocol,
 )
+from app.diarization.routing import (
+    CustomerProjectionReason,
+    CustomerProjectionStatus,
+    CustomerSpeechProjection,
+    CustomerSpeechProjectionRequest,
+    CustomerSpeechProjector,
+    DiarizationRoutingError,
+    DiarizationRoutingErrorCategory,
+    RoleTaggedWord,
+)
 
 __all__ = [
     "DiarizationRequest",
@@ -67,6 +77,14 @@ __all__ = [
     "SpeakerRoleResolverProtocol",
     "RoleEvidenceCode",
     "RuleBasedSpeakerRoleResolver",
+    "CustomerProjectionReason",
+    "CustomerProjectionStatus",
+    "CustomerSpeechProjection",
+    "CustomerSpeechProjectionRequest",
+    "CustomerSpeechProjector",
+    "DiarizationRoutingError",
+    "DiarizationRoutingErrorCategory",
+    "RoleTaggedWord",
     "UNKNOWN_LOCAL_SPEAKER_ID",
     "WordAlignmentError",
     "WordAlignmentErrorCategory",

@@ -1085,3 +1085,22 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Streaming wiring, coaching/classification routing ve
   dashboard rendering ayri ve onayli gorevlere ertelendi.
+
+## 74. Trusted Customer-Speech Projection
+
+- Immutable role-tagged word, projection request/result ve sabit guvenli
+  status/reason contract'lari eklendi.
+- Trusted tenant/call/revision scope ve call-global speaker role mapping'i
+  fail-closed dogrulanir; bu katmanda yeni rol inference yapilmaz.
+- Yalnizca configured confidence threshold'unu gecen CUSTOMER word'leri
+  chronological sirada deterministic customer text'e girer.
+- AGENT, UNKNOWN, OVERLAP, missing-global-identity ve low-confidence CUSTOMER
+  word'leri trigger-ready projection disinda tutulur ve sabit kategorilerle
+  sayilir; customer speech yoksa valid empty projection doner.
+- Eklenen/degisen dosyalar: `app/diarization/routing.py`,
+  `app/diarization/__init__.py`, `tests/test_diarization_routing.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 120 passed; full 1180 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Classification/coaching ve streaming wiring ayri ve
+  onayli gorevlere ertelendi.
