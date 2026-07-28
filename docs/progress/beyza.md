@@ -75,3 +75,27 @@ Tarih: 28 Temmuz 2026
 - Repository-wide Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: SQL transaction implementation'i, migration, Docker ve
   runtime wiring ayri onayli PR'lara ertelendi.
+
+## PR34 - PostgreSQL/pgvector Vector-Store Migration
+
+Tarih: 28 Temmuz 2026
+
+- Forward-only `migrations/postgres/0001_vector_store.sql` eklendi.
+- Migration tek transaction icinde vector extension, fixed
+  `callmetric_vector` schema, migration ledger, embedding profile ve vector
+  record tablolarini olusturur; ledger'a `0001` version'ini ekler.
+- Profile scope/dimension uniqueness, cosine-only distance, full record
+  identity, dimension-bearing restrictive foreign key, unbounded vector
+  dimension/nonzero ve ordered metadata JSONB array constraints eklendi.
+- Migration yalnizca statik olarak dogrulandi; SQL, PostgreSQL ve Docker
+  calistirilmadi.
+- Degisen dosya: `docs/progress/beyza.md`; eklenen dosyalar:
+  `migrations/postgres/0001_vector_store.sql`,
+  `tests/test_postgres_vector_migration.py`.
+- Focused migration testleri: 21 passed.
+- Full suite 1361 test toplarken mevcut Torch `c10.dll` WinError 1114 nedeniyle
+  dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
+  script passed ve conflict-marker testleri 5 passed.
+- Sonraki planli adim: complete Psycopg SQL transaction implementation'i ayri
+  onayli PR35 kapsaminda ele alinacak.
