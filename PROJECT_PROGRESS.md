@@ -1146,3 +1146,25 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Offline composer'i streaming/runtime veya dashboard'a
   baglamak ayri ve onayli gorevlere ertelendi.
+
+## 77. Privacy-Safe Offline Diarization Evaluation Harness
+
+- Tek explicit local mono audio girdisi icin injectable loader, word-timestamp
+  ASR ve mevcut offline diarization composition contract'larini kullanan
+  local-only evaluation harness eklendi.
+- Input scope, supported regular file, mono/finite/bounded sample ve duration,
+  expected speaker count ve optional output directory fail-closed dogrulanir.
+- Immutable summary yalnizca aggregate timing/RTF, turn/speaker/role/projection
+  sayilari ve sabit status/reason kodlari tasir; text, filename ve path tasimaz.
+- Optional detailed JSON text ve source path icermeden atomic yazilir; existing
+  report explicit overwrite olmadan degistirilmez.
+- CLI yalnizca safe aggregate JSON summary basar; testlerde gercek Whisper,
+  pyannote veya private audio kullanilmadi.
+- Eklenen dosyalar: `app/diarization/offline_evaluation.py`,
+  `scripts/evaluate_diarization_offline.py`,
+  `tests/test_diarization_offline_evaluation.py`; degisen dosya:
+  `PROJECT_PROGRESS.md`.
+- Testler: focused offline-evaluation/diarization/ASR 177 passed; full 1215
+  passed (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Harness'i explicit user-supplied local audio ile ayri ve
+  onayli bir smoke testte calistirmak.
