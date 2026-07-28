@@ -14,6 +14,9 @@ from app.vector_store.postgres.contracts import (
     PostgreSQLVectorTransaction,
     PostgreSQLVectorTransactionRunner,
 )
+from app.vector_store.postgres.profile_repository import (
+    PostgreSQLEmbeddingProfileRepository as PostgreSQLEmbeddingProfileRepository,
+)
 
 __all__ = [
     "PostgreSQLCosineSearchRow",
