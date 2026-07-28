@@ -23,6 +23,7 @@ class _SpeakerAssignment(BaseModel):
     end_seconds: float
     local_speaker_ids: tuple[str, ...]
     global_speaker_id: str | None = None
+    global_speaker_ids: tuple[str, ...] = ()
     role: SpeakerRole = SpeakerRole.UNKNOWN
     speaker_confidence: float | None = None
     role_confidence: float | None = None
@@ -36,6 +37,14 @@ class _SpeakerAssignment(BaseModel):
     @classmethod
     def validate_global_speaker_id(cls, value: str | None) -> str | None:
         return None if value is None else _required_text(value, "global_speaker_id")
+
+    @field_validator("global_speaker_ids")
+    @classmethod
+    def validate_global_speaker_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(_required_text(value, "global_speaker_id") for value in values)
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("global speaker IDs must be unique")
+        return cleaned
 
     @field_validator("local_speaker_ids")
     @classmethod
@@ -68,6 +77,15 @@ class _SpeakerAssignment(BaseModel):
             raise ValueError("OVERLAP requires at least two local speaker IDs")
         if self.role is not SpeakerRole.OVERLAP and speaker_count != 1:
             raise ValueError("non-OVERLAP roles require exactly one local speaker ID")
+        if self.global_speaker_ids and len(self.global_speaker_ids) != speaker_count:
+            raise ValueError("global speaker IDs must match local speaker cardinality")
+        if self.global_speaker_id is not None:
+            if speaker_count != 1:
+                raise ValueError("scalar global speaker ID requires one local speaker")
+            if self.global_speaker_ids and self.global_speaker_ids != (
+                self.global_speaker_id,
+            ):
+                raise ValueError("scalar and tuple global speaker IDs must agree")
         return self
 
 
