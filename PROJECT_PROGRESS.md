@@ -1051,3 +1051,21 @@ Tarih: 28 Temmuz 2026
 - Kalite: scoped Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
   deployment configuration ayri ve onayli gorevlere ertelendi.
+
+## 71. Complete PostgreSQL Cosine Search-Row Contract
+
+Tarih: 28 Temmuz 2026
+
+- PostgreSQL cosine search row contract'ina complete `VectorRecord` ve
+  `VectorBackedRetriever` dimension dogrulamasi icin gerekli immutable
+  embedding tuple alani eklendi.
+- Frozen/slotted row, transaction signature, cosine ordering ve mevcut package
+  export davranislari degismeden korundu.
+- Degisen dosyalar: `app/vector_store/postgres/contracts.py`,
+  `tests/test_postgres_vector_boundary.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/retrieval 103 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, Psycopg ve Docker ayri ve onayli gorevlere
+  ertelendi.

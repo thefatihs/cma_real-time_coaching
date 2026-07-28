@@ -26,6 +26,7 @@ class PostgreSQLCosineSearchRow:
     document_id: str
     chunk_id: str
     text: str
+    embedding: tuple[float, ...]
     metadata_json: str
     cosine_distance: float
 
