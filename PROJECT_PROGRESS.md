@@ -942,3 +942,22 @@ Tarih: 28 Temmuz 2026
   asamasinda durdu.
 - Sonraki planli adim: Persistence, SQL, migration ve deployment configuration
   ayri ve onayli gorevlere ertelendi.
+
+## 67. Provider-Neutral Embedding-Profile Repository Contract
+
+Tarih: 28 Temmuz 2026
+
+- Immutable knowledge-base embedding profile'larini tenant ve knowledge-base
+  scope ile kaydetme ve okuma icin provider-neutral repository protokolu
+  eklendi.
+- Eksik profil insert edilir, tamamen esit profil idempotent no-op olarak
+  canonical stored profili dondurur; farkli model, dimension, normalization
+  veya metric kaydi state degistirmeden fail-closed reddedilir.
+- Eklenen dosyalar: `app/vector_store/profile_repository.py`,
+  `tests/test_embedding_profile_repository_protocol.py`; degisen dosyalar:
+  `app/vector_store/__init__.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused embedding-profile/repository 50 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Sonraki planli adim: SQL, dependencies, migrations, Docker ve deployment
+  configuration ayri ve onayli gorevlere ertelendi.
