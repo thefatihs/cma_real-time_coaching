@@ -923,3 +923,22 @@ Tarih: 28 Temmuz 2026
   durdu.
 - Sonraki planli adim: Loader, persistence ve runtime composition calismalari
   ayri ve onayli gorevlere ertelendi.
+
+## 66. Immutable Knowledge-Base Embedding Profile
+
+Tarih: 28 Temmuz 2026
+
+- Tenant ve knowledge-base scope'unu model kimligi, vector dimension,
+  normalization politikasi ve distance metric ile baglayan immutable
+  provider-neutral profil contract'i eklendi.
+- Profil alanlari `tenant_id`, `knowledge_base_id`, `model_id`,
+  `vector_dimension`, `normalize_embeddings` ve `distance_metric` olarak
+  sinirlandi; deployment secret, path, device veya provider ayari eklenmedi.
+- Eklenen dosyalar: `app/vector_store/embedding_profile.py`,
+  `tests/test_embedding_profile.py`; degisen dosyalar:
+  `app/vector_store/__init__.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused embedding-profile/vector-store 96 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Sonraki planli adim: Persistence, SQL, migration ve deployment configuration
+  ayri ve onayli gorevlere ertelendi.
