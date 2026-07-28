@@ -7,6 +7,7 @@ from typing import Protocol
 
 from app.calls.models import CallClassificationMetadata, CallState
 from app.classification.streaming import (
+    ClassificationProcessingStatus,
     RuntimeClassifierProtocol,
     StableClassificationOutcome,
     StableTranscriptClassificationStage,
@@ -19,6 +20,12 @@ from app.events.models import (
 )
 from app.streaming.audio_window import ASRAudioWindow, AudioWindowBuilder
 from app.streaming.chunk_generator import generate_audio_chunks
+from app.streaming.customer_routing import (
+    CustomerOnlyClassificationRouter,
+    CustomerProjectionProviderProtocol,
+    CustomerRoutingOutcome,
+    CustomerRoutingStatus,
+)
 from app.streaming.rolling_buffer import RollingAudioBuffer
 from app.streaming.transcript_reconciler import TranscriptReconciler
 from app.streaming.window_transcriber import WindowTranscriptionResult
@@ -42,6 +49,7 @@ class StreamingASRStep:
     transcription_time_seconds: float
     classification_outcomes: tuple[StableClassificationOutcome, ...] = ()
     coaching_outcomes: tuple[StableCoachingOutcome, ...] = ()
+    customer_routing_outcomes: tuple[CustomerRoutingOutcome, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,7 @@ class StreamingASRResult:
     classification_outcomes: tuple[StableClassificationOutcome, ...] = ()
     classification_metadata: CallClassificationMetadata = CallClassificationMetadata()
     coaching_outcomes: tuple[StableCoachingOutcome, ...] = ()
+    customer_routing_outcomes: tuple[CustomerRoutingOutcome, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +107,8 @@ class StreamingASRPipeline:
         chunk_generator: ChunkGenerator = generate_audio_chunks,
         runtime_classifier: RuntimeClassifierProtocol | None = None,
         coaching_coordinator_factory: CoachingCoordinatorFactory | None = None,
+        customer_only_classification_enabled: bool = False,
+        customer_projection_provider: CustomerProjectionProviderProtocol | None = None,
     ) -> None:
         self._tenant_context = tenant_context
         self._asr_config = asr_config
@@ -107,6 +118,10 @@ class StreamingASRPipeline:
             runtime_classifier
         )
         self._coaching_coordinator_factory = coaching_coordinator_factory
+        self._customer_router = CustomerOnlyClassificationRouter(
+            enabled=customer_only_classification_enabled,
+            projection_provider=customer_projection_provider,
+        )
 
     def run(
         self,
@@ -128,6 +143,7 @@ class StreamingASRPipeline:
         steps: list[StreamingASRStep] = []
         all_classification_outcomes: list[StableClassificationOutcome] = []
         all_coaching_outcomes: list[StableCoachingOutcome] = []
+        all_customer_routing_outcomes: list[CustomerRoutingOutcome] = []
         coaching_coordinator = (
             self._coaching_coordinator_factory(call_state)
             if self._coaching_coordinator_factory is not None
@@ -174,25 +190,25 @@ class StreamingASRPipeline:
             transcript_events = reconciler.ingest(transcription)
             step_classification_outcomes: list[StableClassificationOutcome] = []
             step_coaching_outcomes: list[StableCoachingOutcome] = []
+            step_customer_routing_outcomes: list[CustomerRoutingOutcome] = []
             for event in transcript_events:
                 previous_stable = call_state.stable_transcript
                 call_state.apply_transcript(event)
-                outcome = self._classification_stage.process(
-                    event,
-                    cumulative_stable_transcript=call_state.stable_transcript,
-                    stable_changed=(call_state.stable_transcript != previous_stable),
-                    call_state=call_state,
-                    stable_delta=event.text,
-                    preceding_stable_transcript=previous_stable,
+                stable_changed = call_state.stable_transcript != previous_stable
+                outcome, coaching_outcome, routing_outcome = (
+                    self._process_classification_and_coaching(
+                        event=event,
+                        call_state=call_state,
+                        previous_stable=previous_stable,
+                        stable_changed=stable_changed,
+                        coordinator=coaching_coordinator,
+                    )
                 )
                 step_classification_outcomes.append(outcome)
                 all_classification_outcomes.append(outcome)
-                coaching_outcome = self._process_coaching(
-                    coordinator=coaching_coordinator,
-                    event=event,
-                    stable_changed=(call_state.stable_transcript != previous_stable),
-                    classification_outcome=outcome,
-                )
+                if routing_outcome is not None:
+                    step_customer_routing_outcomes.append(routing_outcome)
+                    all_customer_routing_outcomes.append(routing_outcome)
                 if coaching_outcome is not None:
                     step_coaching_outcomes.append(coaching_outcome)
                     all_coaching_outcomes.append(coaching_outcome)
@@ -212,6 +228,7 @@ class StreamingASRPipeline:
                 transcript_events=transcript_events,
                 classification_outcomes=tuple(step_classification_outcomes),
                 coaching_outcomes=tuple(step_coaching_outcomes),
+                customer_routing_outcomes=tuple(step_customer_routing_outcomes),
                 stable_transcript=reconciler.stable_transcript,
                 partial_transcript=reconciler.partial_transcript,
                 transcription_time_seconds=(transcription.processing_time_seconds),
@@ -224,21 +241,19 @@ class StreamingASRPipeline:
         if final_event is not None:
             previous_stable = call_state.stable_transcript
             call_state.apply_transcript(final_event)
-            final_classification = self._classification_stage.process(
-                final_event,
-                cumulative_stable_transcript=call_state.stable_transcript,
-                stable_changed=(call_state.stable_transcript != previous_stable),
-                call_state=call_state,
-                stable_delta=final_event.text,
-                preceding_stable_transcript=previous_stable,
+            stable_changed = call_state.stable_transcript != previous_stable
+            final_classification, final_coaching, final_routing = (
+                self._process_classification_and_coaching(
+                    event=final_event,
+                    call_state=call_state,
+                    previous_stable=previous_stable,
+                    stable_changed=stable_changed,
+                    coordinator=coaching_coordinator,
+                )
             )
             all_classification_outcomes.append(final_classification)
-            final_coaching = self._process_coaching(
-                coordinator=coaching_coordinator,
-                event=final_event,
-                stable_changed=(call_state.stable_transcript != previous_stable),
-                classification_outcome=final_classification,
-            )
+            if final_routing is not None:
+                all_customer_routing_outcomes.append(final_routing)
             if final_coaching is not None:
                 all_coaching_outcomes.append(final_coaching)
 
@@ -250,11 +265,75 @@ class StreamingASRPipeline:
             classification_outcomes=tuple(all_classification_outcomes),
             classification_metadata=call_state.classification_metadata(),
             coaching_outcomes=tuple(all_coaching_outcomes),
+            customer_routing_outcomes=tuple(all_customer_routing_outcomes),
             stable_transcript=reconciler.stable_transcript,
             partial_transcript=reconciler.partial_transcript,
             total_chunks=len(steps),
             audio_duration_seconds=audio_duration_seconds,
         )
+
+    def _process_classification_and_coaching(
+        self,
+        *,
+        event: TranscriptEvent,
+        call_state: CallState,
+        previous_stable: str,
+        stable_changed: bool,
+        coordinator: CoachingProcessorProtocol | None,
+    ) -> tuple[
+        StableClassificationOutcome,
+        StableCoachingOutcome | None,
+        CustomerRoutingOutcome | None,
+    ]:
+        if event.kind.value == "PARTIAL" or not stable_changed:
+            classification = self._classification_stage.process(
+                event,
+                cumulative_stable_transcript=call_state.stable_transcript,
+                stable_changed=stable_changed,
+                call_state=call_state,
+                stable_delta=event.text,
+                preceding_stable_transcript=previous_stable,
+            )
+            return classification, None, None
+
+        decision = self._customer_router.prepare(event, call_state)
+        if (
+            self._customer_router.enabled
+            and decision.outcome.status is not CustomerRoutingStatus.CUSTOMER_PROCESSED
+        ):
+            classification = StableClassificationOutcome(
+                status=(
+                    ClassificationProcessingStatus.DUPLICATE_REVISION_SKIPPED
+                    if decision.outcome.status
+                    is CustomerRoutingStatus.ALREADY_PROCESSED
+                    else ClassificationProcessingStatus.EMPTY_SKIPPED
+                ),
+                transcript_revision=event.revision,
+                source_sequence=event.source_chunk_sequence,
+            )
+            return classification, None, decision.outcome
+
+        routed_event = decision.routed_event
+        if routed_event is None:
+            raise RuntimeError("customer routing invariant failed")
+        customer_only = self._customer_router.enabled
+        classification = self._classification_stage.process(
+            routed_event,
+            cumulative_stable_transcript=(
+                routed_event.text if customer_only else call_state.stable_transcript
+            ),
+            stable_changed=stable_changed,
+            call_state=call_state,
+            stable_delta=routed_event.text,
+            preceding_stable_transcript=("" if customer_only else previous_stable),
+        )
+        coaching = self._process_coaching(
+            coordinator=coordinator,
+            event=routed_event,
+            stable_changed=stable_changed,
+            classification_outcome=classification,
+        )
+        return classification, coaching, decision.outcome
 
     @staticmethod
     def _process_coaching(

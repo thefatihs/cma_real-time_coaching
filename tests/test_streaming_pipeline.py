@@ -29,6 +29,18 @@ from app.events.models import (
     TranscriptKind,
 )
 from app.events.labels import ClassificationViewSource
+from app.diarization.models import SpeakerRole
+from app.diarization.role_resolver import RoleEvidenceCode
+from app.diarization.routing import (
+    CustomerProjectionReason,
+    CustomerProjectionStatus,
+    CustomerSpeechProjection,
+    RoleTaggedWord,
+)
+from app.streaming.customer_routing import (
+    CustomerProjectionProviderProtocol,
+    CustomerRoutingStatus,
+)
 from app.streaming.audio_window import ASRAudioWindow
 from app.streaming.pipeline import (
     CoachingCoordinatorFactory,
@@ -137,6 +149,8 @@ def pipeline(
     calls: list[object] | None = None,
     runtime_classifier: RuntimeClassifierProtocol | None = None,
     coaching_factory: CoachingCoordinatorFactory | None = None,
+    customer_only_classification_enabled: bool = False,
+    customer_projection_provider: CustomerProjectionProviderProtocol | None = None,
 ) -> StreamingASRPipeline:
     return StreamingASRPipeline(
         context(),
@@ -145,6 +159,8 @@ def pipeline(
         chunk_generator=generator_for(source, calls),
         runtime_classifier=runtime_classifier,
         coaching_coordinator_factory=coaching_factory,
+        customer_only_classification_enabled=customer_only_classification_enabled,
+        customer_projection_provider=customer_projection_provider,
     )
 
 
@@ -158,7 +174,7 @@ def coaching_factory(
         asr=config(),
         classification=TenantClassificationConfig(
             model_id="common_turkish_setfit_v2",
-            labels=["complaint"],
+            labels=sorted({"complaint", label}),
         ),
         rag=TenantRAGConfig(enabled=False),
         coaching=TenantCoachingConfig(
@@ -269,6 +285,75 @@ class FakeRuntimeClassifier:
             thresholds={"complaint": 0.45},
             processing_time_ms=4.0,
             created_at_utc=NOW,
+        )
+
+
+class StreamingProjectionProvider:
+    def __init__(
+        self,
+        text: str,
+        *,
+        fail: bool = False,
+    ) -> None:
+        self.text = text
+        self.fail = fail
+        self.calls: list[tuple[str, str, int]] = []
+
+    def get_projection(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        transcript_revision: int,
+    ) -> CustomerSpeechProjection:
+        self.calls.append((tenant_id, call_id, transcript_revision))
+        if self.fail:
+            raise RuntimeError("private projection failure")
+        if not self.text:
+            return CustomerSpeechProjection(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                transcript_revision=transcript_revision,
+                customer_words=(),
+                customer_text="",
+                excluded_agent_word_count=1,
+                excluded_unknown_word_count=0,
+                excluded_overlap_word_count=0,
+                excluded_below_confidence_word_count=0,
+                status=CustomerProjectionStatus.EMPTY,
+                reason=CustomerProjectionReason.NO_TRUSTED_CUSTOMER_SPEECH,
+            )
+        words = tuple(
+            RoleTaggedWord(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                transcript_revision=transcript_revision,
+                start_seconds=float(index),
+                end_seconds=float(index + 1),
+                text=word,
+                local_speaker_ids=("customer-local",),
+                global_speaker_id="CALL_SPEAKER_0002",
+                global_speaker_ids=("CALL_SPEAKER_0002",),
+                role=SpeakerRole.CUSTOMER,
+                role_confidence=1.0,
+                role_evidence=RoleEvidenceCode.STRONG_CUSTOMER,
+            )
+            for index, word in enumerate(self.text.split())
+        )
+        return CustomerSpeechProjection(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            transcript_revision=transcript_revision,
+            customer_words=words,
+            customer_text=self.text,
+            customer_start_seconds=words[0].start_seconds,
+            customer_end_seconds=words[-1].end_seconds,
+            excluded_agent_word_count=1,
+            excluded_unknown_word_count=0,
+            excluded_overlap_word_count=0,
+            excluded_below_confidence_word_count=0,
+            status=CustomerProjectionStatus.READY,
+            reason=CustomerProjectionReason.TRUSTED_CUSTOMER_SPEECH,
         )
 
 
@@ -678,6 +763,105 @@ def test_stable_pipeline_combines_rule_and_classification_coaching() -> None:
         "call_001",
     )
     assert outcome.transcript_revision == result.final_event.revision  # type: ignore[union-attr]
+
+
+def test_customer_routing_disabled_preserves_legacy_rule_path() -> None:
+    provider = StreamingProjectionProvider("devam etmek istiyorum", fail=True)
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("iptal etmek istiyorum", 0.0, 1.0)]]),
+        coaching_factory=coaching_factory(
+            phrase="iptal etmek istiyorum",
+            label="cancellation_request",
+        ),
+        customer_projection_provider=provider,
+    ).run(Path("synthetic.wav"), "call_001")
+
+    assert provider.calls == []
+    assert result.customer_routing_outcomes[-1].status is (
+        CustomerRoutingStatus.LEGACY_PATH
+    )
+    assert result.coaching_outcomes[-1].result is not None
+    assert result.coaching_outcomes[-1].result.displayed_suggestions
+
+
+def test_agent_cancellation_is_excluded_from_enabled_customer_routing() -> None:
+    provider = StreamingProjectionProvider("devam etmek istiyorum")
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("temsilci iptal etmek istiyorum", 0.0, 1.0)]]),
+        coaching_factory=coaching_factory(
+            phrase="iptal etmek istiyorum",
+            label="cancellation_request",
+        ),
+        customer_only_classification_enabled=True,
+        customer_projection_provider=provider,
+    ).run(Path("synthetic.wav"), "call_001")
+
+    assert result.customer_routing_outcomes[-1].status is (
+        CustomerRoutingStatus.CUSTOMER_PROCESSED
+    )
+    assert result.coaching_outcomes
+    assert result.coaching_outcomes[-1].result is not None
+    assert result.coaching_outcomes[-1].result.displayed_suggestions == ()
+
+
+def test_enabled_pipeline_sends_only_customer_text_to_classifier() -> None:
+    classifier = FakeRuntimeClassifier()
+    customer_text = "devam etmek istiyorum"
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("temsilci iptal etmek istiyorum", 0.0, 1.0)]]),
+        runtime_classifier=classifier,
+        customer_only_classification_enabled=True,
+        customer_projection_provider=StreamingProjectionProvider(customer_text),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    assert result.customer_routing_outcomes[-1].status is (
+        CustomerRoutingStatus.CUSTOMER_PROCESSED
+    )
+    assert len(classifier.calls) == 2
+    assert {call["text"] for call in classifier.calls} == {customer_text}
+    assert all("iptal" not in str(call["text"]) for call in classifier.calls)
+
+
+def test_customer_cancellation_uses_existing_coaching_lifecycle() -> None:
+    provider = StreamingProjectionProvider("iptal etmek istiyorum")
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("temsilci devam müşteri talebi", 0.0, 1.0)]]),
+        coaching_factory=coaching_factory(
+            phrase="iptal etmek istiyorum",
+            label="cancellation_request",
+        ),
+        customer_only_classification_enabled=True,
+        customer_projection_provider=provider,
+    ).run(Path("synthetic.wav"), "call_001")
+
+    coaching = result.coaching_outcomes[-1]
+    assert coaching.result is not None
+    suggestion = coaching.result.displayed_suggestions[0]
+    assert suggestion.source is CoachingSuggestionSource.RULE
+    assert suggestion.label_id == "cancellation_request"
+
+
+def test_empty_customer_projection_skips_classifier_and_coaching() -> None:
+    classifier = FakeRuntimeClassifier()
+    result = pipeline(
+        [chunk(0, 0.0, 1.0)],
+        FakeTranscriber([[("önceki karışık iptal metni", 0.0, 1.0)]]),
+        runtime_classifier=classifier,
+        coaching_factory=coaching_factory(phrase="iptal"),
+        customer_only_classification_enabled=True,
+        customer_projection_provider=StreamingProjectionProvider(""),
+    ).run(Path("synthetic.wav"), "call_001")
+
+    assert classifier.calls == []
+    assert result.coaching_outcomes == ()
+    assert result.classification_outcomes[-1].classification_event is None
+    assert result.customer_routing_outcomes[-1].status is (
+        CustomerRoutingStatus.NO_CUSTOMER_SPEECH
+    )
 
 
 def test_structural_coaching_processor_is_injected_with_exact_arguments() -> None:

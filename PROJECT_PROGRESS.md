@@ -1104,3 +1104,24 @@ Tarih: 28 Temmuz 2026
   (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Classification/coaching ve streaming wiring ayri ve
   onayli gorevlere ertelendi.
+
+## 75. Feature-Flagged Customer-Only Intent and Coaching Routing
+
+- Stable revision classification oncesine default-disabled, injectable ve
+  Fatih-owned customer-only routing seam'i eklendi.
+- Flag disabled iken projection provider cagrilmaz ve mevcut mixed-transcript
+  classification/coaching davranisi degismez.
+- Flag enabled iken yalnizca exact tenant/call/revision scope'lu non-empty
+  `CustomerSpeechProjection.customer_text` mevcut dual-view classification ve
+  coaching lifecycle'ina girer.
+- Empty, missing, malformed, stale veya wrong-scope projection classification
+  ve yeni coaching'i fail-closed atlar; mixed transcript'e fallback yapmaz.
+- Exact call/revision idempotency yalnizca scope/revision metadata'si tutar;
+  projection veya transcript text bookkeeping/diagnostic icinde saklanmaz.
+- Eklenen/degisen dosyalar: `app/streaming/customer_routing.py`,
+  `app/streaming/pipeline.py`, `tests/test_customer_only_routing.py`,
+  `tests/test_streaming_pipeline.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused streaming/classification/coaching/diarization 168 passed;
+  full 1193 passed (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Real diarization projection provider wiring ve dashboard
+  speaker rendering ayri ve onayli gorevlere ertelendi.
