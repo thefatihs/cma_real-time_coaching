@@ -270,7 +270,7 @@ def test_enabled_word_timestamps_allow_missing_provider_word_data(
             ASRWordTimestampErrorCategory.INVALID_TIMESTAMP,
         ),
         (
-            FakeWord(0.5, 0.5, "word", 0.9),
+            FakeWord(0.6, 0.5, "word", 0.9),
             ASRWordTimestampErrorCategory.INVALID_TIMESTAMP,
         ),
         (
@@ -338,3 +338,109 @@ def test_word_timestamps_reject_provider_order_without_sorting(
         FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
 
     assert error.value.category is ASRWordTimestampErrorCategory.NONDETERMINISTIC_ORDER
+
+
+def test_one_zero_duration_artifact_is_skipped_without_changing_segment_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segment_text = "preserved segment text"
+
+    class ZeroDurationArtifactModel:
+        def transcribe(
+            self, audio_path: str, **settings: Any
+        ) -> tuple[Iterator[FakeSegment], FakeTranscriptionInfo]:
+            words = [
+                FakeWord(0.0, 0.4, "first", 0.9),
+                FakeWord(0.5, 0.5, "artifact", 0.8),
+                FakeWord(0.6, 1.0, "last", 0.7),
+            ]
+            return iter([FakeSegment(0.0, 1.0, segment_text, words)]), (
+                FakeTranscriptionInfo(duration=1.0)
+            )
+
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine.WhisperModel",
+        lambda *args, **kwargs: ZeroDurationArtifactModel(),
+    )
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    result = FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
+
+    assert result.segments[0].text == segment_text
+    assert [
+        (word.start_seconds, word.end_seconds) for word in result.segments[0].words
+    ] == [
+        (0.0, 0.4),
+        (0.6, 1.0),
+    ]
+    assert result.skipped_zero_duration_word_count == 1
+
+
+def test_second_zero_duration_artifact_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExcessArtifactsModel:
+        def transcribe(
+            self, audio_path: str, **settings: Any
+        ) -> tuple[Iterator[FakeSegment], FakeTranscriptionInfo]:
+            words = [
+                FakeWord(0.2, 0.2, "artifact-one", 0.9),
+                FakeWord(0.4, 0.4, "artifact-two", 0.9),
+            ]
+            return iter([FakeSegment(0.0, 1.0, "safe", words)]), (
+                FakeTranscriptionInfo(duration=1.0)
+            )
+
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine.WhisperModel",
+        lambda *args, **kwargs: ExcessArtifactsModel(),
+    )
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    with pytest.raises(ASRWordTimestampError) as error:
+        FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
+
+    assert (
+        error.value.category
+        is ASRWordTimestampErrorCategory.ZERO_DURATION_ARTIFACT_LIMIT_EXCEEDED
+    )
+    assert "artifact-one" not in repr(error.value)
+    assert "artifact-two" not in repr(error.value)
+
+
+@pytest.mark.parametrize("timestamp", [-0.1, 1.1])
+def test_out_of_bound_zero_duration_artifact_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    timestamp: float,
+) -> None:
+    class OutOfBoundsArtifactModel:
+        def transcribe(
+            self, audio_path: str, **settings: Any
+        ) -> tuple[Iterator[FakeSegment], FakeTranscriptionInfo]:
+            return iter(
+                [
+                    FakeSegment(
+                        0.0,
+                        1.0,
+                        "safe",
+                        [FakeWord(timestamp, timestamp, "artifact", 0.9)],
+                    )
+                ]
+            ), FakeTranscriptionInfo(duration=1.0)
+
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine.WhisperModel",
+        lambda *args, **kwargs: OutOfBoundsArtifactModel(),
+    )
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    with pytest.raises(ASRWordTimestampError) as error:
+        FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
+
+    assert error.value.category is ASRWordTimestampErrorCategory.OUTSIDE_PARENT_SEGMENT

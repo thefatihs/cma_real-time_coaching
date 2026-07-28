@@ -1168,3 +1168,26 @@ Tarih: 28 Temmuz 2026
   passed (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Harness'i explicit user-supplied local audio ile ayri ve
   onayli bir smoke testte calistirmak.
+
+## 78. Bounded Zero-Duration Whisper Word Artifact Compatibility
+
+- Faster-Whisper'in segment ve audio sinirlari icindeki tam sifir sureli tek
+  word artifact'i timestamp uydurmadan immutable word koleksiyonundan cikartilir.
+- Transcription segment text'i degistirilmez; transcription ve offline
+  evaluation summary yalnizca aggregate
+  `skipped_zero_duration_word_count` metadata'sini tasir.
+- Varsayilan call limiti birdir; ikinci artifact, negatif/non-finite veya
+  sinir-disi timestamp ve gecersiz probability fail-closed kalir.
+- Basarili offline evaluation bir artifact atladiginda sabit
+  `completed_with_skipped_zero_duration_word` warning reason'i dondurur; JSON
+  raporu word text veya provider detayi icermez.
+- Degisen dosyalar: `app/asr/models.py`,
+  `app/asr/faster_whisper_engine.py`,
+  `app/diarization/offline_evaluation.py`,
+  `scripts/evaluate_diarization_offline.py`,
+  `tests/test_faster_whisper_engine.py`,
+  `tests/test_diarization_offline_evaluation.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused ASR/offline-evaluation/alignment/composition 55 passed; full
+  1220 passed (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Full offline Stage 8B evaluation ayri ve onayli bir
+  execution gorevine ertelendi.

@@ -36,6 +36,7 @@ class ASRWordTimestampErrorCategory(str, Enum):
     INVALID_PROBABILITY = "invalid_word_probability"
     OUTSIDE_PARENT_SEGMENT = "word_outside_parent_segment"
     NONDETERMINISTIC_ORDER = "nondeterministic_word_order"
+    ZERO_DURATION_ARTIFACT_LIMIT_EXCEEDED = "zero_duration_word_artifact_limit_exceeded"
     MALFORMED_PROVIDER_OUTPUT = "malformed_word_output"
 
 
@@ -64,3 +65,4 @@ class TranscriptionResult:
     duration_seconds: float
     processing_time_seconds: float
     segments: list[TranscriptionSegment]
+    skipped_zero_duration_word_count: int = 0

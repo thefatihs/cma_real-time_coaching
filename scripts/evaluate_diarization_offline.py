@@ -118,6 +118,7 @@ def main(
             excluded_unknown_word_count=0,
             excluded_overlap_word_count=0,
             excluded_below_confidence_word_count=0,
+            skipped_zero_duration_word_count=0,
             transcript_revision=0,
         )
     print(safe_summary_json(summary))

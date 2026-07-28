@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -396,6 +397,34 @@ def test_optional_json_excludes_text_and_source_path(tmp_path: Path) -> None:
     assert str(audio_path) not in report
     assert audio_path.name not in report
     assert "text" not in payload["words"][0]
+
+
+def test_skipped_zero_duration_count_is_reported_as_safe_warning(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "synthetic.wav"
+    audio_path.write_bytes(b"synthetic")
+    output = tmp_path / "reports"
+    output.mkdir()
+    transcription = replace(
+        _transcription(),
+        skipped_zero_duration_word_count=1,
+    )
+
+    summary = _evaluator(asr=FakeASR(transcription)).evaluate(
+        _request(audio_path, output_directory=output)
+    )
+    report = (output / REPORT_FILENAME).read_text(encoding="utf-8")
+    payload = json.loads(report)
+
+    assert summary.status is OfflineEvaluationStatus.COMPLETED
+    assert summary.reason is (
+        OfflineEvaluationReason.COMPLETED_WITH_SKIPPED_ZERO_DURATION_WORD
+    )
+    assert summary.skipped_zero_duration_word_count == 1
+    assert payload["summary"]["skipped_zero_duration_word_count"] == 1
+    assert PRIVATE_TEXT not in repr(summary)
+    assert PRIVATE_TEXT not in report
 
 
 def test_atomic_no_overwrite_and_explicit_overwrite(tmp_path: Path) -> None:

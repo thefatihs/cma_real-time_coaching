@@ -43,6 +43,9 @@ class OfflineEvaluationStatus(str, Enum):
 
 class OfflineEvaluationReason(str, Enum):
     COMPLETED = "completed"
+    COMPLETED_WITH_SKIPPED_ZERO_DURATION_WORD = (
+        "completed_with_skipped_zero_duration_word"
+    )
     INVALID_INPUT = "invalid_input"
     UNSUPPORTED_AUDIO = "unsupported_audio"
     ASR_FAILED = "asr_failed"
@@ -94,6 +97,7 @@ class OfflineEvaluationSummary:
     excluded_unknown_word_count: int
     excluded_overlap_word_count: int
     excluded_below_confidence_word_count: int
+    skipped_zero_duration_word_count: int
     transcript_revision: int
 
 
@@ -281,6 +285,9 @@ class OfflineDiarizationEvaluator:
                 diarization_time=finished - after_asr,
                 total_time=finished - started,
                 expected_speaker_count=request.expected_speaker_count,
+                skipped_zero_duration_word_count=(
+                    transcription.skipped_zero_duration_word_count
+                ),
             )
         except Exception:
             return _failure(
@@ -353,6 +360,8 @@ def _absolute_words(
     transcription: TranscriptionResult,
     duration: float,
 ) -> tuple[ASRWordTimestamp, ...]:
+    if not 0 <= transcription.skipped_zero_duration_word_count <= 1:
+        raise ValueError("invalid_skipped_zero_duration_word_count")
     words = tuple(word for segment in transcription.segments for word in segment.words)
     if any(
         word.start_seconds < 0
@@ -375,6 +384,7 @@ def _summary(
     diarization_time: float,
     total_time: float,
     expected_speaker_count: int,
+    skipped_zero_duration_word_count: int,
 ) -> OfflineEvaluationSummary:
     if any(
         not isfinite(value) or value < 0
@@ -400,7 +410,11 @@ def _summary(
         raise ValueError("missing_projection")
     return OfflineEvaluationSummary(
         status=OfflineEvaluationStatus.COMPLETED,
-        reason=OfflineEvaluationReason.COMPLETED,
+        reason=(
+            OfflineEvaluationReason.COMPLETED_WITH_SKIPPED_ZERO_DURATION_WORD
+            if skipped_zero_duration_word_count
+            else OfflineEvaluationReason.COMPLETED
+        ),
         audio_duration_seconds=duration,
         asr_time_seconds=asr_time,
         asr_real_time_factor=asr_time / duration,
@@ -420,6 +434,7 @@ def _summary(
         excluded_below_confidence_word_count=(
             projection.excluded_below_confidence_word_count
         ),
+        skipped_zero_duration_word_count=skipped_zero_duration_word_count,
         transcript_revision=composition.transcript_revision,
     )
 
@@ -449,6 +464,7 @@ def _failure(
         excluded_unknown_word_count=0,
         excluded_overlap_word_count=0,
         excluded_below_confidence_word_count=0,
+        skipped_zero_duration_word_count=0,
         transcript_revision=0,
     )
 
