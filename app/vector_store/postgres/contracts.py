@@ -88,7 +88,14 @@ class PostgreSQLVectorTransaction(Protocol):
     def replace_record(
         self,
         row: PostgreSQLStoredVectorRow,
-    ) -> None: ...
+    ) -> None:
+        """Atomically insert or replace one full-identity row.
+
+        Identity comprises tenant, knowledge base, document and chunk. The
+        operation runs inside the current runner-owned transaction and must not
+        commit, roll back, close or otherwise manage transaction lifecycle.
+        """
+        ...
 
     def search_cosine(
         self,
