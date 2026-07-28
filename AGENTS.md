@@ -50,11 +50,14 @@ Keep the final report under 15 lines and include only:
 - Pyright result;
 - remaining warnings;
 - final Git status.
-## Project Progress Log
+## Progress Ownership
 
-- After every completed development task, update `PROJECT_PROGRESS.md`.
-- Add only a short factual summary of the completed feature.
-- Include changed files, test results and the next planned step.
+- Fatih Codex tasks update only `docs/progress/fatih.md`.
+- Fatih Codex tasks must not modify `PROJECT_PROGRESS.md` or another
+  contributor's progress file.
+- Shared progress files may be changed only by an explicitly assigned
+  shared-milestone task.
+- Add only a short factual summary with changed files, test results and the
+  next planned step.
 - Never include private audio, transcript content, customer information or
   absolute private file paths.
-- Updating `PROJECT_PROGRESS.md` is part of the task's definition of done.
