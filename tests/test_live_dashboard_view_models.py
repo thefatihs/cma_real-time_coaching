@@ -695,10 +695,11 @@ def test_completed_call_summary_contains_safe_product_data() -> None:
     assert result.model_name == "large-v3"
     assert result.language == "tr"
     assert result.audio_metadata == (
-        ("Dosya", "sentetik.wav"),
+        ("Kaynak", "Yüklenen ses"),
         ("Biçim", "WAV"),
         ("Boyut", "2.0 KB"),
     )
+    assert "sentetik.wav" not in repr(result.audio_metadata)
     assert "İptal Talebi" in {chip.text for chip in result.detected_labels}
 
 

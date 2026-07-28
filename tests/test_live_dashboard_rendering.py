@@ -29,14 +29,17 @@ class _SessionState(dict[str, object]):
 
 
 class _Column:
+    def __init__(self, recorder: _RecordingStreamlit) -> None:
+        self._recorder = recorder
+
     def __enter__(self) -> _Column:
         return self
 
     def __exit__(self, *_args: object) -> None:
         return None
 
-    def metric(self, *_args: object, **_kwargs: object) -> None:
-        return None
+    def metric(self, *args: object, **_kwargs: object) -> None:
+        self._recorder.metrics.append(tuple(str(value) for value in args))
 
     def button(self, *_args: object, **_kwargs: object) -> bool:
         return False
@@ -46,6 +49,10 @@ class _RecordingStreamlit:
     def __init__(self) -> None:
         self.session_state = _SessionState()
         self.captions: list[str] = []
+        self.infos: list[str] = []
+        self.writes: list[str] = []
+        self.metrics: list[tuple[str, ...]] = []
+        self.markdown_kwargs: list[dict[str, object]] = []
         self.sidebar = nullcontext()
 
     def container(self, **_kwargs: object) -> Any:
@@ -57,9 +64,13 @@ class _RecordingStreamlit:
     def tabs(self, labels: tuple[str, ...]) -> list[Any]:
         return [nullcontext() for _ in labels]
 
-    def columns(self, spec: int | list[float]) -> list[_Column]:
+    def columns(
+        self,
+        spec: int | list[float],
+        **_kwargs: object,
+    ) -> list[_Column]:
         count = spec if isinstance(spec, int) else len(spec)
-        return [_Column() for _ in range(count)]
+        return [_Column(self) for _ in range(count)]
 
     def cache_resource(self, **_kwargs: object) -> Any:
         return lambda function: function
@@ -109,6 +120,16 @@ class _RecordingStreamlit:
 
     def caption(self, value: object, **_kwargs: object) -> None:
         self.captions.append(str(value))
+
+    def info(self, value: object, **_kwargs: object) -> None:
+        self.infos.append(str(value))
+
+    def write(self, value: object, **_kwargs: object) -> None:
+        self.writes.append(str(value))
+
+    def markdown(self, value: object, **kwargs: object) -> None:
+        self.writes.append(str(value))
+        self.markdown_kwargs.append(kwargs)
 
     def __getattr__(self, _name: str) -> Any:
         return lambda *_args, **_kwargs: None
@@ -170,3 +191,80 @@ def test_representative_renderer_shows_non_empty_history(
     )
 
     assert "Önceki Öneriler" in recorder.captions
+
+
+def test_representative_renderer_uses_native_safe_dynamic_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(
+        tenant_demos()["tenant_alpha"],
+        "sensitive-call-1234",
+    )
+    tabs = dashboard_tabs(state.runtime, state)
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    recorder.markdown_kwargs.clear()
+
+    app._render_representative(state.runtime, tabs)
+
+    assert not recorder.markdown_kwargs
+    rendered_metrics = " ".join(
+        value for metric in recorder.metrics for value in metric
+    )
+    assert "sensitive-call" not in rendered_metrics
+    assert "••••1234" in rendered_metrics
+
+
+def test_representative_renderer_has_safe_empty_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    tabs = dashboard_tabs(state.runtime, state)
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    recorder.infos.clear()
+
+    app._render_representative(state.runtime, tabs)
+
+    assert any("Henüz kesinleşen konuşma yok" in item for item in recorder.infos)
+    assert any("Henüz güncel bir niyet" in item for item in recorder.infos)
+    assert any("aktif bir koçluk önerisi yok" in item for item in recorder.infos)
+
+
+def test_representative_renderer_preserves_card_order_and_runtime_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    tabs = dashboard_tabs(state.runtime, state)
+    high = replace(
+        _history_card(),
+        suggestion_id="high",
+        priority=SuggestionPriority.HIGH,
+        priority_text="HIGH",
+        title="Yüksek öncelik",
+    )
+    critical = replace(
+        _history_card(),
+        suggestion_id="critical",
+        priority=SuggestionPriority.CRITICAL,
+        priority_text="CRITICAL",
+        title="Kritik öncelik",
+    )
+    representative = replace(
+        tabs.representative,
+        active_suggestions=(critical, high),
+    )
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    recorder.writes.clear()
+    runtime_before = repr(state.runtime)
+
+    app._render_representative(
+        state.runtime,
+        replace(tabs, representative=representative),
+    )
+
+    assert recorder.writes.index("Kritik öncelik") < recorder.writes.index(
+        "Yüksek öncelik"
+    )
+    assert repr(state.runtime) == runtime_before
