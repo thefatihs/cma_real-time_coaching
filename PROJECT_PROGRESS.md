@@ -1081,6 +1081,32 @@ Tarih: 28 Temmuz 2026
 - Eklenen/degisen dosyalar: `app/diarization/role_resolver.py`,
   `app/diarization/__init__.py`, `tests/test_diarization_role_resolver.py`,
   `PROJECT_PROGRESS.md`.
+
+- Testler: focused PostgreSQL boundary/profile 126 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
+  deployment configuration ayri ve onayli gorevlere ertelendi.
+
+## 71. Complete PostgreSQL Cosine Search-Row Contract
+
+Tarih: 28 Temmuz 2026
+
+- PostgreSQL cosine search row contract'ina complete `VectorRecord` ve
+  `VectorBackedRetriever` dimension dogrulamasi icin gerekli immutable
+  embedding tuple alani eklendi.
+- Frozen/slotted row, transaction signature, cosine ordering ve mevcut package
+  export davranislari degismeden korundu.
+- Degisen dosyalar: `app/vector_store/postgres/contracts.py`,
+  `tests/test_postgres_vector_boundary.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/retrieval 103 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, Psycopg ve Docker ayri ve onayli gorevlere
+  ertelendi.
+
 - Testler: focused diarization 109 passed; full 1169 passed
   (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Streaming wiring, coaching/classification routing ve
@@ -1168,3 +1194,43 @@ Tarih: 28 Temmuz 2026
   passed (1 dependency warning). Ruff ve Pyright passed.
 - Sonraki planli adim: Harness'i explicit user-supplied local audio ile ayri ve
   onayli bir smoke testte calistirmak.
+
+## 78. SQL-Free PostgreSQL Vector Transaction Boundary
+
+Tarih: 28 Temmuz 2026
+
+- Gelecekteki PostgreSQL vector adapter'i icin SQL ve Psycopg tipi icermeyen,
+  runner-owned transaction/session protokolleri ve immutable backend row
+  contract'lari eklendi.
+- Embedding'ler icin deterministic IEEE-754 float32 canonicalization, metadata
+  icin ordered JSON pair-array ve cosine score/distance codec politikalari
+  eklendi.
+- Eklenen dosyalar: `app/vector_store/postgres/__init__.py`,
+  `app/vector_store/postgres/contracts.py`,
+  `app/vector_store/postgres/codecs.py`,
+  `tests/test_postgres_vector_boundary.py`; degisen dosya:
+  `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/profile 126 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
+  deployment configuration ayri ve onayli gorevlere ertelendi.
+
+## 79. Complete PostgreSQL Cosine Search-Row Contract
+
+Tarih: 28 Temmuz 2026
+
+- PostgreSQL cosine search row contract'ina complete `VectorRecord` ve
+  `VectorBackedRetriever` dimension dogrulamasi icin gerekli immutable
+  embedding tuple alani eklendi.
+- Frozen/slotted row, transaction signature, cosine ordering ve mevcut package
+  export davranislari degismeden korundu.
+- Degisen dosyalar: `app/vector_store/postgres/contracts.py`,
+  `tests/test_postgres_vector_boundary.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/retrieval 103 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, Psycopg ve Docker ayri ve onayli gorevlere
+  ertelendi.
