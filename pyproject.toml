@@ -10,6 +10,7 @@ dependencies = [
     "jiwer>=4.0.0",
     "numpy>=2.5.1",
     "pandas>=3.0.3",
+    "psycopg[binary]>=3.3.4,<4",
     "pydantic-settings>=2.14.2",
     "scikit-learn>=1.9.0",
     "sentence-transformers>=5.6.0,<6",

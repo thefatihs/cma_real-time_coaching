@@ -52,3 +52,26 @@ Tarih: 28 Temmuz 2026
   dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
 - Sonraki planli adim: SQL/Psycopg transaction implementation'i, migrations ve
   runtime wiring ayri ve onayli PR33 kapsaminda ele alinacak.
+
+## PR33 - Synchronous Psycopg PostgreSQL Transaction Runner
+
+Tarih: 28 Temmuz 2026
+
+- Injected connection ve transaction factory'leri kullanan stateless
+  `PsycopgPostgreSQLVectorTransactionRunner` eklendi.
+- Runner her operation icin tek fresh connection edinir; `autocommit=False`
+  dogrulamasi, tek callback, success commit ve tum acquired-connection
+  path'lerinde deterministic close lifecycle'i uygular.
+- Primary transaction failure'lari ayni exception nesnesiyle korunur;
+  rollback/close cleanup failure'lari rollback-then-close sirasiyla
+  `ExceptionGroup` cause olarak saklanir.
+- Dogrudan runtime dependency olarak `psycopg[binary]>=3.3.4,<4` eklendi.
+- Degisen dosyalar: `pyproject.toml`, `uv.lock`, `docs/progress/beyza.md`;
+  eklenen dosyalar: `app/vector_store/postgres/runner.py`,
+  `tests/test_postgres_transaction_runner.py`.
+- Focused PostgreSQL runner/search/upsert/batch/profile testleri: 168 passed.
+- Full suite 1340 test toplarken mevcut Torch `c10.dll` WinError 1114 nedeniyle
+  dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
+- Repository-wide Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: SQL transaction implementation'i, migration, Docker ve
+  runtime wiring ayri onayli PR'lara ertelendi.
