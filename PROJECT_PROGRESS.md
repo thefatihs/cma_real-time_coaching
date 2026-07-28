@@ -1006,7 +1006,7 @@ Tarih: 28 Temmuz 2026
 - Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
   deployment configuration ayri ve onayli gorevlere ertelendi.
 
-## 69. Live Dashboard Operational State Hardening
+## 70. Live Dashboard Operational State Hardening
 
 - Tenant, call ve source mode alanlarindan yalnizca hash tabanli deterministik UI
   scope kimligi uretilir; scope degisiminde feedback, scoped widget ve stale
@@ -1029,8 +1029,173 @@ Tarih: 28 Temmuz 2026
 - Sonraki planli adim: Speaker-aware transcript ve timeline sunumunu ayri bir
   gorevde mevcut diarization companion contract'i uzerinden tasarlamak.
 
+## 71. Optional Whisper Word Timestamps and Speaker Alignment
 
-## 70. SQL-Free PostgreSQL Vector Transaction Boundary
+- Immutable ASR word timestamp contract'i eklendi; faster-whisper entegrasyonu
+  varsayilan davranisi koruyan acik bir secenekle word timestamp isteyebilir.
+- Word timestamp'lari parent segment icinde fail-closed dogrulanir; eksik word
+  verisi geriye uyumlu bos immutable tuple olarak korunur.
+- Saf diarization aligner'i en buyuk pozitif overlap'i kullanir; esitlikleri
+  erken turn ve speaker kimligiyle deterministik cozer, overlap yoksa UNKNOWN
+  atar ve coklu-speaker OVERLAP bilgisini korur.
+- Degisen/eklenen dosyalar: `app/asr/models.py`,
+  `app/asr/faster_whisper_engine.py`, `app/diarization/alignment.py`,
+  `app/diarization/__init__.py`, ilgili iki test dosyasi ve
+  `PROJECT_PROGRESS.md`.
+- Testler: focused ASR/diarization 114 passed; full 1063 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Streaming wiring, role resolution ve global speaker
+  tracking ayri ve onayli gorevlere ertelendi.
+
+## 72. Deterministic Call-Scoped Speaker Identity Tracking
+
+- Ardışık rolling-window diarization turn'leri icin tenant/call izole,
+  deterministic ve bounded global speaker tracker eklendi.
+- Window-local speaker adlari guvenilmeden toplam pozitif absolute-time overlap
+  ile one-to-one eslestirme yapilir; esitlikler global creation order ve lexical
+  local speaker kimligiyle cozulur.
+- Yeni konusmacilar call-scoped monotonik `CALL_SPEAKER_0001` kimlikleri alir;
+  OVERLAP turn'leri tum eslesen immutable global kimlikleri korur.
+- Exact window tekrar islemesi idempotenttir; fail-closed scope/window/turn
+  dogrulamasi ve yalnizca exact call state'ini silen reset contract'i eklendi.
+- Degisen/eklenen dosyalar: `app/diarization/identity_tracker.py`,
+  `app/diarization/models.py`, `app/diarization/__init__.py`,
+  `tests/test_diarization_identity_tracker.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 94 passed; full 1154 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Role resolution, speaker embedding ve streaming wiring
+  ayri ve onayli gorevlere ertelendi.
+
+## 73. Conservative Call-Scoped Speaker Role Resolution
+
+- Immutable speaker-attributed bounded text, role-resolution request/result ve
+  synchronous resolver protocol contract'lari eklendi.
+- Kucuk deterministic Turkce phrase set'leri strong agent/customer evidence
+  uretir; call-opening konumu yalnizca weak evidence olarak kaydedilir ve tek
+  basina rol belirlemez.
+- Conflicting veya yetersiz evidence UNKNOWN kalir; iki speaker call'unda
+  yalnizca tek high-confidence direct rol ve conflict bulunmamasi halinde
+  opposite rol inferred evidence olarak atanir.
+- OVERLAP text role evidence disinda tutulur; text result/diagnostic repr'lerine
+  tasinmaz ve toplam islenen text fail-closed bir limit ile sinirlanir.
+- Eklenen/degisen dosyalar: `app/diarization/role_resolver.py`,
+  `app/diarization/__init__.py`, `tests/test_diarization_role_resolver.py`,
+  `PROJECT_PROGRESS.md`.
+
+- Testler: focused PostgreSQL boundary/profile 126 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
+  deployment configuration ayri ve onayli gorevlere ertelendi.
+
+## 71. Complete PostgreSQL Cosine Search-Row Contract
+
+Tarih: 28 Temmuz 2026
+
+- PostgreSQL cosine search row contract'ina complete `VectorRecord` ve
+  `VectorBackedRetriever` dimension dogrulamasi icin gerekli immutable
+  embedding tuple alani eklendi.
+- Frozen/slotted row, transaction signature, cosine ordering ve mevcut package
+  export davranislari degismeden korundu.
+- Degisen dosyalar: `app/vector_store/postgres/contracts.py`,
+  `tests/test_postgres_vector_boundary.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused PostgreSQL boundary/retrieval 103 passed; full suite mevcut
+  Torch `c10.dll` WinError 1114 nedeniyle uc ASR/CLI testinin collection
+  asamasinda durdu.
+- Kalite: scoped Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: Adapter, SQL, Psycopg ve Docker ayri ve onayli gorevlere
+  ertelendi.
+
+- Testler: focused diarization 109 passed; full 1169 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Streaming wiring, coaching/classification routing ve
+  dashboard rendering ayri ve onayli gorevlere ertelendi.
+
+## 74. Trusted Customer-Speech Projection
+
+- Immutable role-tagged word, projection request/result ve sabit guvenli
+  status/reason contract'lari eklendi.
+- Trusted tenant/call/revision scope ve call-global speaker role mapping'i
+  fail-closed dogrulanir; bu katmanda yeni rol inference yapilmaz.
+- Yalnizca configured confidence threshold'unu gecen CUSTOMER word'leri
+  chronological sirada deterministic customer text'e girer.
+- AGENT, UNKNOWN, OVERLAP, missing-global-identity ve low-confidence CUSTOMER
+  word'leri trigger-ready projection disinda tutulur ve sabit kategorilerle
+  sayilir; customer speech yoksa valid empty projection doner.
+- Eklenen/degisen dosyalar: `app/diarization/routing.py`,
+  `app/diarization/__init__.py`, `tests/test_diarization_routing.py`,
+  `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 120 passed; full 1180 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Classification/coaching ve streaming wiring ayri ve
+  onayli gorevlere ertelendi.
+
+## 75. Feature-Flagged Customer-Only Intent and Coaching Routing
+
+- Stable revision classification oncesine default-disabled, injectable ve
+  Fatih-owned customer-only routing seam'i eklendi.
+- Flag disabled iken projection provider cagrilmaz ve mevcut mixed-transcript
+  classification/coaching davranisi degismez.
+- Flag enabled iken yalnizca exact tenant/call/revision scope'lu non-empty
+  `CustomerSpeechProjection.customer_text` mevcut dual-view classification ve
+  coaching lifecycle'ina girer.
+- Empty, missing, malformed, stale veya wrong-scope projection classification
+  ve yeni coaching'i fail-closed atlar; mixed transcript'e fallback yapmaz.
+- Exact call/revision idempotency yalnizca scope/revision metadata'si tutar;
+  projection veya transcript text bookkeeping/diagnostic icinde saklanmaz.
+- Eklenen/degisen dosyalar: `app/streaming/customer_routing.py`,
+  `app/streaming/pipeline.py`, `tests/test_customer_only_routing.py`,
+  `tests/test_streaming_pipeline.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused streaming/classification/coaching/diarization 168 passed;
+  full 1193 passed (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Real diarization projection provider wiring ve dashboard
+  speaker rendering ayri ve onayli gorevlere ertelendi.
+
+## 76. Safe Offline Diarization Composition
+
+- Injectable offline composer mevcut diarizer, call-scoped identity tracker,
+  word alignment, role resolver ve customer projector contract'larini tek
+  deterministic akis icinde birlestirir.
+- Her component sinirinda exact tenant/call/revision/window scope fail-closed
+  dogrulanir; ordinary exception ve malformed output yalnizca sabit safe reason
+  ile partial-result icermeyen failure outcome uretir.
+- Tracker'a exact-call checkpoint/restore eklendi; downstream failure yeni
+  history veya global speaker ordinal'larini transactionally geri alir.
+- Empty turn/word girdileri valid empty customer projection uretir; exact
+  request tekrar islemesi global identity ve history acisindan idempotenttir.
+- Eklenen/degisen dosyalar: `app/diarization/composition.py`,
+  `app/diarization/identity_tracker.py`, `app/diarization/alignment.py`,
+  `app/diarization/routing.py`, `app/diarization/__init__.py`,
+  `tests/test_diarization_composition.py`, `PROJECT_PROGRESS.md`.
+- Testler: focused diarization 131 passed; full 1204 passed
+  (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Offline composer'i streaming/runtime veya dashboard'a
+  baglamak ayri ve onayli gorevlere ertelendi.
+
+## 77. Privacy-Safe Offline Diarization Evaluation Harness
+
+- Tek explicit local mono audio girdisi icin injectable loader, word-timestamp
+  ASR ve mevcut offline diarization composition contract'larini kullanan
+  local-only evaluation harness eklendi.
+- Input scope, supported regular file, mono/finite/bounded sample ve duration,
+  expected speaker count ve optional output directory fail-closed dogrulanir.
+- Immutable summary yalnizca aggregate timing/RTF, turn/speaker/role/projection
+  sayilari ve sabit status/reason kodlari tasir; text, filename ve path tasimaz.
+- Optional detailed JSON text ve source path icermeden atomic yazilir; existing
+  report explicit overwrite olmadan degistirilmez.
+- CLI yalnizca safe aggregate JSON summary basar; testlerde gercek Whisper,
+  pyannote veya private audio kullanilmadi.
+- Eklenen dosyalar: `app/diarization/offline_evaluation.py`,
+  `scripts/evaluate_diarization_offline.py`,
+  `tests/test_diarization_offline_evaluation.py`; degisen dosya:
+  `PROJECT_PROGRESS.md`.
+- Testler: focused offline-evaluation/diarization/ASR 177 passed; full 1215
+  passed (1 dependency warning). Ruff ve Pyright passed.
+- Sonraki planli adim: Harness'i explicit user-supplied local audio ile ayri ve
+  onayli bir smoke testte calistirmak.
+
+## 78. SQL-Free PostgreSQL Vector Transaction Boundary
 
 Tarih: 28 Temmuz 2026
 
@@ -1052,7 +1217,7 @@ Tarih: 28 Temmuz 2026
 - Sonraki planli adim: Adapter, SQL, dependencies, migrations, Docker ve
   deployment configuration ayri ve onayli gorevlere ertelendi.
 
-## 71. Complete PostgreSQL Cosine Search-Row Contract
+## 79. Complete PostgreSQL Cosine Search-Row Contract
 
 Tarih: 28 Temmuz 2026
 

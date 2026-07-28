@@ -6,7 +6,21 @@ from typing import Any
 import pytest
 
 from app.asr.faster_whisper_engine import FasterWhisperEngine
-from app.asr.models import TranscriptionResult, TranscriptionSegment
+from app.asr.models import (
+    ASRWordTimestamp,
+    ASRWordTimestampError,
+    ASRWordTimestampErrorCategory,
+    TranscriptionResult,
+    TranscriptionSegment,
+)
+
+
+@dataclass
+class FakeWord:
+    start: float
+    end: float
+    word: str
+    probability: float | None = None
 
 
 @dataclass
@@ -14,6 +28,7 @@ class FakeSegment:
     start: float
     end: float
     text: str
+    words: list[FakeWord] | None = None
 
 
 @dataclass
@@ -143,6 +158,7 @@ def test_successful_transcription_returns_structured_result(
         "language": "tr",
         "beam_size": 1,
     }
+    assert all(segment.words == () for segment in result.segments)
 
 
 def test_accuracy_options_are_passed_to_faster_whisper(
@@ -186,3 +202,139 @@ def test_missing_optional_metadata_uses_safe_defaults(
     assert result.language == ""
     assert result.language_probability == 0.0
     assert result.duration_seconds == 0.0
+
+
+def test_enabled_word_timestamps_are_requested_and_converted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WordModel(FakeWhisperModel):
+        def transcribe(
+            self, audio_path: str, **settings: Any
+        ) -> tuple[Iterator[FakeSegment], FakeTranscriptionInfo]:
+            self.transcribe_calls.append((audio_path, settings))
+            return iter(
+                [
+                    FakeSegment(
+                        0.0,
+                        1.5,
+                        " Merhaba dünya ",
+                        [
+                            FakeWord(0.0, 0.6, " Merhaba", 0.9),
+                            FakeWord(0.7, 1.5, " dünya ", None),
+                        ],
+                    )
+                ]
+            ), FakeTranscriptionInfo()
+
+    model = WordModel()
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine.WhisperModel",
+        lambda *args, **kwargs: model,
+    )
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    result = FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
+
+    assert model.transcribe_calls[0][1]["word_timestamps"] is True
+    assert result.segments[0].words == (
+        ASRWordTimestamp("Merhaba", 0.0, 0.6, 0.9),
+        ASRWordTimestamp("dünya", 0.7, 1.5),
+    )
+
+
+def test_enabled_word_timestamps_allow_missing_provider_word_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_models, _ = install_fake_model(monkeypatch)
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    result = FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
+
+    assert all(segment.words == () for segment in result.segments)
+    assert created_models[0].transcribe_calls[0][1]["word_timestamps"] is True
+
+
+@pytest.mark.parametrize(
+    ("word", "category"),
+    [
+        (
+            FakeWord(0.0, 0.5, "  ", 0.9),
+            ASRWordTimestampErrorCategory.INVALID_TEXT,
+        ),
+        (
+            FakeWord(float("nan"), 0.5, "word", 0.9),
+            ASRWordTimestampErrorCategory.INVALID_TIMESTAMP,
+        ),
+        (
+            FakeWord(0.5, 0.5, "word", 0.9),
+            ASRWordTimestampErrorCategory.INVALID_TIMESTAMP,
+        ),
+        (
+            FakeWord(0.0, 0.5, "word", 1.1),
+            ASRWordTimestampErrorCategory.INVALID_PROBABILITY,
+        ),
+        (
+            FakeWord(0.0, 1.1, "word", 0.9),
+            ASRWordTimestampErrorCategory.OUTSIDE_PARENT_SEGMENT,
+        ),
+    ],
+)
+def test_malformed_word_timestamps_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    word: FakeWord,
+    category: ASRWordTimestampErrorCategory,
+) -> None:
+    class MalformedWordModel:
+        def transcribe(
+            self, audio_path: str, **settings: Any
+        ) -> tuple[Iterator[FakeSegment], FakeTranscriptionInfo]:
+            return iter([FakeSegment(0.0, 1.0, "safe", [word])]), (
+                FakeTranscriptionInfo()
+            )
+
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine.WhisperModel",
+        lambda *args, **kwargs: MalformedWordModel(),
+    )
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    with pytest.raises(ASRWordTimestampError) as error:
+        FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
+
+    assert error.value.category is category
+    assert "safe" not in str(error.value)
+
+
+def test_word_timestamps_reject_provider_order_without_sorting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnorderedWordModel:
+        def transcribe(
+            self, audio_path: str, **settings: Any
+        ) -> tuple[Iterator[FakeSegment], FakeTranscriptionInfo]:
+            words = [
+                FakeWord(0.6, 1.0, "second"),
+                FakeWord(0.0, 0.5, "first"),
+            ]
+            return iter([FakeSegment(0.0, 1.0, "safe", words)]), (
+                FakeTranscriptionInfo()
+            )
+
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine.WhisperModel",
+        lambda *args, **kwargs: UnorderedWordModel(),
+    )
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    with pytest.raises(ASRWordTimestampError) as error:
+        FasterWhisperEngine(word_timestamps=True).transcribe_file(audio_path)
+
+    assert error.value.category is ASRWordTimestampErrorCategory.NONDETERMINISTIC_ORDER

@@ -1,6 +1,28 @@
 """Provider-neutral, tenant-safe speaker diarization contracts."""
 
+from app.diarization.alignment import (
+    UNKNOWN_LOCAL_SPEAKER_ID,
+    WordAlignmentError,
+    WordAlignmentErrorCategory,
+    WordAlignmentRequest,
+    align_words_to_speakers,
+)
 from app.diarization.fake_backend import FakeSpeakerDiarizer
+from app.diarization.composition import (
+    CustomerSpeechProjectorProtocol,
+    DiarizationCompositionOutcome,
+    DiarizationCompositionReason,
+    DiarizationCompositionRequest,
+    DiarizationCompositionStatus,
+    OfflineDiarizationComposer,
+)
+from app.diarization.identity_tracker import (
+    SpeakerIdentityTracker,
+    SpeakerIdentityTrackerCheckpoint,
+    SpeakerIdentityTrackingError,
+    SpeakerIdentityTrackingErrorCategory,
+    SpeakerIdentityTrackingRequest,
+)
 from app.diarization.models import (
     DiarizationRequest,
     DiarizationResult,
@@ -16,9 +38,34 @@ from app.diarization.pyannote_backend import (
     PyannoteDiarizationErrorCategory,
     PyannoteSpeakerDiarizer,
 )
+from app.diarization.role_resolver import (
+    RoleEvidenceCode,
+    RuleBasedSpeakerRoleResolver,
+    SpeakerAttributedTextSpan,
+    SpeakerRoleAssignment,
+    SpeakerRoleResolutionError,
+    SpeakerRoleResolutionErrorCategory,
+    SpeakerRoleResolutionRequest,
+    SpeakerRoleResolutionResult,
+    SpeakerRoleResolverProtocol,
+)
+from app.diarization.routing import (
+    CustomerProjectionReason,
+    CustomerProjectionStatus,
+    CustomerSpeechProjection,
+    CustomerSpeechProjectionRequest,
+    CustomerSpeechProjector,
+    DiarizationRoutingError,
+    DiarizationRoutingErrorCategory,
+    RoleTaggedWord,
+)
 
 __all__ = [
     "DiarizationRequest",
+    "DiarizationCompositionOutcome",
+    "DiarizationCompositionReason",
+    "DiarizationCompositionRequest",
+    "DiarizationCompositionStatus",
     "DiarizationResult",
     "DiarizationTurn",
     "DiarizedTranscriptEvent",
@@ -29,5 +76,34 @@ __all__ = [
     "PyannoteDiarizationErrorCategory",
     "PyannoteSpeakerDiarizer",
     "SpeakerDiarizerProtocol",
+    "SpeakerIdentityTracker",
+    "SpeakerIdentityTrackerCheckpoint",
+    "SpeakerIdentityTrackingError",
+    "SpeakerIdentityTrackingErrorCategory",
+    "SpeakerIdentityTrackingRequest",
     "SpeakerRole",
+    "SpeakerAttributedTextSpan",
+    "SpeakerRoleAssignment",
+    "SpeakerRoleResolutionError",
+    "SpeakerRoleResolutionErrorCategory",
+    "SpeakerRoleResolutionRequest",
+    "SpeakerRoleResolutionResult",
+    "SpeakerRoleResolverProtocol",
+    "RoleEvidenceCode",
+    "RuleBasedSpeakerRoleResolver",
+    "CustomerProjectionReason",
+    "CustomerProjectionStatus",
+    "CustomerSpeechProjection",
+    "CustomerSpeechProjectionRequest",
+    "CustomerSpeechProjector",
+    "DiarizationRoutingError",
+    "DiarizationRoutingErrorCategory",
+    "RoleTaggedWord",
+    "CustomerSpeechProjectorProtocol",
+    "OfflineDiarizationComposer",
+    "UNKNOWN_LOCAL_SPEAKER_ID",
+    "WordAlignmentError",
+    "WordAlignmentErrorCategory",
+    "WordAlignmentRequest",
+    "align_words_to_speakers",
 ]
