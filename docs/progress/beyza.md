@@ -202,3 +202,31 @@ Tarih: 28 Temmuz 2026
   dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
 - Sonraki planli adim: deployment/runtime readiness invocation'i ayri ve
   ownership-onayli bir PR kapsaminda ele alinacak.
+
+## PR39 - Explicit PostgreSQL RAG Profile Provisioning
+
+Tarih: 29 Temmuz 2026
+
+- Environment-backed secret PostgreSQL settings ve exact non-secret
+  tenant/knowledge-base provider JSON contract'i kullanan explicit deployment
+  operation'i ve thin CLI eklendi.
+- Islem sirasi side-effect-free composition, read-only schema readiness ve
+  explicit immutable profile registration'dir; returned canonical profile
+  complete equality ile dogrulanir.
+- CLI yalnizca `--provider-settings PATH` kabul eder; DSN ve connection
+  ayarlari CLI/JSON'a alinmaz. Basari, configuration ve operational sonuclar
+  fixed secret-safe mesajlarla sirasiyla 0, 2 ve 1 exit code'larina map edilir.
+- Migration, automatic repair/startup wiring, model load/download, ingestion,
+  retrieval, LLM, retry, logging ve pooling eklenmedi.
+- Eklenen dosyalar: `app/deployment/__init__.py`,
+  `app/deployment/postgres_rag.py`, `scripts/provision_postgres_rag.py`,
+  `tests/test_postgres_rag_provisioning.py`,
+  `tests/test_provision_postgres_rag_cli.py`; degisen dosya:
+  `docs/progress/beyza.md`.
+- Focused provisioning/CLI testleri: 34 passed; ilgili
+  PostgreSQL/composition/readiness/profile testleri: 435 passed.
+- Full suite 1538 test toplarken mevcut Torch `c10.dll` WinError 1114 nedeniyle
+  dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
+- Repository-wide Ruff check/format passed; Pyright 0 errors.
+- Sonraki planli adim: production deployment packaging/runbook ve operator
+  invocation'i ayri, ownership-onayli bir PR kapsaminda ele alinacak.
