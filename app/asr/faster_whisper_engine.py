@@ -1,9 +1,9 @@
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from math import isfinite
 from time import perf_counter
-from typing import Any
+from typing import Any, Protocol, cast
 
-from faster_whisper import WhisperModel
 from numpy.typing import NDArray
 
 from app.asr.models import (
@@ -13,6 +13,23 @@ from app.asr.models import (
     TranscriptionResult,
     TranscriptionSegment,
 )
+
+
+class _WhisperModelProtocol(Protocol):
+    def transcribe(
+        self,
+        audio: str | NDArray[Any],
+        **settings: Any,
+    ) -> tuple[Iterable[object], object]: ...
+
+
+type _WhisperModelConstructor = Callable[..., _WhisperModelProtocol]
+
+
+def _load_whisper_model_constructor() -> _WhisperModelConstructor:
+    from faster_whisper import WhisperModel
+
+    return cast(_WhisperModelConstructor, WhisperModel)
 
 
 class FasterWhisperEngine:
@@ -45,17 +62,18 @@ class FasterWhisperEngine:
         if max_skipped_zero_duration_words < 0:
             raise ValueError("max_skipped_zero_duration_words must be non-negative")
         self.max_skipped_zero_duration_words = max_skipped_zero_duration_words
-        self._model: WhisperModel | None = None
+        self._model: _WhisperModelProtocol | None = None
 
-    def _create_model(self) -> WhisperModel:
-        return WhisperModel(
+    def _create_model(self) -> _WhisperModelProtocol:
+        model_constructor = _load_whisper_model_constructor()
+        return model_constructor(
             self.model_size,
             device=self.device,
             compute_type=self.compute_type,
             cpu_threads=self.cpu_threads,
         )
 
-    def _get_model(self) -> WhisperModel:
+    def _get_model(self) -> _WhisperModelProtocol:
         if self._model is None:
             self._model = self._create_model()
         return self._model

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -56,6 +56,16 @@ class FakeWhisperModel:
         return segments, FakeTranscriptionInfo()
 
 
+def install_model_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+    constructor: Callable[..., object],
+) -> None:
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine._load_whisper_model_constructor",
+        lambda: constructor,
+    )
+
+
 def install_fake_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[list[FakeWhisperModel], list[tuple[object, ...]]]:
@@ -68,7 +78,7 @@ def install_fake_model(
         created_models.append(model)
         return model
 
-    monkeypatch.setattr("app.asr.faster_whisper_engine.WhisperModel", fake_constructor)
+    install_model_constructor(monkeypatch, fake_constructor)
     return created_models, constructor_calls
 
 
@@ -126,6 +136,45 @@ def test_model_is_loaded_lazily_and_reused(
     assert len(constructor_calls) == 1
     assert len(created_models) == 1
     assert len(created_models[0].transcribe_calls) == 2
+
+
+def test_loader_exception_identity_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_error = ImportError("synthetic provider import failure")
+
+    def failing_loader() -> object:
+        raise expected_error
+
+    monkeypatch.setattr(
+        "app.asr.faster_whisper_engine._load_whisper_model_constructor",
+        failing_loader,
+    )
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    with pytest.raises(ImportError) as raised:
+        FasterWhisperEngine().transcribe_file(audio_path)
+
+    assert raised.value is expected_error
+
+
+def test_model_constructor_exception_identity_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_error = RuntimeError("synthetic provider construction failure")
+
+    def failing_constructor(*args: object, **kwargs: object) -> object:
+        raise expected_error
+
+    install_model_constructor(monkeypatch, failing_constructor)
+    audio_path = tmp_path / "audio.wav"
+    audio_path.touch()
+
+    with pytest.raises(RuntimeError) as raised:
+        FasterWhisperEngine().transcribe_file(audio_path)
+
+    assert raised.value is expected_error
 
 
 def test_successful_transcription_returns_structured_result(
@@ -190,8 +239,8 @@ def test_missing_optional_metadata_uses_safe_defaults(
         ) -> tuple[Iterator[FakeSegment], object]:
             return iter([]), object()
 
-    monkeypatch.setattr(
-        "app.asr.faster_whisper_engine.WhisperModel",
+    install_model_constructor(
+        monkeypatch,
         lambda *args, **kwargs: ModelWithoutMetadata(),
     )
     audio_path = tmp_path / "audio.ogg"
@@ -228,10 +277,7 @@ def test_enabled_word_timestamps_are_requested_and_converted(
             ), FakeTranscriptionInfo()
 
     model = WordModel()
-    monkeypatch.setattr(
-        "app.asr.faster_whisper_engine.WhisperModel",
-        lambda *args, **kwargs: model,
-    )
+    install_model_constructor(monkeypatch, lambda *args, **kwargs: model)
     audio_path = tmp_path / "audio.wav"
     audio_path.touch()
 
@@ -297,8 +343,8 @@ def test_malformed_word_timestamps_fail_closed(
                 FakeTranscriptionInfo()
             )
 
-    monkeypatch.setattr(
-        "app.asr.faster_whisper_engine.WhisperModel",
+    install_model_constructor(
+        monkeypatch,
         lambda *args, **kwargs: MalformedWordModel(),
     )
     audio_path = tmp_path / "audio.wav"
@@ -327,8 +373,8 @@ def test_word_timestamps_reject_provider_order_without_sorting(
                 FakeTranscriptionInfo()
             )
 
-    monkeypatch.setattr(
-        "app.asr.faster_whisper_engine.WhisperModel",
+    install_model_constructor(
+        monkeypatch,
         lambda *args, **kwargs: UnorderedWordModel(),
     )
     audio_path = tmp_path / "audio.wav"
@@ -359,8 +405,8 @@ def test_one_zero_duration_artifact_is_skipped_without_changing_segment_text(
                 FakeTranscriptionInfo(duration=1.0)
             )
 
-    monkeypatch.setattr(
-        "app.asr.faster_whisper_engine.WhisperModel",
+    install_model_constructor(
+        monkeypatch,
         lambda *args, **kwargs: ZeroDurationArtifactModel(),
     )
     audio_path = tmp_path / "audio.wav"
@@ -394,8 +440,8 @@ def test_second_zero_duration_artifact_fails_closed(
                 FakeTranscriptionInfo(duration=1.0)
             )
 
-    monkeypatch.setattr(
-        "app.asr.faster_whisper_engine.WhisperModel",
+    install_model_constructor(
+        monkeypatch,
         lambda *args, **kwargs: ExcessArtifactsModel(),
     )
     audio_path = tmp_path / "audio.wav"
@@ -433,8 +479,8 @@ def test_out_of_bound_zero_duration_artifact_fails_closed(
                 ]
             ), FakeTranscriptionInfo(duration=1.0)
 
-    monkeypatch.setattr(
-        "app.asr.faster_whisper_engine.WhisperModel",
+    install_model_constructor(
+        monkeypatch,
         lambda *args, **kwargs: OutOfBoundsArtifactModel(),
     )
     audio_path = tmp_path / "audio.wav"
