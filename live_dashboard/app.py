@@ -56,6 +56,7 @@ from live_dashboard.view_models import (  # noqa: E402
     DashboardRuntime,
     DashboardTabsViewModel,
     LocalExecutionState,
+    StatusCardViewModel,
     UploadedAudioSession,
     apply_feedback,
     advance_runtime,
@@ -172,6 +173,45 @@ def _metric_rows(items: tuple[object, ...]) -> None:
             column.metric(label, value)
 
 
+def _render_speaker_dashboard(view: DashboardTabsViewModel) -> None:
+    speaker_dashboard = view.representative.speaker_dashboard
+    if speaker_dashboard is None:
+        return
+    st.subheader("Konuşmacı Görünümü")
+    _metric_rows(
+        (
+            StatusCardViewModel(
+                "Konuşmacı",
+                str(speaker_dashboard.speaker_count),
+            ),
+            StatusCardViewModel(
+                "Konuşma turu",
+                str(speaker_dashboard.turn_count),
+            ),
+            StatusCardViewModel(
+                "Müşteri kelimesi",
+                str(speaker_dashboard.projected_customer_word_count),
+            ),
+            StatusCardViewModel(
+                "UNKNOWN dışlama",
+                str(speaker_dashboard.unknown_exclusion_count),
+            ),
+        )
+    )
+    for row in responsive_rows(speaker_dashboard.speakers, 2):
+        columns = st.columns(len(row))
+        for column, speaker in zip(columns, row, strict=True):
+            with column:
+                with st.container(border=True):
+                    st.caption(speaker.slot)
+                    st.write(speaker.role)
+                    st.caption(
+                        f"Hizalanan kelime: {speaker.aligned_word_count} · "
+                        f"Güven: {speaker.confidence_bucket} · "
+                        f"Karar: {speaker.decision_reason}"
+                    )
+
+
 def _render_representative(
     runtime: DashboardRuntime,
     view: DashboardTabsViewModel,
@@ -212,6 +252,8 @@ def _render_representative(
     kpi_columns = st.columns(4)
     for column, kpi in zip(kpi_columns, representative_kpis(view), strict=True):
         column.metric(kpi.label, kpi.value)
+
+    _render_speaker_dashboard(view)
 
     left, right = st.columns(
         [1.65, 1],
