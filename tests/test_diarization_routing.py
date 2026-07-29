@@ -20,6 +20,7 @@ from app.diarization.routing import (
     CustomerSpeechProjector,
     DiarizationRoutingError,
     DiarizationRoutingErrorCategory,
+    ProjectionExclusionReason,
 )
 
 
@@ -176,6 +177,51 @@ def test_agent_unknown_overlap_and_missing_identity_are_excluded() -> None:
     assert projection.excluded_overlap_word_count == 1
     assert projection.status is CustomerProjectionStatus.EMPTY
     assert projection.reason is CustomerProjectionReason.NO_TRUSTED_CUSTOMER_SPEECH
+
+
+def test_projection_reports_fixed_aggregate_exclusion_reasons() -> None:
+    words = (
+        _word("Agent", 0, 1, "agent"),
+        _word("Unknown", 1, 2, "unknown"),
+        _word(
+            "Overlap",
+            2,
+            3,
+            "agent",
+            role=SpeakerRole.OVERLAP,
+            second_speaker_id="customer",
+        ),
+        _word("Missing", 3, 4, None),
+        _word("Low", 4, 5, "low-customer"),
+    )
+    projection = CustomerSpeechProjector().project(
+        _request(
+            _event(*words),
+            _resolution(
+                _assignment("agent", SpeakerRole.AGENT),
+                _assignment("unknown", SpeakerRole.UNKNOWN),
+                _assignment("customer", SpeakerRole.CUSTOMER),
+                _assignment(
+                    "low-customer",
+                    SpeakerRole.CUSTOMER,
+                    confidence=0.5,
+                ),
+            ),
+        )
+    )
+
+    counts = {item.reason: item.count for item in projection.exclusion_counts}
+    assert counts == {
+        ProjectionExclusionReason.AGENT: 1,
+        ProjectionExclusionReason.UNKNOWN_ROLE: 1,
+        ProjectionExclusionReason.OVERLAP: 1,
+        ProjectionExclusionReason.LOW_CONFIDENCE: 1,
+        ProjectionExclusionReason.MISSING_SPEAKER: 1,
+    }
+    assert projection.excluded_agent_word_count == 1
+    assert projection.excluded_unknown_word_count == 2
+    assert projection.excluded_overlap_word_count == 1
+    assert projection.excluded_below_confidence_word_count == 1
 
 
 def test_mixed_conversation_preserves_only_chronological_customer_word_order() -> None:
