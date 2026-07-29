@@ -12,7 +12,9 @@ import sys
 import time
 from pathlib import Path
 
-IMAGE = "pgvector/pgvector:0.8.5-pg16-bookworm"
+IMAGE_TAG = "pgvector/pgvector:0.8.5-pg16-bookworm"
+IMAGE_DIGEST = "sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb"
+IMAGE = f"{IMAGE_TAG}@{IMAGE_DIGEST}"
 SERVICE = "postgres-vector-integration"
 DATABASE = "callmetric_vector_test"
 USER = "callmetric_test"
@@ -186,6 +188,11 @@ def _cleanup(docker: str, project_name: str) -> None:
 
 
 def run() -> None:
+    if IMAGE != (
+        "pgvector/pgvector:0.8.5-pg16-bookworm@"
+        "sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb"
+    ):
+        raise IntegrationRunError("PostgreSQL integration image pin is invalid")
     docker = shutil.which("docker")
     if docker is None:
         raise IntegrationRunError("docker executable is unavailable")

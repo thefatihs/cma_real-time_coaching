@@ -1,7 +1,7 @@
 # Synthetic local integration credentials only. Never use this service in production.
 services:
   postgres-vector-integration:
-    image: pgvector/pgvector:0.8.5-pg16-bookworm
+    image: pgvector/pgvector:0.8.5-pg16-bookworm@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
     restart: "no"
     environment:
       POSTGRES_DB: callmetric_vector_test
