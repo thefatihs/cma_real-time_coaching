@@ -267,12 +267,18 @@ def test_composition_is_frozen_slotted_and_exports_are_exact(
     with pytest.raises(FrozenInstanceError):
         setattr(result, "prompt_builder", DeterministicPromptBuilder())
     assert composition_exports.__all__ == [
+        "BoundedPostgreSQLRAGManager",
         "KnowledgeBaseRAGProviderSettings",
         "LLMGatewayFactory",
         "ProfileVerifiedPostgreSQLRAGRunner",
         "PostgreSQLRAGOrchestrationComposition",
         "PostgreSQLRAGComposition",
         "PostgreSQLVectorStoreSettings",
+        "RAGOrchestrationCompletion",
+        "RAGOrchestrationCompletionStatus",
+        "RAGOrchestrationIdentity",
+        "RAGOrchestrationSubmission",
+        "RAGOrchestrationSubmissionStatus",
         "compose_profile_bound_postgres_rag",
         "compose_profile_bound_postgres_rag_orchestration",
     ]
