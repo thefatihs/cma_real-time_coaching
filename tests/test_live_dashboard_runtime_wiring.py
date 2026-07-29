@@ -3,6 +3,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from app.calls.models import CallState
 from app.classification.runtime import RuntimeSetFitClassifier
 from app.coaching.coordinator import CoachingCoordinator
@@ -33,6 +35,8 @@ from app.tenancy.models import TenantCoachingConfig, TenantRAGConfig
 from live_dashboard.demo_data import TenantDemo, tenant_demos
 from live_dashboard.runtime_wiring import (
     ArtifactAvailability,
+    DashboardExecutionIdentity,
+    DashboardExecutionResource,
     DashboardServiceSelection,
     build_live_pipeline,
     default_service_selection,
@@ -405,3 +409,49 @@ def test_factory_creates_isolated_structurally_compatible_processors() -> None:
     assert first._coordinator.call_state is first_state  # noqa: SLF001
     assert second._coordinator.call_state is second_state  # noqa: SLF001
     assert runner.calls == callbacks.id_calls == callbacks.clock_calls == 0
+
+
+def test_execution_resource_retains_exact_pipeline_and_completion_pump() -> None:
+    tenant = enabled_tenant()
+    subject = create_local_execution(tenant, "call-one").runtime
+    integration, manager, callbacks = integration_dependencies()
+    resource = DashboardExecutionResource(
+        DashboardExecutionIdentity("tenant_alpha", "call-one"),
+        integration=integration,
+    )
+    pipeline = build_live_pipeline(
+        subject,
+        TypedFakeTranscriber(),
+        selection=DashboardServiceSelection(False, True),
+        availability=ArtifactAvailability(True),
+        classifier_provider=RuntimeSetFitClassifier,
+        integration=integration,
+        execution_resource=resource,
+    )
+    factory = pipeline._coaching_coordinator_factory  # noqa: SLF001
+    assert factory is not None
+
+    processor = factory(CallState(tenant_id="tenant_alpha", call_id="call-one"))
+
+    assert isinstance(processor, RAGCoachingProcessorDecorator)
+    assert resource._pipeline is pipeline  # noqa: SLF001
+    assert resource._completion_pump is processor  # noqa: SLF001
+    assert manager.calls == callbacks.id_calls == callbacks.clock_calls == 0
+
+
+def test_execution_resource_scope_mismatch_fails_before_construction() -> None:
+    subject = runtime()
+    resource = DashboardExecutionResource(
+        DashboardExecutionIdentity("tenant_alpha", "call-other"),
+        integration=None,
+    )
+
+    with pytest.raises(ValueError, match="scope"):
+        build_live_pipeline(
+            subject,
+            TypedFakeTranscriber(),
+            selection=DashboardServiceSelection(False, True),
+            availability=ArtifactAvailability(True),
+            classifier_provider=RuntimeSetFitClassifier,
+            execution_resource=resource,
+        )
