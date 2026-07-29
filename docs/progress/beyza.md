@@ -384,3 +384,30 @@ Tarih: 29 Temmuz 2026
   script passed ve conflict-marker testleri 5 passed.
 - Sonraki onayli PR46 fazi: concrete vLLM gateway ve secret-safe settings;
   runtime, deployment CLI ve coaching wiring ertelendi.
+
+## PR46-B - External vLLM OpenAI-Compatible Gateway
+
+Tarih: 29 Temmuz 2026
+
+- Frozen, environment-backed ve secret-safe
+  `VLLMOpenAICompatibleSettings` ile external HTTPS `/v1` vLLM endpoint
+  contract'i eklendi.
+- `VLLMOpenAICompatibleGateway`, existing non-streaming `LLMGateway`
+  contract'ini short-lived synchronous `httpx.Client` ile uygular; request'e
+  tenant/call identity eklemez ve provider response scope'una guvenmez.
+- Strict response validation exact tek completion choice gerektirir; timeout,
+  transport ve HTTP status exception'lari native olarak korunur, semantic
+  response hatalari fixed secret-safe `ValueError` ile fail-closed kapanir.
+- `httpx>=0.28.1,<0.29` dev grubundan ayni locked 0.28.1 surumuyle direct
+  runtime dependency'ye tasindi; baska package resolution veya Torch/CUDA
+  marker'i degismedi.
+- Eklenen dosyalar: `app/llm/vllm_openai_compatible.py`,
+  `tests/test_vllm_openai_compatible_gateway.py`; degisen dosyalar:
+  `app/llm/__init__.py`, `pyproject.toml`, `uv.lock`,
+  `docs/progress/beyza.md`.
+- Focused vLLM/LLM/composition/orchestration testleri: 119 passed.
+- Full suite: 1883 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`
+  ve conflict-marker script passed; conflict-marker testleri 5 passed.
+- Bu PR external vLLM OpenAI-compatible gateway'i ekler; vLLM Python runtime,
+  model, Docker veya Linux/GPU deployment'i uygulama paketine eklenmedi.
