@@ -84,3 +84,13 @@ This log uses local chronological numbering and records only Fatih-owned work.
   Pyright passed.
 - Next planned step: use the scanner as part of normal repository validation;
   no runtime integration is required.
+
+## F-015 â€” Pyannote Terminal Boundary Normalization
+
+- Added a fail-closed 50 ms tolerance that clamps only the selected output's
+  terminal end boundary to the call window.
+- Changed files: `app/diarization/pyannote_backend.py`,
+  `tests/test_pyannote_diarization_backend.py`, `docs/progress/fatih.md`.
+- Tests: focused 47 passed; full 1555 passed and 10 opt-in integration tests
+  skipped (1 dependency warning). Ruff and Pyright passed.
+- Next planned step: validate the bounded policy in the Linux CPU runtime.
