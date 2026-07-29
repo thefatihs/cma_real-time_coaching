@@ -167,9 +167,11 @@ def test_public_signature_and_exports_are_exact() -> None:
     assert deployment_exports.__all__ == [
         "PostgreSQLMigrationResult",
         "PostgreSQLMigrationSettings",
+        "PostgreSQLRAGRetrievalRequest",
         "apply_postgres_vector_migrations",
         "ingest_profile_bound_postgres_rag",
         "provision_profile_bound_postgres_rag",
+        "retrieve_profile_bound_postgres_rag",
     ]
     assert (
         deployment_exports.provision_profile_bound_postgres_rag
