@@ -107,3 +107,17 @@ This log uses local chronological numbering and records only Fatih-owned work.
   skipped (1 dependency warning). Ruff and Pyright passed.
 - Next planned step: use the aggregate contracts in privacy-safe operator
   diagnostics.
+
+## F-017 — Speaker-Aware Dashboard
+
+- Added a scope-checked, bounded dashboard projection for existing diarization
+  role diagnostics and aggregate customer-projection counts without retaining
+  speaker IDs, transcript text, timestamps, or evidence content.
+- Changed files: `live_dashboard/app.py`, `live_dashboard/view_models.py`,
+  `tests/test_live_dashboard_rendering.py`,
+  `tests/test_live_dashboard_speaker_view.py`, `docs/progress/fatih.md`.
+- Tests: focused dashboard tests 80 passed; full suite 1986 passed and 12
+  opt-in integration tests skipped (1 existing dependency warning). Ruff and
+  Pyright passed.
+- Next planned step: wire the aggregate view into an explicitly diarization-
+  enabled live runtime while preserving the legacy dashboard path.

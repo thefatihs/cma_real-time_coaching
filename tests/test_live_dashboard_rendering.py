@@ -14,6 +14,8 @@ from live_dashboard.presentation import ui_scope_identity
 from live_dashboard.view_models import (
     create_local_execution,
     dashboard_tabs,
+    SpeakerCardViewModel,
+    SpeakerDashboardViewModel,
     SuggestionCardViewModel,
 )
 
@@ -190,6 +192,55 @@ def test_representative_renderer_handles_empty_history(
     app = _load_dashboard_app(monkeypatch, recorder)
 
     app._render_representative(state.runtime, tabs, _scope())
+
+
+def test_representative_renderer_shows_bounded_speaker_aggregates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    tabs = dashboard_tabs(state.runtime, state)
+    speaker_dashboard = SpeakerDashboardViewModel(
+        speakers=(
+            SpeakerCardViewModel(
+                slot="SPEAKER_1",
+                role="AGENT",
+                aligned_word_count=8,
+                confidence_bucket="HIGH",
+                decision_reason="strong_agent",
+            ),
+            SpeakerCardViewModel(
+                slot="SPEAKER_2",
+                role="Rol belirleniyor",
+                aligned_word_count=5,
+                confidence_bucket="NONE",
+                decision_reason="insufficient",
+            ),
+        ),
+        speaker_count=2,
+        turn_count=4,
+        projected_customer_word_count=0,
+        unknown_exclusion_count=5,
+    )
+    representative = replace(
+        tabs.representative,
+        speaker_dashboard=speaker_dashboard,
+    )
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+
+    app._render_representative(
+        state.runtime,
+        replace(tabs, representative=representative),
+        _scope(),
+    )
+
+    rendered = " ".join([*recorder.writes, *recorder.captions])
+    assert "SPEAKER_1" in rendered
+    assert "SPEAKER_2" in rendered
+    assert "Rol belirleniyor" in rendered
+    assert "private" not in rendered
+    assert ("Konuşmacı", "2") in recorder.metrics
+    assert ("UNKNOWN dışlama", "5") in recorder.metrics
 
 
 def test_representative_renderer_shows_non_empty_history(

@@ -23,6 +23,11 @@ from app.coaching.coordinator import (
     StableCoachingOutcome,
 )
 from app.coaching.rule_engine import RuleBasedCoachingEngine
+from app.diarization.composition import (
+    DiarizationCompositionOutcome,
+    DiarizationCompositionStatus,
+)
+from app.diarization.models import SpeakerRole
 from app.events.models import (
     CoachingAction,
     CoachingSuggestionEvent,
@@ -153,6 +158,24 @@ class StatusCardViewModel:
 
 
 @dataclass(frozen=True, slots=True)
+class SpeakerCardViewModel:
+    slot: str
+    role: str
+    aligned_word_count: int
+    confidence_bucket: str
+    decision_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerDashboardViewModel:
+    speakers: tuple[SpeakerCardViewModel, ...]
+    speaker_count: int
+    turn_count: int
+    projected_customer_word_count: int
+    unknown_exclusion_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class LatencyViewModel:
     chunk_duration_ms: float
     asr_ms: float
@@ -188,6 +211,7 @@ class RepresentativeTabViewModel:
     safe_messages: tuple[str, ...]
     active_suggestions: tuple[SuggestionCardViewModel, ...] = ()
     suggestion_history: tuple[SuggestionCardViewModel, ...] = ()
+    speaker_dashboard: SpeakerDashboardViewModel | None = None
 
     @property
     def suggestions(self) -> tuple[SuggestionCardViewModel, ...]:
@@ -710,10 +734,116 @@ def progress_view(state: LocalExecutionState) -> ProgressViewModel:
     )
 
 
+def speaker_dashboard_view(
+    outcome: DiarizationCompositionOutcome,
+    *,
+    tenant_id: str,
+    call_id: str,
+    transcript_revision: int,
+) -> SpeakerDashboardViewModel | None:
+    """Reduce a valid diarization outcome to bounded, content-free UI aggregates."""
+    role_resolution = outcome.role_resolution
+    projection = outcome.customer_projection
+    expected_scope = (tenant_id, call_id, transcript_revision)
+    if (
+        outcome.status
+        not in {
+            DiarizationCompositionStatus.COMPLETED,
+            DiarizationCompositionStatus.EMPTY,
+        }
+        or role_resolution is None
+        or projection is None
+        or (outcome.tenant_id, outcome.call_id, outcome.transcript_revision)
+        != expected_scope
+        or (
+            role_resolution.tenant_id,
+            role_resolution.call_id,
+            role_resolution.transcript_revision,
+        )
+        != expected_scope
+        or (
+            projection.tenant_id,
+            projection.call_id,
+            projection.transcript_revision,
+        )
+        != expected_scope
+    ):
+        return None
+
+    assignments = role_resolution.assignments
+    diagnostics = role_resolution.diagnostics
+    if (
+        not assignments
+        or len(assignments) > 2
+        or len(diagnostics) != len(assignments)
+        or any(
+            assignment.global_speaker_id is None
+            or diagnostic.final_role is not assignment.role
+            for assignment, diagnostic in zip(assignments, diagnostics, strict=True)
+        )
+    ):
+        return None
+
+    speaker_rows = sorted(
+        zip(assignments, diagnostics, strict=True),
+        key=lambda row: row[0].global_speaker_id or "",
+    )
+    speaker_ids = tuple(assignment.global_speaker_id for assignment, _ in speaker_rows)
+    if len(set(speaker_ids)) != len(speaker_ids):
+        return None
+    aligned_counts = dict.fromkeys(speaker_ids, 0)
+    for word in outcome.diarized_words:
+        if (
+            word.tenant_id != tenant_id
+            or word.call_id != call_id
+            or word.transcript_revision != transcript_revision
+        ):
+            return None
+        word_speakers = word.global_speaker_ids or (
+            (word.global_speaker_id,) if word.global_speaker_id is not None else ()
+        )
+        for speaker_id in word_speakers:
+            if speaker_id in aligned_counts:
+                aligned_counts[speaker_id] += 1
+    if any(
+        turn.tenant_id != tenant_id or turn.call_id != call_id
+        for turn in outcome.tracked_turns
+    ) or any(
+        word.tenant_id != tenant_id
+        or word.call_id != call_id
+        or word.transcript_revision != transcript_revision
+        for word in projection.customer_words
+    ):
+        return None
+
+    speakers = tuple(
+        SpeakerCardViewModel(
+            slot=f"SPEAKER_{index}",
+            role=(
+                "Rol belirleniyor"
+                if assignment.role is SpeakerRole.UNKNOWN
+                else assignment.role.value
+            ),
+            aligned_word_count=aligned_counts[assignment.global_speaker_id],
+            confidence_bucket=diagnostic.confidence_bucket.value.upper(),
+            decision_reason=diagnostic.final_decision_reason.value,
+        )
+        for index, (assignment, diagnostic) in enumerate(speaker_rows, start=1)
+    )
+    return SpeakerDashboardViewModel(
+        speakers=speakers,
+        speaker_count=len(speakers),
+        turn_count=len(outcome.tracked_turns),
+        projected_customer_word_count=len(projection.customer_words),
+        unknown_exclusion_count=projection.excluded_unknown_word_count,
+    )
+
+
 def dashboard_tabs(
     runtime: DashboardRuntime,
     local_state: LocalExecutionState | None = None,
     audio_metadata: SafeUploadMetadata | None = None,
+    diarization_outcome: DiarizationCompositionOutcome | None = None,
 ) -> DashboardTabsViewModel:
     """Build presentation-only data for the three product views."""
     local_mode = local_state is not None
@@ -860,6 +990,16 @@ def dashboard_tabs(
             safe_messages=safe_messages,
             active_suggestions=representative_suggestions,
             suggestion_history=tuple(ordered_suggestions(runtime.suggestion_history)),
+            speaker_dashboard=(
+                speaker_dashboard_view(
+                    diarization_outcome,
+                    tenant_id=runtime.call_state.tenant_id,
+                    call_id=runtime.call_id,
+                    transcript_revision=runtime.call_state.transcript_revision,
+                )
+                if diarization_outcome is not None
+                else None
+            ),
         ),
         technical=TechnicalTabViewModel(
             progress=progress,
