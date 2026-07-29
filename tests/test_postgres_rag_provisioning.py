@@ -164,7 +164,12 @@ def test_public_signature_and_exports_are_exact() -> None:
     assert all(
         parameter.kind.name == "KEYWORD_ONLY" for parameter in parameters.values()
     )
-    assert deployment_exports.__all__ == ["provision_profile_bound_postgres_rag"]
+    assert deployment_exports.__all__ == [
+        "PostgreSQLMigrationResult",
+        "PostgreSQLMigrationSettings",
+        "apply_postgres_vector_migrations",
+        "provision_profile_bound_postgres_rag",
+    ]
     assert (
         deployment_exports.provision_profile_bound_postgres_rag
         is deployment.provision_profile_bound_postgres_rag

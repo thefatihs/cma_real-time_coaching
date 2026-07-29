@@ -230,3 +230,29 @@ Tarih: 29 Temmuz 2026
 - Repository-wide Ruff check/format passed; Pyright 0 errors.
 - Sonraki planli adim: production deployment packaging/runbook ve operator
   invocation'i ayri, ownership-onayli bir PR kapsaminda ele alinacak.
+
+## PR40 - Explicit PostgreSQL Vector Migration
+
+Tarih: 29 Temmuz 2026
+
+- Fixed `0001_vector_store.sql` registry, SHA-256 integrity validation,
+  session advisory lock, fail-closed state inspection ve separate readiness
+  verification kullanan explicit forward-only migration operation'i eklendi.
+- Migration ve readiness connection'lari lock/statement timeout'larini yalniz
+  strictly validated integer settings'ten uretilen exact libpq `options`
+  kwarg'i ile alir; timeout SQL'i, configuration commit'i veya application
+  import/startup migration'i eklenmedi.
+- Migration file'in owned `BEGIN`/`COMMIT` siniri korunur; inspection rollback
+  whole-file execution'dan once yapilir ve connection lifecycle explicit
+  migration operation'i tarafindan yonetilir.
+- Gercek Docker PostgreSQL 16.14 ve pgvector `0.8.5-pg16-bookworm`
+  entegrasyonu: 11 passed; concurrent advisory-lock migration, idempotency,
+  readiness ve mevcut vector-store akislarini dogruladi.
+- Integration runner'a ait project-scoped container, network ve volume
+  basariyla kaldirildi.
+- Focused PostgreSQL/composition/embedding/ingestion/retrieval testleri:
+  546 passed; son dogrudan PR40 testleri: 55 passed.
+- Full suite bilinen Torch/CTranslate2 Windows DLL access-violation'i nedeniyle
+  ASR/diarization test collection asamasinda durdu.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
+  script passed ve conflict-marker testleri 5 passed.

@@ -23,7 +23,6 @@ PROJECT_NAME_PATTERN = re.compile(r"^callmetric-pgvector-[0-9]+-[a-f0-9]{12}$")
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = REPOSITORY_ROOT / "compose.postgres-integration.yml"
-MIGRATION_FILE = REPOSITORY_ROOT / "migrations" / "postgres" / "0001_vector_store.sql"
 INTEGRATION_TEST = (
     REPOSITORY_ROOT / "tests" / "integration" / "test_postgres_vector_integration.py"
 )
@@ -132,29 +131,9 @@ def _published_port(docker: str, project_name: str) -> int:
     return port
 
 
-def _apply_migration(docker: str, project_name: str) -> None:
-    migration = MIGRATION_FILE.read_text(encoding="utf-8")
-    _run(
-        _compose_arguments(
-            docker,
-            project_name,
-            "exec",
-            "-T",
-            SERVICE,
-            "psql",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-U",
-            USER,
-            "-d",
-            DATABASE,
-        ),
-        input_text=migration,
-    )
-
-
 def _pytest_environment(port: int) -> dict[str, str]:
     environment = os.environ.copy()
+    migration_dsn = f"postgresql://{USER}:{PASSWORD}@{LOOPBACK_HOST}:{port}/{DATABASE}"
     environment.update(
         {
             "CALLMETRIC_POSTGRES_INTEGRATION": "1",
@@ -164,6 +143,14 @@ def _pytest_environment(port: int) -> dict[str, str]:
             "CALLMETRIC_POSTGRES_USER": USER,
             "CALLMETRIC_POSTGRES_PASSWORD": PASSWORD,
             "CALLMETRIC_POSTGRES_CONNECT_TIMEOUT": "5",
+            "CALLMETRIC_POSTGRES_MIGRATION_DSN": migration_dsn,
+            "CALLMETRIC_POSTGRES_MIGRATION_CONNECT_TIMEOUT_SECONDS": "5",
+            "CALLMETRIC_POSTGRES_MIGRATION_SSL_MODE": "require",
+            "CALLMETRIC_POSTGRES_MIGRATION_APPLICATION_NAME": (
+                "callmetric-integration-migration"
+            ),
+            "CALLMETRIC_POSTGRES_MIGRATION_LOCK_TIMEOUT_SECONDS": "10",
+            "CALLMETRIC_POSTGRES_MIGRATION_STATEMENT_TIMEOUT_SECONDS": "30",
         }
     )
     return environment
@@ -216,7 +203,6 @@ def run() -> None:
         _run(_compose_arguments(docker, project_name, "up", "-d"))
         _wait_until_healthy(docker, project_name)
         port = _published_port(docker, project_name)
-        _apply_migration(docker, project_name)
         _run(
             [
                 sys.executable,
