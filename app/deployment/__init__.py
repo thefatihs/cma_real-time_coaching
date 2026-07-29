@@ -3,6 +3,12 @@
 from app.deployment.postgres_migrations import (
     PostgreSQLMigrationResult as PostgreSQLMigrationResult,
 )
+from app.deployment.postgres_orchestration import (
+    PostgreSQLRAGOrchestrationLimits as PostgreSQLRAGOrchestrationLimits,
+)
+from app.deployment.postgres_orchestration import (
+    orchestrate_profile_bound_postgres_rag as orchestrate_profile_bound_postgres_rag,
+)
 from app.deployment.postgres_migrations import (
     PostgreSQLMigrationSettings as PostgreSQLMigrationSettings,
 )
@@ -25,9 +31,11 @@ from app.deployment.postgres_retrieval import (
 __all__ = [
     "PostgreSQLMigrationResult",
     "PostgreSQLMigrationSettings",
+    "PostgreSQLRAGOrchestrationLimits",
     "PostgreSQLRAGRetrievalRequest",
     "apply_postgres_vector_migrations",
     "ingest_profile_bound_postgres_rag",
+    "orchestrate_profile_bound_postgres_rag",
     "provision_profile_bound_postgres_rag",
     "retrieve_profile_bound_postgres_rag",
 ]
