@@ -22,6 +22,9 @@ from app.streaming.window_transcriber import WindowTranscriber  # noqa: E402
 from live_dashboard.demo_data import scenario_for, tenant_demos  # noqa: E402
 from live_dashboard.runtime_wiring import (  # noqa: E402
     ArtifactAvailability,
+    DashboardExecutionIdentity,
+    DashboardExecutionResource,
+    DashboardExecutionResourceRegistry,
     DashboardServiceSelection,
     build_live_pipeline,
     default_service_selection,
@@ -82,6 +85,9 @@ div[data-testid="stVerticalBlock"] {gap:.75rem}
 </style>
 """)
 
+_EXECUTION_RESOURCE_CAPACITY = 8
+_EXECUTION_RESOURCE_SESSION_KEY = "dashboard_execution_resource_key"
+
 
 @st.cache_resource(show_spinner="ASR modeli yükleniyor…")
 def _load_asr_model(
@@ -114,10 +120,47 @@ def _artifact_availability() -> ArtifactAvailability:
     return inspect_default_artifacts()
 
 
+@st.cache_resource(show_spinner=False)
+def _execution_resource_registry(
+    capacity: int,
+) -> DashboardExecutionResourceRegistry:
+    return DashboardExecutionResourceRegistry(capacity=capacity)
+
+
+def _execution_resource(runtime: DashboardRuntime) -> DashboardExecutionResource:
+    registry = _execution_resource_registry(_EXECUTION_RESOURCE_CAPACITY)
+    identity = DashboardExecutionIdentity(
+        runtime.tenant.config.context.tenant_id,
+        runtime.call_id,
+    )
+    previous_key = st.session_state.get(_EXECUTION_RESOURCE_SESSION_KEY)
+    if previous_key is not None and previous_key != identity.opaque_key:
+        if not isinstance(previous_key, str):
+            raise ValueError("dashboard execution resource key is invalid")
+        registry.close_and_remove(previous_key)
+    resource = registry.acquire(
+        tenant_id=identity.tenant_id,
+        call_id=identity.call_id,
+        integration=None,
+    )
+    st.session_state[_EXECUTION_RESOURCE_SESSION_KEY] = resource.opaque_key
+    return resource
+
+
+def _close_execution_resource() -> None:
+    key = st.session_state.pop(_EXECUTION_RESOURCE_SESSION_KEY, None)
+    if key is None:
+        return
+    if not isinstance(key, str):
+        raise ValueError("dashboard execution resource key is invalid")
+    _execution_resource_registry(_EXECUTION_RESOURCE_CAPACITY).close_and_remove(key)
+
+
 def _make_pipeline(
     runtime: DashboardRuntime,
     selection: DashboardServiceSelection,
     availability: ArtifactAvailability,
+    execution_resource: DashboardExecutionResource,
 ) -> StreamingASRPipeline:
     config = runtime.tenant.config
     engine = _load_asr_model(
@@ -134,6 +177,8 @@ def _make_pipeline(
         selection=selection,
         availability=availability,
         classifier_provider=_load_runtime_classifier,
+        integration=None,
+        execution_resource=execution_resource,
     )
 
 
@@ -717,6 +762,7 @@ with st.sidebar:
         if st.button("Sonraki olay", use_container_width=True):
             advance_runtime(_synthetic_runtime())
         if st.button("Sıfırla", use_container_width=True):
+            _close_execution_resource()
             st.session_state.pop("synthetic_signature", None)
             st.session_state.playing = False
             st.session_state.suggestion_feedback = {}
@@ -767,10 +813,12 @@ with st.sidebar:
                         sleep(max(duration - step.transcription_time_seconds, 0.0))
 
                 try:
+                    execution_resource = _execution_resource(local.runtime)
                     pipeline = _make_pipeline(
                         local.runtime,
                         service_selection,
                         artifact_availability,
+                        execution_resource,
                     )
                     if (
                         source_mode == "Dosya yükle"
@@ -788,6 +836,9 @@ with st.sidebar:
                         if not path.is_file():
                             raise ValueError("Ses dosyası bulunamadı")
                         execute_local_once(local, pipeline, path, show_step, show_plan)
+                    execution_resource.drain_completed(
+                        current_seconds=local.audio_duration_seconds or 0.0,
+                    )
                     live_progress.progress(1.0, text="Tamamlandı · %100")
                 except Exception:
                     local.status = "error"
@@ -796,6 +847,7 @@ with st.sidebar:
                     st.error(local.error_message)
         st.button("Durdur", disabled=not local.stop_enabled, use_container_width=True)
         if st.button("Sıfırla", use_container_width=True):
+            _close_execution_resource()
             if source_mode == "Dosya yükle":
                 upload_session.reset()
             else:

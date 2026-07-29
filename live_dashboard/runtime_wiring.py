@@ -2,7 +2,9 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 
 from app.calls.models import CallState
 from app.classification.artifacts import load_training_metadata, sha256_file
@@ -19,9 +21,11 @@ from app.classification.threshold_profiles import load_threshold_profile
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.rule_engine import RuleBasedCoachingEngine
 from app.integration import (
+    CoachingCompletionPumpProtocol,
     RAGCoachingIntegrationDependencies,
     compose_rag_coaching_processor,
 )
+from app.coaching.coordinator import StableCoachingOutcome
 from app.streaming.pipeline import (
     CoachingProcessorProtocol,
     StreamingASRPipeline,
@@ -44,6 +48,216 @@ class DashboardServiceSelection:
 
 
 ClassifierProvider = Callable[[], RuntimeSetFitClassifier]
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardExecutionIdentity:
+    tenant_id: str
+    call_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "tenant_id", _required_text(self.tenant_id, "tenant_id")
+        )
+        object.__setattr__(self, "call_id", _required_text(self.call_id, "call_id"))
+
+    @property
+    def opaque_key(self) -> str:
+        value = f"{self.tenant_id}\0{self.call_id}".encode()
+        return sha256(value).hexdigest()
+
+
+class DashboardExecutionResource:
+    """Own one call-scoped dashboard pipeline and optional completion pump."""
+
+    def __init__(
+        self,
+        identity: DashboardExecutionIdentity,
+        *,
+        integration: RAGCoachingIntegrationDependencies | None,
+    ) -> None:
+        if not isinstance(identity, DashboardExecutionIdentity):
+            raise ValueError("identity must be DashboardExecutionIdentity")
+        if integration is not None and not isinstance(
+            integration,
+            RAGCoachingIntegrationDependencies,
+        ):
+            raise ValueError(
+                "integration must be RAGCoachingIntegrationDependencies or None"
+            )
+        self._identity = identity
+        self._integration = integration
+        self._manager = None if integration is None else integration.background_manager
+        self._pipeline: StreamingASRPipeline | None = None
+        self._completion_pump: CoachingCompletionPumpProtocol | None = None
+        self._lock = Lock()
+        self._closed = False
+        self._manager_closed = False
+
+    @property
+    def identity(self) -> DashboardExecutionIdentity:
+        return self._identity
+
+    @property
+    def opaque_key(self) -> str:
+        return self._identity.opaque_key
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def integration(self) -> RAGCoachingIntegrationDependencies | None:
+        return self._integration
+
+    def attach_pipeline(self, pipeline: StreamingASRPipeline) -> None:
+        if not isinstance(pipeline, StreamingASRPipeline):
+            raise ValueError("pipeline must be StreamingASRPipeline")
+        with self._lock:
+            self._require_open()
+            if self._pipeline is not None and self._pipeline is not pipeline:
+                raise RuntimeError("dashboard execution pipeline is already attached")
+            self._pipeline = pipeline
+
+    def bind_completion_pump(
+        self,
+        processor: CoachingProcessorProtocol,
+    ) -> None:
+        if not isinstance(processor, CoachingCompletionPumpProtocol):
+            return
+        with self._lock:
+            self._require_open()
+            if (
+                self._completion_pump is not None
+                and self._completion_pump is not processor
+            ):
+                raise RuntimeError("dashboard completion pump is already attached")
+            self._completion_pump = processor
+
+    def drain_completed(
+        self,
+        *,
+        current_seconds: float,
+    ) -> tuple[StableCoachingOutcome, ...]:
+        with self._lock:
+            self._require_open()
+            pump = self._completion_pump
+        if pump is None:
+            return ()
+        return pump.drain_completed(current_seconds=current_seconds)
+
+    def close(self) -> None:
+        manager = None
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._pipeline = None
+            self._completion_pump = None
+            if not self._manager_closed:
+                self._manager_closed = True
+                manager = self._manager
+            self._manager = None
+            self._integration = None
+        if manager is not None:
+            manager.close(wait=False)
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("dashboard execution resource is closed")
+
+
+class DashboardExecutionResourceRegistry:
+    """Bounded process-owned lookup for call-scoped execution resources."""
+
+    def __init__(self, *, capacity: int) -> None:
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("capacity must be a positive integer")
+        self._capacity = capacity
+        self._resources: dict[str, DashboardExecutionResource] = {}
+        self._lock = Lock()
+
+    def acquire(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        integration: RAGCoachingIntegrationDependencies | None,
+    ) -> DashboardExecutionResource:
+        identity = DashboardExecutionIdentity(tenant_id, call_id)
+        key = identity.opaque_key
+        with self._lock:
+            existing = self._resources.get(key)
+            if existing is not None:
+                if existing.identity != identity:
+                    raise ValueError("dashboard execution scope does not match")
+                if existing.closed:
+                    raise RuntimeError(
+                        "closed dashboard execution resource is retained"
+                    )
+                if existing.integration is not integration:
+                    raise RuntimeError(
+                        "dashboard execution integration cannot be replaced"
+                    )
+                return existing
+            if len(self._resources) >= self._capacity:
+                raise RuntimeError("dashboard execution resource capacity is exhausted")
+            resource = DashboardExecutionResource(
+                identity,
+                integration=integration,
+            )
+            self._resources[key] = resource
+            return resource
+
+    def lookup(
+        self,
+        opaque_key: str,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> DashboardExecutionResource:
+        key = _required_text(opaque_key, "opaque_key")
+        identity = DashboardExecutionIdentity(tenant_id, call_id)
+        with self._lock:
+            resource = self._resources.get(key)
+            if resource is None or resource.identity != identity:
+                raise ValueError("dashboard execution resource scope does not match")
+            if resource.closed:
+                raise RuntimeError("dashboard execution resource is closed")
+            return resource
+
+    def remove(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> None:
+        identity = DashboardExecutionIdentity(tenant_id, call_id)
+        key = identity.opaque_key
+        with self._lock:
+            resource = self._resources.get(key)
+            if resource is None:
+                raise ValueError("dashboard execution resource does not exist")
+            if resource.identity != identity:
+                raise ValueError("dashboard execution resource scope does not match")
+            if not resource.closed:
+                raise RuntimeError(
+                    "dashboard execution resource must be closed before removal"
+                )
+            self._resources.pop(key)
+
+    def close_and_remove(self, opaque_key: str) -> None:
+        key = _required_text(opaque_key, "opaque_key")
+        with self._lock:
+            resource = self._resources.get(key)
+        if resource is None:
+            raise ValueError("dashboard execution resource does not exist")
+        resource.close()
+        with self._lock:
+            if self._resources.get(key) is not resource:
+                raise RuntimeError("dashboard execution resource changed during close")
+            self._resources.pop(key)
 
 
 def inspect_default_artifacts(
@@ -102,6 +316,7 @@ def build_live_pipeline(
     availability: ArtifactAvailability,
     classifier_provider: ClassifierProvider,
     integration: RAGCoachingIntegrationDependencies | None = None,
+    execution_resource: DashboardExecutionResource | None = None,
 ) -> StreamingASRPipeline:
     """Build one uploaded-audio pipeline with optional existing services."""
     classifier = (
@@ -109,8 +324,23 @@ def build_live_pipeline(
         if selection.enable_setfit and availability.compatible
         else None
     )
+    if execution_resource is not None:
+        expected_identity = DashboardExecutionIdentity(
+            runtime.tenant.config.context.tenant_id,
+            runtime.call_id,
+        )
+        if execution_resource.identity != expected_identity:
+            raise ValueError(
+                "dashboard execution resource scope does not match runtime"
+            )
+        if execution_resource.integration is not integration:
+            raise ValueError("dashboard execution resource integration does not match")
     coaching_factory = (
-        _coaching_factory(runtime.tenant, integration=integration)
+        _coaching_factory(
+            runtime.tenant,
+            integration=integration,
+            execution_resource=execution_resource,
+        )
         if selection.enable_coaching
         else None
     )
@@ -123,19 +353,23 @@ def build_live_pipeline(
     runtime.service_status_message = (
         availability.safe_message if runtime.classification_failure else None
     )
-    return StreamingASRPipeline(
+    pipeline = StreamingASRPipeline(
         runtime.tenant.config.context,
         runtime.tenant.config.asr,
         window_transcriber,
         runtime_classifier=classifier,
         coaching_coordinator_factory=coaching_factory,
     )
+    if execution_resource is not None:
+        execution_resource.attach_pipeline(pipeline)
+    return pipeline
 
 
 def _coaching_factory(
     tenant: TenantDemo,
     *,
     integration: RAGCoachingIntegrationDependencies | None,
+    execution_resource: DashboardExecutionResource | None,
 ) -> Callable[[CallState], CoachingProcessorProtocol]:
     def create(call_state: CallState) -> CoachingProcessorProtocol:
         coordinator = CoachingCoordinator(
@@ -143,10 +377,22 @@ def _coaching_factory(
             call_state,
             RuleBasedCoachingEngine(tenant.config, tenant.rules),
         )
-        return compose_rag_coaching_processor(
+        processor = compose_rag_coaching_processor(
             coordinator=coordinator,
             tenant_config=tenant.config,
             integration=integration,
         )
+        if execution_resource is not None:
+            execution_resource.bind_completion_pump(processor)
+        return processor
 
     return create
+
+
+def _required_text(value: str, field_name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty")
+    return cleaned

@@ -11,6 +11,7 @@ import pytest
 from app.events.models import SuggestionPriority
 from live_dashboard.demo_data import tenant_demos
 from live_dashboard.presentation import ui_scope_identity
+from live_dashboard.runtime_wiring import DashboardExecutionResourceRegistry
 from live_dashboard.view_models import (
     create_local_execution,
     dashboard_tabs,
@@ -180,6 +181,61 @@ def _scope(call_id: str = "local-call"):
         tenant_id="tenant_alpha",
         call_id=call_id,
         source_mode="synthetic-test",
+    )
+
+
+def test_dashboard_execution_resource_reuses_scope_and_session_keeps_only_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    registry = DashboardExecutionResourceRegistry(capacity=2)
+    monkeypatch.setattr(app, "_execution_resource_registry", lambda _capacity: registry)
+    runtime = create_local_execution(
+        tenant_demos()["tenant_alpha"],
+        "synthetic-call",
+    ).runtime
+
+    first = app._execution_resource(runtime)
+    second = app._execution_resource(runtime)
+
+    assert second is first
+    assert recorder.session_state["dashboard_execution_resource_key"] == (
+        first.opaque_key
+    )
+    assert not any(
+        isinstance(value, type(first)) for value in recorder.session_state.values()
+    )
+
+    app._close_execution_resource()
+    assert first.closed
+    assert "dashboard_execution_resource_key" not in recorder.session_state
+
+
+def test_dashboard_scope_change_closes_and_removes_previous_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    registry = DashboardExecutionResourceRegistry(capacity=1)
+    monkeypatch.setattr(app, "_execution_resource_registry", lambda _capacity: registry)
+    first_runtime = create_local_execution(
+        tenant_demos()["tenant_alpha"],
+        "call-one",
+    ).runtime
+    second_runtime = create_local_execution(
+        tenant_demos()["tenant_alpha"],
+        "call-two",
+    ).runtime
+
+    first = app._execution_resource(first_runtime)
+    second = app._execution_resource(second_runtime)
+
+    assert first.closed
+    assert not second.closed
+    assert second.identity.call_id == "call-two"
+    assert recorder.session_state["dashboard_execution_resource_key"] == (
+        second.opaque_key
     )
 
 

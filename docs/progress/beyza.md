@@ -536,3 +536,30 @@ Tarih: 29 Temmuz 2026
   conflict-marker script ve 5 conflict-marker testi passed.
 - Sonraki planli adim: dashboard/session-state rendering veya uzun omurlu runtime
   lifecycle'i ayri, ownership-onayli bir PR'da ele alinacak.
+
+## PR50-D1 - Call-Scoped Dashboard Execution Lifecycle
+
+Tarih: 29 Temmuz 2026
+
+- Canonical tenant/call identity ve opaque lookup key kullanan bounded dashboard
+  execution registry ile ayni scope Streamlit rerun'larinda exact resource
+  identity korunur; capacity, wrong-scope ve replacement durumlari fail-closed
+  ele alinir.
+- Call-scoped resource live pipeline'i ve mevcut completion pump'i audio
+  finalization sonrasinda explicit nonblocking drain icin erisilebilir tutar;
+  base-only varsayilan davranis PostgreSQL/vLLM aktivasyonu yapmaz.
+- Thread-safe ve idempotent `close()`, opsiyonel bounded manager'i etkili olarak
+  tam bir kez kapatir; explicit reset/scope replacement close ve removal
+  uygular. Browser/process abandonment cleanup'i host runtime sorumlulugundadir.
+- Degisen dosyalar: `live_dashboard/runtime_wiring.py`,
+  `live_dashboard/app.py`, `tests/test_live_dashboard_runtime_wiring.py`,
+  `tests/test_live_dashboard_rendering.py`, yeni
+  `tests/test_live_dashboard_execution_resource.py` ve
+  `docs/progress/beyza.md`.
+- Focused lifecycle/runtime/dashboard/pipeline testleri: 81 passed; korunan
+  speaker-aware dashboard testleri: 5 passed.
+- Full suite: 2016 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`,
+  conflict-marker script ve 5 conflict-marker testi passed.
+- Sonraki planli adim: provider activation ve post-final outcome UI consumption
+  ayri, ownership-onayli bir PR'da ele alinacak.
