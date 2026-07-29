@@ -280,3 +280,30 @@ Tarih: 29 Temmuz 2026
   ASR/diarization test collection asamasinda durdu.
 - Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
   script passed ve conflict-marker testleri 5 passed.
+
+## PR43 - Explicit PostgreSQL RAG Chunk Ingestion
+
+Tarih: 29 Temmuz 2026
+
+- Preconstructed `DocumentIngestionRequest` chunk'larini alan explicit
+  `ingest_profile_bound_postgres_rag` deployment operation'i ve thin CLI
+  eklendi.
+- Islem sirasi argument/scope validation, side-effect-free composition,
+  read-only schema readiness, mutation yapmayan exact profile lookup ve
+  sonrasinda lazy embedding ile atomic batch admission'dir.
+- Migration veya profile registration/replacement otomatik yapilmaz; model
+  readiness ve exact registered-profile dogrulamasindan once yuklenmez.
+- CLI strict provider ve ingestion JSON contract'lari ile mevcut
+  `CALLMETRIC_POSTGRES_*` environment ayarlarini kullanir; configuration,
+  operational ve success ciktilari fixed ve secret-safe kalir.
+- Eklenen dosyalar: `app/deployment/postgres_ingestion.py`,
+  `scripts/ingest_postgres_rag.py`, `tests/test_postgres_rag_ingestion.py`,
+  `tests/test_ingest_postgres_rag_cli.py`; degisen dosyalar:
+  `app/deployment/__init__.py`, `tests/test_postgres_rag_provisioning.py`,
+  `docs/progress/beyza.md`.
+- Focused ingestion/deployment/composition/readiness/atomic testleri:
+  175 passed.
+- Full suite: 1678 passed, 11 opt-in PostgreSQL integration testi skipped,
+  1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
+  script passed ve conflict-marker testleri 5 passed.

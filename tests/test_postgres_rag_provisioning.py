@@ -168,6 +168,7 @@ def test_public_signature_and_exports_are_exact() -> None:
         "PostgreSQLMigrationResult",
         "PostgreSQLMigrationSettings",
         "apply_postgres_vector_migrations",
+        "ingest_profile_bound_postgres_rag",
         "provision_profile_bound_postgres_rag",
     ]
     assert (
