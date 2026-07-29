@@ -97,6 +97,7 @@ Tarih: 28 Temmuz 2026
   dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
 - Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
   script passed ve conflict-marker testleri 5 passed.
+
 - Sonraki planli adim: complete Psycopg SQL transaction implementation'i ayri
   onayli PR35 kapsaminda ele alinacak.
 
@@ -171,6 +172,29 @@ Tarih: 28 Temmuz 2026
   dort ASR/CLI/offline-evaluation testinin collection asamasinda durdu.
 - Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
   script passed ve conflict-marker testleri 5 passed.
+
+## PR41 - Reproducible Windows Torch Environment
+
+Tarih: 29 Temmuz 2026
+
+- Anaconda 3.12.4 tabanli eski `.venv` icinde Torch 2.13.0 native
+  `c10.dll` import'u basarisizdi; proje Python pin'i uv-managed CPython
+  3.12.12 olarak kesinlestirildi.
+- Yalniz Windows icin direct `torch==2.12.0` runtime constraint'i eklendi.
+  Lock'ta Windows CPython 3.12 `win_amd64` wheel'i 2.12.0, non-Windows Torch
+  2.13.0 ve mevcut Linux CUDA dependency/marker'lari degismeden korundu.
+- Eski ortam silinmeden
+  `%TEMP%\callmetric-project-venv-backup-20260729-122706-082bc427e0324d5588e0b3cd9c1a8f41`
+  konumuna tasindi; yeni locked ortam uv-managed CPython 3.12.12 kullaniyor.
+- Torch 2.12.0+cpu import'u ve CPU tensor olusturma basarili; CUDA initialize
+  edilmedi. CTranslate2, Faster-Whisper, SentenceTransformers ve SetFit
+  modelsiz ayri subprocess'lerde basariyla import edildi.
+- Pytest collection: 1645 collected; onceki dort failing modul: 55 passed;
+  ilgili embedding/classification/ASR testleri: 184 passed.
+- Full suite: 1634 passed, 11 opt-in PostgreSQL integration testi skipped,
+  1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`
+  ve conflict-marker script passed; conflict-marker testleri 5 passed.
 - Sonraki planli adim: migration/schema readiness ve explicit profile
   provisioning ayri ve onayli PR38 kapsaminda ele alinacak.
 
