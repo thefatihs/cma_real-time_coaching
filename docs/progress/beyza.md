@@ -360,3 +360,27 @@ Tarih: 29 Temmuz 2026
   script passed ve conflict-marker testleri 5 passed.
 - Sonraki planli adim: LLM orchestration veya runtime/API entegrasyonu ayri ve
   ownership-onayli bir PR kapsaminda ele alinacak.
+
+## PR46-A - Provider-Neutral PostgreSQL RAG Orchestration
+
+Tarih: 29 Temmuz 2026
+
+- Existing PostgreSQL retriever, deterministic prompt builder ve provider-neutral
+  LLM gateway contract'ini birlestiren frozen/slotted
+  `PostgreSQLRAGOrchestrationComposition` eklendi.
+- `LLMGatewayFactory` private thread-safe deferred gateway arkasinda saklanir;
+  composition sirasinda PostgreSQL connection, readiness/profile operation'i,
+  embedding/model load veya LLM provider factory/API cagrisı yapilmaz.
+- Empty retrieval mevcut short-circuit davranisini korur ve LLM factory'yi
+  cagirmadan `None` doner; ilk gercek generation factory'yi bir kez olusturur
+  ve sonraki cagrislar ayni gateway'i kullanir.
+- Eklenen dosyalar: `app/composition/postgres_rag_orchestration.py`,
+  `tests/test_postgres_rag_orchestration_composition.py`; degisen dosyalar:
+  `app/composition/__init__.py`, `tests/test_postgres_rag_composition.py`,
+  `docs/progress/beyza.md`.
+- Focused orchestration/composition/retrieval testleri: 100 passed.
+- Full suite: 1806 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
+  script passed ve conflict-marker testleri 5 passed.
+- Sonraki onayli PR46 fazi: concrete vLLM gateway ve secret-safe settings;
+  runtime, deployment CLI ve coaching wiring ertelendi.
