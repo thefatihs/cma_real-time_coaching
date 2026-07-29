@@ -332,3 +332,31 @@ Tarih: 29 Temmuz 2026
   1 mevcut Starlette deprecation warning.
 - Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
   script passed ve conflict-marker testleri 5 passed.
+
+## PR45 - Explicit PostgreSQL RAG Retrieval
+
+Tarih: 29 Temmuz 2026
+
+- Frozen ve strict `PostgreSQLRAGRetrievalRequest` ile explicit
+  `retrieve_profile_bound_postgres_rag` deployment operation'i eklendi.
+- Islem sirasi local argument/scope validation, side-effect-free composition,
+  read-only schema readiness, mutation yapmayan exact profile lookup ve
+  sonrasinda lazy query embedding ile deterministic cosine retrieval'dir.
+- Migration, profile registration/replacement, ingestion veya LLM execution
+  eklenmedi; backend readiness ve exact profile dogrulamasindan once yuklenmez.
+- Thin CLI strict provider/retrieval JSON contract'larini ve mevcut
+  `CALLMETRIC_POSTGRES_*` environment ayarlarini kullanir; sonuc yalnizca
+  explicit, yeni olusturulan UTF-8 JSON dosyasina yazilir ve console ciktilari
+  fixed ve secret-safe kalir.
+- Eklenen dosyalar: `app/deployment/postgres_retrieval.py`,
+  `scripts/retrieve_postgres_rag.py`, `tests/test_postgres_rag_retrieval.py`,
+  `tests/test_retrieve_postgres_rag_cli.py`; degisen dosyalar:
+  `app/deployment/__init__.py`, `tests/test_postgres_rag_provisioning.py`,
+  `docs/progress/beyza.md`.
+- Focused retrieval/CLI/provisioning/composition/readiness testleri:
+  177 passed, 1 Windows symlink permission skip.
+- Full suite: 1790 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
+  script passed ve conflict-marker testleri 5 passed.
+- Sonraki planli adim: LLM orchestration veya runtime/API entegrasyonu ayri ve
+  ownership-onayli bir PR kapsaminda ele alinacak.
