@@ -11,10 +11,14 @@ from app.composition.postgres_rag_orchestration import (
     PostgreSQLRAGOrchestrationComposition,
     compose_profile_bound_postgres_rag_orchestration,
 )
+from app.composition.postgres_rag_runtime import (
+    ProfileVerifiedPostgreSQLRAGRunner,
+)
 
 __all__ = [
     "KnowledgeBaseRAGProviderSettings",
     "LLMGatewayFactory",
+    "ProfileVerifiedPostgreSQLRAGRunner",
     "PostgreSQLRAGOrchestrationComposition",
     "PostgreSQLRAGComposition",
     "PostgreSQLVectorStoreSettings",
