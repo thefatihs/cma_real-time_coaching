@@ -463,3 +463,26 @@ Tarih: 29 Temmuz 2026
   conflict-marker script ve 5 conflict-marker testi passed.
 - Connection pooling eklenmedi; FastAPI/dashboard/live runtime wiring PR50
   kapsaminda kalir.
+
+## PR50-A - Readiness-Verified PostgreSQL RAG Runtime Runner
+
+Tarih: 29 Temmuz 2026
+
+- Side-effect-free kurulan `ProfileVerifiedPostgreSQLRAGRunner`, explicit
+  `prepare()` ile schema readiness ve exact registered embedding profile
+  dogrulamasini thread-safe ve basarili hazirliktan sonra idempotent yapar.
+- `run()` yalnizca hazirlanmis, bound tenant/knowledge-base scope'u ile eslesen
+  request'leri mevcut orchestrator'a aynen delege eder; result/`None`, citation
+  sirasi ve provider exception identity korunur.
+- Eklenen dosyalar: `app/composition/postgres_rag_runtime.py`,
+  `tests/test_postgres_rag_runtime.py`; degisen dosyalar:
+  `app/composition/__init__.py`,
+  `tests/test_postgres_rag_orchestration_composition.py`,
+  `tests/test_postgres_rag_composition.py`, `docs/progress/beyza.md`.
+- Focused runtime/composition/orchestration testleri: 106 passed.
+- Full suite: 1949 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`,
+  conflict-marker script ve 5 conflict-marker testi passed.
+- Sonraki planli adimlar: background execution/state management, integration
+  wiring, dashboard rendering ve olculmus ihtiyaca dayali pooling ayri PR'larda
+  ele alinacak.

@@ -403,6 +403,7 @@ def test_public_exports_are_exact() -> None:
     assert composition_exports.__all__ == [
         "KnowledgeBaseRAGProviderSettings",
         "LLMGatewayFactory",
+        "ProfileVerifiedPostgreSQLRAGRunner",
         "PostgreSQLRAGOrchestrationComposition",
         "PostgreSQLRAGComposition",
         "PostgreSQLVectorStoreSettings",

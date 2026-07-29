@@ -269,6 +269,7 @@ def test_composition_is_frozen_slotted_and_exports_are_exact(
     assert composition_exports.__all__ == [
         "KnowledgeBaseRAGProviderSettings",
         "LLMGatewayFactory",
+        "ProfileVerifiedPostgreSQLRAGRunner",
         "PostgreSQLRAGOrchestrationComposition",
         "PostgreSQLRAGComposition",
         "PostgreSQLVectorStoreSettings",
