@@ -6,9 +6,10 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import psycopg
 import pytest
@@ -22,6 +23,11 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from app.vector_store.embedding_profile import (  # noqa: E402
     EmbeddingDistanceMetric,
     KnowledgeBaseEmbeddingProfile,
+)
+from app.deployment import (  # noqa: E402
+    PostgreSQLMigrationResult,
+    PostgreSQLMigrationSettings,
+    apply_postgres_vector_migrations,
 )
 from app.vector_store.models import (  # noqa: E402
     SearchRequest,
@@ -102,6 +108,76 @@ def settings() -> PostgreSQLTestSettings:
         user=user,
         password=password,
         connect_timeout=5,
+    )
+
+
+def _production_connect(
+    settings: PostgreSQLTestSettings,
+    **kwargs: object,
+) -> Connection[Any]:
+    expected_dsn = (
+        f"postgresql://{settings.user}:{settings.password}@"
+        f"{settings.host}:{settings.port}/{settings.database}"
+    )
+    expected_keyword_dsn = (
+        f"host={settings.host} port={settings.port} "
+        f"dbname={settings.database} user={settings.user} "
+        f"password={settings.password}"
+    )
+    assert kwargs.pop("conninfo") in (expected_dsn, expected_keyword_dsn)
+    assert kwargs.pop("sslmode") == "require"
+    connect_kwargs = cast(dict[str, Any], kwargs)
+    return psycopg.connect(
+        host=settings.host,
+        port=settings.port,
+        dbname=settings.database,
+        user=settings.user,
+        password=settings.password,
+        **connect_kwargs,
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def migration_results(
+    settings: PostgreSQLTestSettings,
+) -> tuple[PostgreSQLMigrationResult, PostgreSQLMigrationResult]:
+    settings_factory = cast(
+        Callable[[], PostgreSQLMigrationSettings],
+        PostgreSQLMigrationSettings,
+    )
+    migration_settings = settings_factory()
+    barrier = threading.Barrier(2)
+    results: list[PostgreSQLMigrationResult] = []
+    failures: list[BaseException] = []
+
+    def migrate() -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            result = apply_postgres_vector_migrations(
+                settings=migration_settings,
+                psycopg_connect=lambda **kwargs: _production_connect(
+                    settings,
+                    **kwargs,
+                ),
+            )
+            results.append(result)
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=migrate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20.0)
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    assert sorted(result.value for result in results) == [
+        PostgreSQLMigrationResult.ALREADY_APPLIED.value,
+        PostgreSQLMigrationResult.APPLIED.value,
+    ]
+    return cast(
+        tuple[PostgreSQLMigrationResult, PostgreSQLMigrationResult],
+        tuple(results),
     )
 
 
@@ -223,6 +299,18 @@ def test_migration_extension_schema_ledger_and_tables(
         ]
 
 
+def test_production_migration_serializes_and_is_idempotent(
+    migration_results: tuple[
+        PostgreSQLMigrationResult,
+        PostgreSQLMigrationResult,
+    ],
+) -> None:
+    assert sorted(result.value for result in migration_results) == [
+        PostgreSQLMigrationResult.ALREADY_APPLIED.value,
+        PostgreSQLMigrationResult.APPLIED.value,
+    ]
+
+
 def test_schema_readiness_and_explicit_composed_profile_provisioning(
     settings: PostgreSQLTestSettings,
 ) -> None:
@@ -259,7 +347,7 @@ def test_schema_readiness_and_explicit_composed_profile_provisioning(
             device="cpu",
             local_files_only=True,
         ),
-        psycopg_connect=psycopg.connect,
+        psycopg_connect=lambda **kwargs: _production_connect(settings, **kwargs),
         embedding_backend_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("embedding backend must not load")
         ),
