@@ -401,12 +401,18 @@ def test_composition_is_frozen_and_slotted() -> None:
 
 def test_public_exports_are_exact() -> None:
     assert composition_exports.__all__ == [
+        "BoundedPostgreSQLRAGManager",
         "KnowledgeBaseRAGProviderSettings",
         "LLMGatewayFactory",
         "ProfileVerifiedPostgreSQLRAGRunner",
         "PostgreSQLRAGOrchestrationComposition",
         "PostgreSQLRAGComposition",
         "PostgreSQLVectorStoreSettings",
+        "RAGOrchestrationCompletion",
+        "RAGOrchestrationCompletionStatus",
+        "RAGOrchestrationIdentity",
+        "RAGOrchestrationSubmission",
+        "RAGOrchestrationSubmissionStatus",
         "compose_profile_bound_postgres_rag",
         "compose_profile_bound_postgres_rag_orchestration",
     ]

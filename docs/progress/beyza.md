@@ -486,3 +486,29 @@ Tarih: 29 Temmuz 2026
 - Sonraki planli adimlar: background execution/state management, integration
   wiring, dashboard rendering ve olculmus ihtiyaca dayali pooling ayri PR'larda
   ele alinacak.
+
+## PR50-B - Bounded PostgreSQL RAG Background Manager
+
+Tarih: 29 Temmuz 2026
+
+- `BoundedPostgreSQLRAGManager`, explicit `start()` sonrasinda owned fixed-size
+  executor ile running, queued ve undrained completion kapasitesini lock altinda
+  sinirlar; admission nonblocking ve deterministic status modelleriyle doner.
+- Tenant/call/revision identity'si duplicate submission'i engeller; yeni
+  revision queued eski isi iptal eder ve tamamlanan/running stale result veya
+  exception'lari teslim etmeden temizler.
+- Success, empty retrieval ve exact provider exception completion'lari ayri,
+  immutable modellerle tek sefer teslim edilir; `close()` yeni isleri reddeder,
+  queued futures'i iptal eder ve late completion'lari discard eder.
+- Eklenen dosyalar: `app/composition/postgres_rag_background.py`,
+  `tests/test_postgres_rag_background.py`; degisen dosyalar:
+  `app/composition/__init__.py`,
+  `tests/test_postgres_rag_orchestration_composition.py`,
+  `tests/test_postgres_rag_composition.py`, `docs/progress/beyza.md`.
+- Focused background/runtime/composition testleri: 101 passed.
+- Full suite: 1976 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`,
+  conflict-marker script ve 5 conflict-marker testi passed.
+- Sonraki planli adimlar: Fatih-onayli coaching completion pump/integration,
+  dashboard rendering ve olculmus ihtiyaca dayali pooling ayri PR'larda ele
+  alinacak.
