@@ -9,12 +9,14 @@ from app.integration.llm_suggestion_factory import (
 )
 from app.integration.policy import RAGCoachingIntegrationPolicy
 from app.integration.rag_coaching import (
+    CoachingCompletionPumpProtocol,
     CoachingSuggestionFactory,
     OrchestrationRunner,
     RAGCoachingProcessorDecorator,
 )
 
 __all__ = [
+    "CoachingCompletionPumpProtocol",
     "CoachingSuggestionFactory",
     "DeterministicLLMCoachingSuggestionFactory",
     "OrchestrationRunner",

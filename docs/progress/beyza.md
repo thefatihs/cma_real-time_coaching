@@ -512,3 +512,27 @@ Tarih: 29 Temmuz 2026
 - Sonraki planli adimlar: Fatih-onayli coaching completion pump/integration,
   dashboard rendering ve olculmus ihtiyaca dayali pooling ayri PR'larda ele
   alinacak.
+
+## PR50-C - Coaching Completion Pump Integration
+
+Tarih: 29 Temmuz 2026
+
+- RAG coaching decorator, base coaching sonucunu bekletmeden dondurur; uygun
+  stable/final revision isini bounded background manager'a iletir ve yalnizca
+  current tenant/call/revision completion'ini explicit pump ile kabul eder.
+- Empty, failed, rejected ve stale background sonuclari fail-closed ele alinir;
+  basarili trusted sonuc mevcut LLM suggestion factory ve external-admission
+  politikasindan gecirilir.
+- Streaming pipeline her chunk sonrasinda ve final reconciliation sonrasinda
+  completion pump'i ayni thread uzerinde calistirir; manager olmayan mevcut
+  coaching processor davranisi degismez.
+- Degisen dosyalar: `app/integration/__init__.py`,
+  `app/integration/composition.py`, `app/integration/rag_coaching.py`,
+  `app/streaming/pipeline.py`, dort onayli focused test dosyasi ve
+  `docs/progress/beyza.md`.
+- Focused integration/composition/streaming/runtime-wiring testleri: 98 passed.
+- Full suite: 1983 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`,
+  conflict-marker script ve 5 conflict-marker testi passed.
+- Sonraki planli adim: dashboard/session-state rendering veya uzun omurlu runtime
+  lifecycle'i ayri, ownership-onayli bir PR'da ele alinacak.

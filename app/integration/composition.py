@@ -6,12 +6,14 @@ from datetime import datetime
 
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.safe_processor import SafeCoachingProcessorAdapter
+from app.composition.postgres_rag_background import (
+    BoundedPostgreSQLRAGManager,
+)
 from app.integration.llm_suggestion_factory import (
     DeterministicLLMCoachingSuggestionFactory,
 )
 from app.integration.policy import RAGCoachingIntegrationPolicy
 from app.integration.rag_coaching import (
-    OrchestrationRunner,
     RAGCoachingProcessorDecorator,
 )
 from app.tenancy.models import TenantConfig
@@ -19,14 +21,17 @@ from app.tenancy.models import TenantConfig
 
 @dataclass(frozen=True, slots=True)
 class RAGCoachingIntegrationDependencies:
-    orchestration_runner: OrchestrationRunner
+    background_manager: BoundedPostgreSQLRAGManager
     policy: RAGCoachingIntegrationPolicy
     suggestion_id_factory: Callable[[], str]
     utc_datetime_factory: Callable[[], datetime]
 
     def __post_init__(self) -> None:
-        if not callable(getattr(self.orchestration_runner, "run", None)):
-            raise ValueError("orchestration_runner.run must be callable")
+        if not isinstance(
+            self.background_manager,
+            BoundedPostgreSQLRAGManager,
+        ):
+            raise ValueError("background_manager must be BoundedPostgreSQLRAGManager")
         if not callable(self.suggestion_id_factory):
             raise ValueError("suggestion_id_factory must be callable")
         if not callable(self.utc_datetime_factory):
@@ -65,7 +70,7 @@ def compose_rag_coaching_processor(
     return RAGCoachingProcessorDecorator(
         coordinator=coordinator,
         tenant_config=tenant_config,
-        orchestration_runner=integration.orchestration_runner,
+        background_manager=integration.background_manager,
         suggestion_factory=suggestion_factory,
         rag_llm_enabled_labels=integration.policy.rag_llm_enabled_labels,
     )

@@ -10,6 +10,12 @@ from app.calls.models import CallState
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.rule_engine import RuleBasedCoachingEngine
 from app.coaching.safe_processor import SafeCoachingProcessorAdapter
+from app.composition import (
+    BoundedPostgreSQLRAGManager,
+    RAGOrchestrationCompletion,
+    RAGOrchestrationIdentity,
+    RAGOrchestrationSubmission,
+)
 from app.events.models import CoachingAction, SuggestionPriority
 from app.integration import (
     CoachingSuggestionFactory,
@@ -20,7 +26,7 @@ from app.integration import (
     RAGCoachingProcessorDecorator,
     compose_rag_coaching_processor,
 )
-from app.orchestration import OrchestrationRequest, OrchestrationResult
+from app.orchestration import OrchestrationRequest
 from app.streaming.pipeline import CoachingProcessorProtocol
 from app.tenancy.models import (
     TenantASRConfig,
@@ -34,13 +40,30 @@ from app.tenancy.models import (
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
 
 
-class FakeRunner:
+class FakeBackgroundManager(BoundedPostgreSQLRAGManager):
     def __init__(self) -> None:
         self.calls = 0
 
-    def run(self, request: OrchestrationRequest) -> OrchestrationResult | None:
+    def announce_current_revision(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        transcript_revision: int,
+    ) -> None:
         self.calls += 1
-        raise AssertionError("runner must not execute during composition")
+        raise AssertionError("manager must not execute during composition")
+
+    def submit(self, request: OrchestrationRequest) -> RAGOrchestrationSubmission:
+        self.calls += 1
+        raise AssertionError("manager must not execute during composition")
+
+    def poll(
+        self,
+        identity: RAGOrchestrationIdentity,
+    ) -> RAGOrchestrationCompletion | None:
+        self.calls += 1
+        raise AssertionError("manager must not execute during composition")
 
 
 class Callback:
@@ -118,27 +141,27 @@ def dependencies(
     selected_policy: RAGCoachingIntegrationPolicy | None = None,
 ) -> tuple[
     RAGCoachingIntegrationDependencies,
-    FakeRunner,
+    FakeBackgroundManager,
     Callback,
     Callback,
 ]:
-    runner = FakeRunner()
+    manager = FakeBackgroundManager()
     id_callback = Callback("llm_suggestion")
     clock_callback = Callback(NOW)
     subject = RAGCoachingIntegrationDependencies(
-        orchestration_runner=runner,
+        background_manager=manager,
         policy=selected_policy or policy(),
         suggestion_id_factory=cast(Callable[[], str], id_callback),
         utc_datetime_factory=cast(Callable[[], datetime], clock_callback),
     )
-    return subject, runner, id_callback, clock_callback
+    return subject, manager, id_callback, clock_callback
 
 
 def test_bundle_is_frozen_and_slotted() -> None:
     subject, _, _, _ = dependencies()
 
     assert subject.__slots__ == (
-        "orchestration_runner",
+        "background_manager",
         "policy",
         "suggestion_id_factory",
         "utc_datetime_factory",
@@ -150,7 +173,7 @@ def test_bundle_is_frozen_and_slotted() -> None:
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
-        ("orchestration_runner", object(), "orchestration_runner.run"),
+        ("background_manager", object(), "background_manager"),
         ("suggestion_id_factory", object(), "suggestion_id_factory"),
         ("utc_datetime_factory", object(), "utc_datetime_factory"),
     ],
@@ -161,7 +184,7 @@ def test_bundle_rejects_non_callable_collaborators(
     message: str,
 ) -> None:
     values: dict[str, object] = {
-        "orchestration_runner": FakeRunner(),
+        "background_manager": FakeBackgroundManager(),
         "policy": policy(),
         "suggestion_id_factory": lambda: "llm_suggestion",
         "utc_datetime_factory": lambda: NOW,
@@ -170,8 +193,8 @@ def test_bundle_rejects_non_callable_collaborators(
 
     with pytest.raises(ValueError, match=message):
         RAGCoachingIntegrationDependencies(
-            orchestration_runner=cast(
-                OrchestrationRunner, values["orchestration_runner"]
+            background_manager=cast(
+                BoundedPostgreSQLRAGManager, values["background_manager"]
             ),
             policy=cast(RAGCoachingIntegrationPolicy, values["policy"]),
             suggestion_id_factory=cast(
@@ -251,7 +274,7 @@ def test_enabled_composition_maps_exact_objects_and_policy() -> None:
     assert first._coordinator is subject_coordinator  # noqa: SLF001
     assert first._base_processor._coordinator is subject_coordinator  # noqa: SLF001
     assert first._tenant_config is config  # noqa: SLF001
-    assert first._orchestration_runner is runner  # noqa: SLF001
+    assert first._background_manager is runner  # noqa: SLF001
     assert first._rag_llm_enabled_labels == bundle.policy.rag_llm_enabled_labels  # noqa: SLF001
     factory = first._suggestion_factory  # noqa: SLF001
     assert isinstance(factory, DeterministicLLMCoachingSuggestionFactory)

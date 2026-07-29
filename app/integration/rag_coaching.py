@@ -1,13 +1,19 @@
 """Deterministic composition of safe coaching and trusted RAG orchestration."""
 
 from collections.abc import Collection
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from app.coaching.coordinator import (
     CoachingCoordinator,
-    CoachingCoordinatorResult,
     CoachingProcessingStatus,
     StableCoachingOutcome,
+)
+from app.composition.postgres_rag_background import (
+    BoundedPostgreSQLRAGManager,
+    RAGOrchestrationCompletionStatus,
+    RAGOrchestrationIdentity,
+    RAGOrchestrationSubmissionStatus,
 )
 from app.coaching.llm_decision_gate import (
     LLMCoachingDecision,
@@ -32,6 +38,15 @@ class OrchestrationRunner(Protocol):
     ) -> OrchestrationResult | None: ...
 
 
+@runtime_checkable
+class CoachingCompletionPumpProtocol(Protocol):
+    def drain_completed(
+        self,
+        *,
+        current_seconds: float,
+    ) -> tuple[StableCoachingOutcome, ...]: ...
+
+
 class CoachingSuggestionFactory(Protocol):
     def create(
         self,
@@ -42,12 +57,18 @@ class CoachingSuggestionFactory(Protocol):
     ) -> CoachingSuggestionEvent | None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingContext:
+    event: TranscriptEvent
+    current_seconds: float
+
+
 class RAGCoachingProcessorDecorator:
     def __init__(
         self,
         coordinator: CoachingCoordinator,
         tenant_config: TenantConfig,
-        orchestration_runner: OrchestrationRunner,
+        background_manager: BoundedPostgreSQLRAGManager,
         suggestion_factory: CoachingSuggestionFactory,
         rag_llm_enabled_labels: tuple[str, ...],
     ) -> None:
@@ -56,10 +77,16 @@ class RAGCoachingProcessorDecorator:
         self._coordinator = coordinator
         self._base_processor = SafeCoachingProcessorAdapter(coordinator)
         self._tenant_config = tenant_config
-        self._orchestration_runner = orchestration_runner
+        if not isinstance(background_manager, BoundedPostgreSQLRAGManager):
+            raise ValueError("background_manager must be BoundedPostgreSQLRAGManager")
+        self._background_manager = background_manager
         self._suggestion_factory = suggestion_factory
         self._rag_llm_enabled_labels = _validated_labels(rag_llm_enabled_labels)
         self._decision_gate = LLMCoachingDecisionGate()
+        self._pending_contexts: dict[
+            RAGOrchestrationIdentity,
+            _PendingContext,
+        ] = {}
 
     def process_safely(
         self,
@@ -83,6 +110,21 @@ class RAGCoachingProcessorDecorator:
             or base_result.transcript_revision != event.revision
         ):
             return base_outcome
+
+        identity = RAGOrchestrationIdentity(
+            tenant_id=event.tenant_id,
+            call_id=event.call_id,
+            transcript_revision=event.revision,
+        )
+        try:
+            self._background_manager.announce_current_revision(
+                tenant_id=identity.tenant_id,
+                call_id=identity.call_id,
+                transcript_revision=identity.transcript_revision,
+            )
+        except (RuntimeError, ValueError):
+            return base_outcome
+        self._discard_superseded_contexts(identity)
 
         rag_config = self._tenant_config.rag
         if (
@@ -127,34 +169,109 @@ class RAGCoachingProcessorDecorator:
             minimum_score=rag_config.minimum_score,
         )
         try:
-            orchestration_result = self._orchestration_runner.run(request)
-        except ValueError:
+            submission = self._background_manager.submit(request)
+        except (RuntimeError, ValueError):
             return base_outcome
-        if orchestration_result is None or not _trusted_result_matches(
-            orchestration_result,
-            event,
-        ):
-            return base_outcome
-
-        suggestion = self._suggestion_factory.create(
-            event=event,
-            orchestration_result=orchestration_result,
-            current_seconds=current_seconds,
-        )
-        if suggestion is None or not _suggestion_scope_matches(suggestion, event):
-            return base_outcome
-
-        snapshot = self._coordinator.snapshot_coaching_state()
-        try:
-            external_result = self._coordinator.process_external_suggestion(
-                event,
-                suggestion,
-                current_seconds,
+        if submission.status is RAGOrchestrationSubmissionStatus.ACCEPTED:
+            self._pending_contexts[submission.identity] = _PendingContext(
+                event=event,
+                current_seconds=current_seconds,
             )
-        except Exception:
-            self._coordinator.restore_coaching_state(snapshot)
-            raise
-        return _combined_outcome(base_outcome, base_result, external_result)
+        return base_outcome
+
+    def drain_completed(
+        self,
+        *,
+        current_seconds: float,
+    ) -> tuple[StableCoachingOutcome, ...]:
+        if current_seconds < 0:
+            raise ValueError("current_seconds cannot be negative")
+        call_state = self._coordinator.call_state
+        current_identity = RAGOrchestrationIdentity(
+            tenant_id=call_state.tenant_id,
+            call_id=call_state.call_id,
+            transcript_revision=call_state.transcript_revision,
+        )
+        try:
+            self._background_manager.announce_current_revision(
+                tenant_id=current_identity.tenant_id,
+                call_id=current_identity.call_id,
+                transcript_revision=current_identity.transcript_revision,
+            )
+        except (RuntimeError, ValueError):
+            self._pending_contexts.clear()
+            return ()
+        self._discard_superseded_contexts(current_identity)
+
+        outcomes: list[StableCoachingOutcome] = []
+        for identity in sorted(
+            self._pending_contexts,
+            key=lambda item: (
+                item.tenant_id,
+                item.call_id,
+                item.transcript_revision,
+            ),
+        ):
+            completion = self._background_manager.poll(identity)
+            if completion is None:
+                continue
+            context = self._pending_contexts.pop(identity)
+            if completion.status is RAGOrchestrationCompletionStatus.EMPTY:
+                continue
+            if completion.status is RAGOrchestrationCompletionStatus.FAILED:
+                outcomes.append(
+                    StableCoachingOutcome(
+                        status=CoachingProcessingStatus.FAILED,
+                        transcript_revision=identity.transcript_revision,
+                        error_type="rag_orchestration",
+                        error_code="background_failure",
+                    )
+                )
+                continue
+            orchestration_result = completion.result
+            if orchestration_result is None or not _trusted_result_matches(
+                orchestration_result,
+                context.event,
+            ):
+                continue
+            suggestion = self._suggestion_factory.create(
+                event=context.event,
+                orchestration_result=orchestration_result,
+                current_seconds=context.current_seconds,
+            )
+            if suggestion is None or not _suggestion_scope_matches(
+                suggestion,
+                context.event,
+            ):
+                continue
+            snapshot = self._coordinator.snapshot_coaching_state()
+            try:
+                external_result = self._coordinator.process_external_suggestion(
+                    context.event,
+                    suggestion,
+                    context.current_seconds,
+                )
+            except Exception:
+                self._coordinator.restore_coaching_state(snapshot)
+                raise
+            outcomes.append(
+                StableCoachingOutcome(
+                    status=CoachingProcessingStatus.PROCESSED,
+                    transcript_revision=identity.transcript_revision,
+                    result=external_result,
+                )
+            )
+        return tuple(outcomes)
+
+    def _discard_superseded_contexts(
+        self,
+        current_identity: RAGOrchestrationIdentity,
+    ) -> None:
+        self._pending_contexts = {
+            identity: context
+            for identity, context in self._pending_contexts.items()
+            if identity == current_identity
+        }
 
 
 def _validated_labels(labels: Collection[str]) -> tuple[str, ...]:
@@ -187,43 +304,4 @@ def _suggestion_scope_matches(
         and suggestion.call_id == event.call_id
         and suggestion.source_transcript_event_id == event.event_id
         and suggestion.source is CoachingSuggestionSource.LLM
-    )
-
-
-def _combined_outcome(
-    base_outcome: StableCoachingOutcome,
-    base_result: CoachingCoordinatorResult,
-    external_result: CoachingCoordinatorResult,
-) -> StableCoachingOutcome:
-    return StableCoachingOutcome(
-        status=base_outcome.status,
-        transcript_revision=base_outcome.transcript_revision,
-        result=CoachingCoordinatorResult(
-            classification_event=base_result.classification_event,
-            displayed_suggestions=(
-                *base_result.displayed_suggestions,
-                *external_result.displayed_suggestions,
-            ),
-            suppressed_suggestions=(
-                *base_result.suppressed_suggestions,
-                *external_result.suppressed_suggestions,
-            ),
-            matched_rule_ids=base_result.matched_rule_ids,
-            suppression_reasons=(
-                *base_result.suppression_reasons,
-                *external_result.suppression_reasons,
-            ),
-            transcript_revision=base_result.transcript_revision,
-            current_revision_labels=base_result.current_revision_labels,
-            replaced_suggestion_ids=(
-                *base_result.replaced_suggestion_ids,
-                *external_result.replaced_suggestion_ids,
-            ),
-            suggestion_decisions=(
-                *base_result.suggestion_decisions,
-                *external_result.suggestion_decisions,
-            ),
-        ),
-        error_type=base_outcome.error_type,
-        error_code=base_outcome.error_code,
     )
