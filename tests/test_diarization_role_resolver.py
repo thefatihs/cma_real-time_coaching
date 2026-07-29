@@ -5,10 +5,14 @@ from pydantic import ValidationError
 
 from app.diarization.models import SpeakerRole
 from app.diarization.role_resolver import (
+    DirectRoleEvidenceOutcome,
+    OppositeRoleInferenceBlockReason,
     RoleEvidenceCode,
+    RoleConfidenceBucket,
     RuleBasedSpeakerRoleResolver,
     SpeakerAttributedTextSpan,
     SpeakerRoleAssignment,
+    SpeakerRoleDiagnostic,
     SpeakerRoleResolutionError,
     SpeakerRoleResolutionErrorCategory,
     SpeakerRoleResolutionRequest,
@@ -69,6 +73,18 @@ def _assignment(
     )
 
 
+def _diagnostic(
+    result: SpeakerRoleResolutionResult,
+    speaker_id: str | None,
+) -> SpeakerRoleDiagnostic:
+    index = next(
+        index
+        for index, assignment in enumerate(result.assignments)
+        if assignment.global_speaker_id == speaker_id
+    )
+    return result.diagnostics[index]
+
+
 def test_strong_greeting_resolves_agent() -> None:
     result = RuleBasedSpeakerRoleResolver().resolve(
         _request(_span("Merhaba, ben Ayşe.", "CALL_SPEAKER_0001"))
@@ -78,6 +94,15 @@ def test_strong_greeting_resolves_agent() -> None:
     assert assignment.role is SpeakerRole.AGENT
     assert assignment.evidence is RoleEvidenceCode.STRONG_AGENT
     assert assignment.confidence == 1.0
+    diagnostic = _diagnostic(result, "CALL_SPEAKER_0001")
+    assert diagnostic.agent_evidence_hit_count == 1
+    assert diagnostic.customer_evidence_hit_count == 0
+    assert diagnostic.direct_evidence_outcome is DirectRoleEvidenceOutcome.AGENT
+    assert diagnostic.agent_threshold_reached is True
+    assert diagnostic.customer_threshold_reached is False
+    assert diagnostic.final_role is SpeakerRole.AGENT
+    assert diagnostic.confidence_bucket is RoleConfidenceBucket.HIGH
+    assert diagnostic.final_decision_reason is RoleEvidenceCode.STRONG_AGENT
 
 
 def test_strong_customer_request_resolves_customer() -> None:
@@ -88,6 +113,12 @@ def test_strong_customer_request_resolves_customer() -> None:
     assignment = _assignment(result, "CALL_SPEAKER_0001")
     assert assignment.role is SpeakerRole.CUSTOMER
     assert assignment.evidence is RoleEvidenceCode.STRONG_CUSTOMER
+    diagnostic = _diagnostic(result, "CALL_SPEAKER_0001")
+    assert diagnostic.agent_evidence_hit_count == 0
+    assert diagnostic.customer_evidence_hit_count == 1
+    assert diagnostic.direct_evidence_outcome is DirectRoleEvidenceOutcome.CUSTOMER
+    assert diagnostic.agent_threshold_reached is False
+    assert diagnostic.customer_threshold_reached is True
 
 
 def test_first_speaker_position_alone_remains_unknown() -> None:
@@ -99,6 +130,16 @@ def test_first_speaker_position_alone_remains_unknown() -> None:
     assert assignment.role is SpeakerRole.UNKNOWN
     assert assignment.evidence is RoleEvidenceCode.WEAK_POSITIONAL
     assert assignment.confidence is None
+    diagnostic = _diagnostic(result, "CALL_SPEAKER_0001")
+    assert diagnostic.agent_evidence_hit_count == 0
+    assert diagnostic.customer_evidence_hit_count == 0
+    assert diagnostic.direct_evidence_outcome is DirectRoleEvidenceOutcome.NONE
+    assert diagnostic.weak_opening_position_evidence_present is True
+    assert diagnostic.confidence_bucket is RoleConfidenceBucket.NONE
+    assert (
+        diagnostic.inference_block_reason
+        is OppositeRoleInferenceBlockReason.SPEAKER_COUNT_NOT_TWO
+    )
 
 
 def test_high_confidence_agent_allows_safe_opposite_customer_inference() -> None:
@@ -117,6 +158,18 @@ def test_high_confidence_agent_allows_safe_opposite_customer_inference() -> None
     inferred = _assignment(result, "CALL_SPEAKER_0002")
     assert inferred.role is SpeakerRole.CUSTOMER
     assert inferred.evidence is RoleEvidenceCode.INFERRED_OPPOSITE
+    inferred_diagnostic = _diagnostic(result, "CALL_SPEAKER_0002")
+    assert inferred_diagnostic.opposite_role_inference_attempted is True
+    assert inferred_diagnostic.opposite_role_inference_applied is True
+    assert (
+        inferred_diagnostic.inference_block_reason
+        is OppositeRoleInferenceBlockReason.NONE
+    )
+    assert inferred_diagnostic.final_role is SpeakerRole.CUSTOMER
+    assert inferred_diagnostic.confidence_bucket is RoleConfidenceBucket.HIGH
+    assert (
+        inferred_diagnostic.final_decision_reason is RoleEvidenceCode.INFERRED_OPPOSITE
+    )
 
 
 def test_conflicting_evidence_remains_unknown_and_blocks_inference() -> None:
@@ -134,6 +187,82 @@ def test_conflicting_evidence_remains_unknown_and_blocks_inference() -> None:
     assert conflicted.role is SpeakerRole.UNKNOWN
     assert conflicted.evidence is RoleEvidenceCode.CONFLICTING
     assert _assignment(result, "CALL_SPEAKER_0002").role is SpeakerRole.UNKNOWN
+    diagnostic = _diagnostic(result, "CALL_SPEAKER_0001")
+    assert diagnostic.agent_evidence_hit_count == 1
+    assert diagnostic.customer_evidence_hit_count == 1
+    assert diagnostic.direct_evidence_outcome is DirectRoleEvidenceOutcome.CONFLICTING
+    assert diagnostic.agent_threshold_reached is True
+    assert diagnostic.customer_threshold_reached is True
+    assert diagnostic.opposite_role_inference_attempted is False
+    assert (
+        diagnostic.inference_block_reason
+        is OppositeRoleInferenceBlockReason.ROLE_CARDINALITY_MISMATCH
+    )
+
+
+def test_conflicting_unknown_blocks_opposite_inference_with_fixed_reason() -> None:
+    result = RuleBasedSpeakerRoleResolver().resolve(
+        _request(
+            _span("Kontrol ediyorum.", "CALL_SPEAKER_0001"),
+            _span(
+                "Merhaba ben arıyorum ve sorun yaşıyorum.",
+                "CALL_SPEAKER_0002",
+                start=1,
+                end=2,
+            ),
+        )
+    )
+
+    diagnostic = _diagnostic(result, "CALL_SPEAKER_0002")
+    assert diagnostic.opposite_role_inference_attempted is True
+    assert diagnostic.opposite_role_inference_applied is False
+    assert (
+        diagnostic.inference_block_reason
+        is OppositeRoleInferenceBlockReason.CONFLICTING_DIRECT_EVIDENCE
+    )
+
+
+def test_subthreshold_opposite_evidence_blocks_inference_with_fixed_reason() -> None:
+    resolver = RuleBasedSpeakerRoleResolver(
+        agent_phrases=("agent one", "agent two"),
+        customer_phrases=("customer one",),
+        agent_threshold=2,
+    )
+    result = resolver.resolve(
+        _request(
+            _span("agent one agent two", "CALL_SPEAKER_0001"),
+            _span("agent one", "CALL_SPEAKER_0002", start=1, end=2),
+        )
+    )
+
+    diagnostic = _diagnostic(result, "CALL_SPEAKER_0002")
+    assert diagnostic.agent_evidence_hit_count == 1
+    assert diagnostic.agent_threshold_reached is False
+    assert diagnostic.opposite_role_inference_attempted is True
+    assert diagnostic.opposite_role_inference_applied is False
+    assert (
+        diagnostic.inference_block_reason
+        is OppositeRoleInferenceBlockReason.OPPOSITE_ROLE_EVIDENCE_PRESENT
+    )
+
+
+def test_two_unknown_speakers_report_role_cardinality_block() -> None:
+    result = RuleBasedSpeakerRoleResolver().resolve(
+        _request(
+            _span("Tamam.", "CALL_SPEAKER_0001"),
+            _span("Peki.", "CALL_SPEAKER_0002", start=10, end=11),
+        )
+    )
+
+    first = _diagnostic(result, "CALL_SPEAKER_0001")
+    second = _diagnostic(result, "CALL_SPEAKER_0002")
+    assert first.weak_opening_position_evidence_present is True
+    assert second.weak_opening_position_evidence_present is False
+    assert first.opposite_role_inference_attempted is False
+    assert (
+        first.inference_block_reason
+        is OppositeRoleInferenceBlockReason.ROLE_CARDINALITY_MISMATCH
+    )
 
 
 def test_insufficient_evidence_and_more_than_two_speakers_remain_unknown() -> None:
@@ -256,6 +385,9 @@ def test_sensitive_text_is_absent_from_result_repr_and_safe_errors() -> None:
 
     assert private_text not in repr(span)
     assert private_text not in repr(result)
+    serialized_diagnostic = result.diagnostics[0].model_dump_json()
+    assert private_text not in serialized_diagnostic
+    assert "CALL_SPEAKER_0001" not in serialized_diagnostic
     with pytest.raises(SpeakerRoleResolutionError) as error:
         RuleBasedSpeakerRoleResolver(max_text_characters=2).resolve(_request(span))
     assert str(error.value) == "text_limit_exceeded"

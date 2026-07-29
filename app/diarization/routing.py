@@ -23,6 +23,21 @@ class CustomerProjectionReason(str, Enum):
     NO_TRUSTED_CUSTOMER_SPEECH = "no_trusted_customer_speech"
 
 
+class ProjectionExclusionReason(str, Enum):
+    AGENT = "agent"
+    UNKNOWN_ROLE = "unknown_role"
+    OVERLAP = "overlap"
+    LOW_CONFIDENCE = "low_confidence"
+    MISSING_SPEAKER = "missing_speaker"
+
+
+class ProjectionExclusionCount(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    reason: ProjectionExclusionReason
+    count: int = Field(ge=0)
+
+
 class DiarizationRoutingErrorCategory(str, Enum):
     INVALID_SCOPE = "invalid_scope"
     INVALID_REVISION = "invalid_revision"
@@ -91,6 +106,7 @@ class CustomerSpeechProjection(BaseModel):
     excluded_below_confidence_word_count: int
     status: CustomerProjectionStatus
     reason: CustomerProjectionReason
+    exclusion_counts: tuple[ProjectionExclusionCount, ...] = ()
 
 
 class CustomerSpeechProjectionRequest(BaseModel):
@@ -125,11 +141,14 @@ class CustomerSpeechProjector:
         excluded_unknown = 0
         excluded_overlap = 0
         excluded_below_confidence = 0
+        diagnostic_counts = {reason: 0 for reason in ProjectionExclusionReason}
         for word in tagged_words:
             if word.role is SpeakerRole.OVERLAP:
                 excluded_overlap += 1
+                diagnostic_counts[ProjectionExclusionReason.OVERLAP] += 1
             elif word.role is SpeakerRole.AGENT:
                 excluded_agent += 1
+                diagnostic_counts[ProjectionExclusionReason.AGENT] += 1
             elif word.role is SpeakerRole.CUSTOMER:
                 if (
                     word.global_speaker_id is not None
@@ -139,8 +158,16 @@ class CustomerSpeechProjector:
                     customer_words.append(word)
                 else:
                     excluded_below_confidence += 1
+                    diagnostic_counts[ProjectionExclusionReason.LOW_CONFIDENCE] += 1
             else:
                 excluded_unknown += 1
+                diagnostic_counts[
+                    (
+                        ProjectionExclusionReason.MISSING_SPEAKER
+                        if word.global_speaker_id is None
+                        else ProjectionExclusionReason.UNKNOWN_ROLE
+                    )
+                ] += 1
 
         has_customer_speech = bool(customer_words)
         return CustomerSpeechProjection(
@@ -159,6 +186,13 @@ class CustomerSpeechProjector:
             excluded_unknown_word_count=excluded_unknown,
             excluded_overlap_word_count=excluded_overlap,
             excluded_below_confidence_word_count=excluded_below_confidence,
+            exclusion_counts=tuple(
+                ProjectionExclusionCount(
+                    reason=reason,
+                    count=diagnostic_counts[reason],
+                )
+                for reason in ProjectionExclusionReason
+            ),
             status=(
                 CustomerProjectionStatus.READY
                 if has_customer_speech

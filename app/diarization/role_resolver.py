@@ -35,6 +35,28 @@ class RoleEvidenceCode(str, Enum):
     OVERLAP_IGNORED = "overlap_ignored"
 
 
+class DirectRoleEvidenceOutcome(str, Enum):
+    NONE = "none"
+    AGENT = "agent"
+    CUSTOMER = "customer"
+    CONFLICTING = "conflicting"
+
+
+class OppositeRoleInferenceBlockReason(str, Enum):
+    NONE = "none"
+    SPEAKER_COUNT_NOT_TWO = "speaker_count_not_two"
+    ROLE_CARDINALITY_MISMATCH = "role_cardinality_mismatch"
+    CONFLICTING_DIRECT_EVIDENCE = "conflicting_direct_evidence"
+    OPPOSITE_ROLE_EVIDENCE_PRESENT = "opposite_role_evidence_present"
+
+
+class RoleConfidenceBucket(str, Enum):
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 class SpeakerRoleResolutionErrorCategory(str, Enum):
     INVALID_SCOPE = "invalid_scope"
     INVALID_REVISION = "invalid_revision"
@@ -153,6 +175,34 @@ class SpeakerRoleAssignment(BaseModel):
     evidence: RoleEvidenceCode
 
 
+MAX_ROLE_EVIDENCE_HIT_COUNT = 65_535
+
+
+class SpeakerRoleDiagnostic(BaseModel):
+    """Bounded aggregate diagnostics containing no speaker or text content."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    agent_evidence_hit_count: int = Field(
+        ge=0,
+        le=MAX_ROLE_EVIDENCE_HIT_COUNT,
+    )
+    customer_evidence_hit_count: int = Field(
+        ge=0,
+        le=MAX_ROLE_EVIDENCE_HIT_COUNT,
+    )
+    direct_evidence_outcome: DirectRoleEvidenceOutcome
+    agent_threshold_reached: bool
+    customer_threshold_reached: bool
+    weak_opening_position_evidence_present: bool
+    opposite_role_inference_attempted: bool
+    opposite_role_inference_applied: bool
+    inference_block_reason: OppositeRoleInferenceBlockReason
+    final_role: SpeakerRole
+    confidence_bucket: RoleConfidenceBucket
+    final_decision_reason: RoleEvidenceCode
+
+
 class SpeakerRoleResolutionResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -161,6 +211,7 @@ class SpeakerRoleResolutionResult(BaseModel):
     transcript_revision: int
     assignments: tuple[SpeakerRoleAssignment, ...]
     ignored_evidence: tuple[RoleEvidenceCode, ...] = ()
+    diagnostics: tuple[SpeakerRoleDiagnostic, ...] = ()
 
 
 class SpeakerRoleResolverProtocol(Protocol):
@@ -246,17 +297,40 @@ class RuleBasedSpeakerRoleResolver:
                     weak_position = True
             scores[speaker_id] = (agent_score, customer_score, weak_position)
 
-        assignments: list[SpeakerRoleAssignment] = []
+        direct_assignments: list[SpeakerRoleAssignment] = []
         for speaker_id in speaker_ids_with_missing:
             score = None if speaker_id is None else scores[speaker_id]
-            assignments.append(self._direct_assignment(speaker_id, score))
-        assignments = self._infer_opposite(assignments, scores)
+            direct_assignments.append(self._direct_assignment(speaker_id, score))
+        (
+            assignments,
+            inference_attempted,
+            inferred_speaker_id,
+            inference_block_reason,
+        ) = self._infer_opposite(direct_assignments, scores)
+        diagnostics = tuple(
+            self._diagnostic(
+                speaker_id=speaker_id,
+                score=None if speaker_id is None else scores[speaker_id],
+                direct_assignment=direct_assignment,
+                final_assignment=final_assignment,
+                inference_attempted=inference_attempted,
+                inference_applied=speaker_id == inferred_speaker_id,
+                inference_block_reason=inference_block_reason,
+            )
+            for speaker_id, direct_assignment, final_assignment in zip(
+                speaker_ids_with_missing,
+                direct_assignments,
+                assignments,
+                strict=True,
+            )
+        )
         return SpeakerRoleResolutionResult(
             tenant_id=request.tenant_id,
             call_id=request.call_id,
             transcript_revision=request.transcript_revision,
             assignments=tuple(assignments),
             ignored_evidence=tuple(sorted(ignored, key=lambda item: item.value)),
+            diagnostics=diagnostics,
         )
 
     def _validate_and_order(
@@ -344,14 +418,24 @@ class RuleBasedSpeakerRoleResolver:
         self,
         assignments: list[SpeakerRoleAssignment],
         scores: dict[str, tuple[int, int, bool]],
-    ) -> list[SpeakerRoleAssignment]:
+    ) -> tuple[
+        list[SpeakerRoleAssignment],
+        bool,
+        str | None,
+        OppositeRoleInferenceBlockReason,
+    ]:
         identified = [
             assignment
             for assignment in assignments
             if assignment.global_speaker_id is not None
         ]
         if len(identified) != 2:
-            return assignments
+            return (
+                assignments,
+                False,
+                None,
+                OppositeRoleInferenceBlockReason.SPEAKER_COUNT_NOT_TWO,
+            )
         resolved = [
             assignment
             for assignment in identified
@@ -364,7 +448,12 @@ class RuleBasedSpeakerRoleResolver:
             if assignment.role is SpeakerRole.UNKNOWN
         ]
         if len(resolved) != 1 or len(unknown) != 1:
-            return assignments
+            return (
+                assignments,
+                False,
+                None,
+                OppositeRoleInferenceBlockReason.ROLE_CARDINALITY_MISMATCH,
+            )
         other = unknown[0]
         assert other.global_speaker_id is not None
         agent_score, customer_score, _ = scores[other.global_speaker_id]
@@ -376,18 +465,85 @@ class RuleBasedSpeakerRoleResolver:
         conflicting_score = (
             agent_score if inferred_role is SpeakerRole.CUSTOMER else customer_score
         )
-        if conflicting_score > 0 or other.evidence is RoleEvidenceCode.CONFLICTING:
-            return assignments
+        if other.evidence is RoleEvidenceCode.CONFLICTING:
+            return (
+                assignments,
+                True,
+                None,
+                OppositeRoleInferenceBlockReason.CONFLICTING_DIRECT_EVIDENCE,
+            )
+        if conflicting_score > 0:
+            return (
+                assignments,
+                True,
+                None,
+                OppositeRoleInferenceBlockReason.OPPOSITE_ROLE_EVIDENCE_PRESENT,
+            )
         replacement = SpeakerRoleAssignment(
             global_speaker_id=other.global_speaker_id,
             role=inferred_role,
             confidence=self._inference_min_confidence,
             evidence=RoleEvidenceCode.INFERRED_OPPOSITE,
         )
-        return [
-            replacement if assignment is other else assignment
-            for assignment in assignments
-        ]
+        return (
+            [
+                replacement if assignment is other else assignment
+                for assignment in assignments
+            ],
+            True,
+            other.global_speaker_id,
+            OppositeRoleInferenceBlockReason.NONE,
+        )
+
+    def _diagnostic(
+        self,
+        *,
+        speaker_id: str | None,
+        score: tuple[int, int, bool] | None,
+        direct_assignment: SpeakerRoleAssignment,
+        final_assignment: SpeakerRoleAssignment,
+        inference_attempted: bool,
+        inference_applied: bool,
+        inference_block_reason: OppositeRoleInferenceBlockReason,
+    ) -> SpeakerRoleDiagnostic:
+        del speaker_id
+        agent_score, customer_score, weak_position = score or (0, 0, False)
+        return SpeakerRoleDiagnostic(
+            agent_evidence_hit_count=min(
+                agent_score,
+                MAX_ROLE_EVIDENCE_HIT_COUNT,
+            ),
+            customer_evidence_hit_count=min(
+                customer_score,
+                MAX_ROLE_EVIDENCE_HIT_COUNT,
+            ),
+            direct_evidence_outcome=self._direct_evidence_outcome(
+                agent_score,
+                customer_score,
+            ),
+            agent_threshold_reached=agent_score >= self._agent_threshold,
+            customer_threshold_reached=customer_score >= self._customer_threshold,
+            weak_opening_position_evidence_present=weak_position,
+            opposite_role_inference_attempted=inference_attempted,
+            opposite_role_inference_applied=inference_applied,
+            inference_block_reason=inference_block_reason,
+            final_role=final_assignment.role,
+            confidence_bucket=_confidence_bucket(final_assignment.confidence),
+            final_decision_reason=final_assignment.evidence,
+        )
+
+    def _direct_evidence_outcome(
+        self,
+        agent_score: int,
+        customer_score: int,
+    ) -> DirectRoleEvidenceOutcome:
+        if agent_score > 0 and customer_score > 0:
+            return DirectRoleEvidenceOutcome.CONFLICTING
+        if agent_score >= self._agent_threshold:
+            return DirectRoleEvidenceOutcome.AGENT
+        if customer_score >= self._customer_threshold:
+            return DirectRoleEvidenceOutcome.CUSTOMER
+        return DirectRoleEvidenceOutcome.NONE
 
 
 def _normalize_phrases(phrases: tuple[str, ...]) -> tuple[str, ...]:
@@ -395,6 +551,16 @@ def _normalize_phrases(phrases: tuple[str, ...]) -> tuple[str, ...]:
     if not normalized or any(not phrase for phrase in normalized):
         raise ValueError("invalid_role_evidence_phrases")
     return tuple(dict.fromkeys(normalized))
+
+
+def _confidence_bucket(confidence: float | None) -> RoleConfidenceBucket:
+    if confidence is None:
+        return RoleConfidenceBucket.NONE
+    if confidence < 0.5:
+        return RoleConfidenceBucket.LOW
+    if confidence < 0.9:
+        return RoleConfidenceBucket.MEDIUM
+    return RoleConfidenceBucket.HIGH
 
 
 def _normalize_text(text: str) -> str:

@@ -94,3 +94,16 @@ This log uses local chronological numbering and records only Fatih-owned work.
 - Tests: focused 47 passed; full 1555 passed and 10 opt-in integration tests
   skipped (1 dependency warning). Ruff and Pyright passed.
 - Next planned step: validate the bounded policy in the Linux CPU runtime.
+
+## F-016 â€” Privacy-Safe Role Observability
+
+- Added immutable ID-free role evidence, inference, decision and projection
+  exclusion diagnostics without changing resolution or routing behavior.
+- Changed files: `app/diarization/__init__.py`,
+  `app/diarization/role_resolver.py`, `app/diarization/routing.py`,
+  `tests/test_diarization_role_resolver.py`,
+  `tests/test_diarization_routing.py`, `docs/progress/fatih.md`.
+- Tests: focused 53 passed; full 1938 passed and 12 opt-in integration tests
+  skipped (1 dependency warning). Ruff and Pyright passed.
+- Next planned step: use the aggregate contracts in privacy-safe operator
+  diagnostics.
