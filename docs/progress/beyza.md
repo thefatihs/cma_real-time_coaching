@@ -307,3 +307,28 @@ Tarih: 29 Temmuz 2026
   1 mevcut Starlette deprecation warning.
 - Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
   script passed ve conflict-marker testleri 5 passed.
+
+## PR44 - Trusted UTF-8 Document Ingestion
+
+Tarih: 29 Temmuz 2026
+
+- Existing `FixedCharacterDocumentChunker` uzerinden pure ve deterministic
+  `build_fixed_character_document_ingestion_request` builder'i eklendi.
+- Ayrı thin CLI yalniz regular `.txt` ve `.md` dosyalarini strict UTF-8,
+  BOM/NUL, traversal/symlink, byte/character limit ve ordered metadata
+  kontrollerinden sonra exact `DocumentIngestionRequest` haline getirir.
+- Tum local dosya, JSON, scope ve chunking validation'i PostgreSQL settings
+  yuklenmeden ve PR43 operation'i cagrilmadan once tamamlanir.
+- Caller-supplied canonical/versioned document ID ve existing deterministic
+  ordinal chunk ID semantigi korunur; migration, profile registration,
+  replacement veya stale chunk deletion eklenmez.
+- Eklenen dosyalar: `app/ingestion/document_request_builder.py`,
+  `scripts/ingest_postgres_rag_document.py`,
+  `tests/test_document_ingestion_request_builder.py`,
+  `tests/test_ingest_postgres_rag_document_cli.py`; degisen dosyalar:
+  `app/ingestion/__init__.py`, `docs/progress/beyza.md`.
+- Focused builder/document CLI/PR43/ingestion/chunking testleri: 163 passed.
+- Full suite: 1729 passed, 11 opt-in PostgreSQL integration testi skipped,
+  1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; conflict-marker
+  script passed ve conflict-marker testleri 5 passed.
