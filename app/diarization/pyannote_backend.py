@@ -19,6 +19,7 @@ from app.diarization.models import (
 )
 
 DEFAULT_PYANNOTE_MODEL_ID = "pyannote/speaker-diarization-community-1"
+MAX_TERMINAL_END_OVERRUN_SECONDS = 0.050
 
 
 class PyannoteDiarizationErrorCategory(str, Enum):
@@ -153,10 +154,9 @@ class PyannoteSpeakerDiarizer:
             )
 
         duration = request.window_end_seconds - request.window_start_seconds
-        converted: list[DiarizationTurn] = []
-        speakers: set[str] = set()
         try:
             tracks = cast(Iterable[object], itertracks(yield_label=True))
+            parsed_tracks: list[tuple[float, float, str]] = []
             for track in tracks:
                 if not isinstance(track, tuple) or len(track) != 3:
                     raise TypeError
@@ -169,9 +169,26 @@ class PyannoteSpeakerDiarizer:
                     or not isfinite(relative_end)
                     or relative_start < 0.0
                     or relative_end <= relative_start
-                    or relative_end > duration
                 ):
                     raise ValueError
+                parsed_tracks.append((relative_start, relative_end, speaker))
+
+            terminal_end = max(
+                (relative_end for _, relative_end, _ in parsed_tracks),
+                default=duration,
+            )
+            converted: list[DiarizationTurn] = []
+            speakers: set[str] = set()
+            for relative_start, relative_end, speaker in parsed_tracks:
+                if relative_end > duration:
+                    overrun = relative_end - duration
+                    if (
+                        relative_end != terminal_end
+                        or overrun > MAX_TERMINAL_END_OVERRUN_SECONDS
+                        or duration <= relative_start
+                    ):
+                        raise ValueError
+                    relative_end = duration
                 speakers.add(speaker)
                 if len(speakers) > self._max_speakers:
                     raise PyannoteDiarizationError(

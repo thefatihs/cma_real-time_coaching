@@ -17,6 +17,7 @@ from app.diarization import (
     SpeakerDiarizerProtocol,
     SpeakerRole,
 )
+from app.diarization.pyannote_backend import MAX_TERMINAL_END_OVERRUN_SECONDS
 
 
 class FakeTensor:
@@ -238,6 +239,96 @@ def test_converts_absolute_timestamps_and_orders_deterministically(
     assert all(turn.role is SpeakerRole.UNKNOWN for turn in result.turns)
     assert all(turn.global_speaker_id is None for turn in result.turns)
     assert all(turn.speaker_confidence is None for turn in result.turns)
+
+
+@pytest.mark.parametrize(
+    "overrun",
+    [0.03121875, MAX_TERMINAL_END_OVERRUN_SECONDS],
+)
+def test_clamps_tolerated_terminal_end_overrun(
+    monkeypatch: pytest.MonkeyPatch,
+    overrun: float,
+) -> None:
+    install_fake_dependencies(
+        monkeypatch,
+        SimpleNamespace(
+            exclusive_speaker_diarization=FakeAnnotation(
+                [(FakeSegment(1.0, 4.0 + overrun), None, "speaker_0")]
+            )
+        ),
+    )
+
+    result = make_backend().diarize(make_request())
+
+    assert len(result.turns) == 1
+    assert result.turns[0].start_seconds == 11.0
+    assert result.turns[0].end_seconds == 14.0
+
+
+def test_rejects_terminal_end_overrun_above_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_dependencies(
+        monkeypatch,
+        SimpleNamespace(
+            exclusive_speaker_diarization=FakeAnnotation(
+                [
+                    (
+                        FakeSegment(
+                            1.0,
+                            4.0 + MAX_TERMINAL_END_OVERRUN_SECONDS + 0.000001,
+                        ),
+                        None,
+                        "speaker_0",
+                    )
+                ]
+            )
+        ),
+    )
+
+    with pytest.raises(PyannoteDiarizationError) as error:
+        make_backend().diarize(make_request())
+
+    assert error.value.category is PyannoteDiarizationErrorCategory.MALFORMED_OUTPUT
+
+
+def test_rejects_terminal_clamp_that_would_create_non_positive_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_dependencies(
+        monkeypatch,
+        SimpleNamespace(
+            exclusive_speaker_diarization=FakeAnnotation(
+                [(FakeSegment(4.0, 4.03121875), None, "speaker_0")]
+            )
+        ),
+    )
+
+    with pytest.raises(PyannoteDiarizationError) as error:
+        make_backend().diarize(make_request())
+
+    assert error.value.category is PyannoteDiarizationErrorCategory.MALFORMED_OUTPUT
+
+
+def test_rejects_tolerated_overrun_on_non_terminal_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_dependencies(
+        monkeypatch,
+        SimpleNamespace(
+            exclusive_speaker_diarization=FakeAnnotation(
+                [
+                    (FakeSegment(0.0, 4.02), None, "speaker_0"),
+                    (FakeSegment(1.0, 4.03), None, "speaker_1"),
+                ]
+            )
+        ),
+    )
+
+    with pytest.raises(PyannoteDiarizationError) as error:
+        make_backend().diarize(make_request())
+
+    assert error.value.category is PyannoteDiarizationErrorCategory.MALFORMED_OUTPUT
 
 
 @pytest.mark.parametrize(
