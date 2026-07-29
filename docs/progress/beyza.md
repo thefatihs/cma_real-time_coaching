@@ -411,3 +411,30 @@ Tarih: 29 Temmuz 2026
   ve conflict-marker script passed; conflict-marker testleri 5 passed.
 - Bu PR external vLLM OpenAI-compatible gateway'i ekler; vLLM Python runtime,
   model, Docker veya Linux/GPU deployment'i uygulama paketine eklenmedi.
+
+## PR47 - Explicit PostgreSQL RAG Orchestration
+
+Tarih: 29 Temmuz 2026
+
+- Strict operation limitleri kullanan readiness/profile-verified
+  `orchestrate_profile_bound_postgres_rag` deployment operation'i ve secret-safe
+  thin CLI eklendi.
+- Islem sirasi local scope/limit validation, side-effect-free composition,
+  read-only schema readiness, mutation yapmayan exact profile lookup ve mevcut
+  retrieval-prompt-vLLM orchestration akisidir.
+- Empty retrieval `None` ile short-circuit olur ve vLLM gateway/HTTP cagrisi
+  yapmaz; assembled prompt siniri concrete gateway kurulmadan fail-closed
+  dogrulanir.
+- CLI strict provider/request/limit JSON contract'larini, mevcut environment
+  settings'lerini ve exclusive UTF-8 JSON output'u kullanir; console ciktilari
+  fixed ve secret-safe kalir.
+- Eklenen dosyalar: `app/deployment/postgres_orchestration.py`,
+  `scripts/orchestrate_postgres_rag.py`,
+  `tests/test_postgres_rag_orchestration.py`,
+  `tests/test_orchestrate_postgres_rag_cli.py`; degisen dosyalar:
+  `app/deployment/__init__.py`, `tests/test_postgres_rag_provisioning.py`,
+  `docs/progress/beyza.md`.
+- Focused orchestration/CLI/composition/vLLM/readiness testleri: 190 passed.
+- Full suite: 1929 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- FastAPI, dashboard/live coaching, gercek vLLM deployment'i ve smoke testleri
+  PR47 disinda kalir.
