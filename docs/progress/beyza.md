@@ -438,3 +438,28 @@ Tarih: 29 Temmuz 2026
 - Full suite: 1929 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
 - FastAPI, dashboard/live coaching, gercek vLLM deployment'i ve smoke testleri
   PR47 disinda kalir.
+
+## PR49 - Secure GitHub Actions CI
+
+Tarih: 29 Temmuz 2026
+
+- Read-only permissions, pull-request/main-push trigger'lari, concurrency
+  cancellation ve fixed timeout'lar kullanan uc bagimsiz CI job'u eklendi:
+  Ubuntu quality/tests, PostgreSQL/pgvector integration ve Windows native
+  compatibility.
+- `actions/checkout` v6.1.0 ve `astral-sh/setup-uv` v9.0.0 resmi upstream
+  tag'lerinin immutable full commit SHA'lariyla pinlendi.
+- `pgvector/pgvector:0.8.5-pg16-bookworm` resmi Docker Hub OCI multi-arch index
+  digest'i `sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb`
+  ile runner ve Compose icinde ayni exact reference olarak pinlendi.
+- Workflow yalniz locked uv dependency cache'i kullanir; `.venv`, model,
+  artifact, database log'u veya production secret'i cache/upload etmez.
+- Gercek local Docker integration digest-pinned image ile calistirildi:
+  11 passed. Unique project container, network ve volume cleanup'i
+  dogrulandi.
+- Non-Docker suite: 1929 passed, 1 skipped, 11 integration testi deselected,
+  1 mevcut Starlette deprecation warning.
+- Ruff check/format passed; Pyright 0 errors; `uv lock --check`,
+  conflict-marker script ve 5 conflict-marker testi passed.
+- Connection pooling eklenmedi; FastAPI/dashboard/live runtime wiring PR50
+  kapsaminda kalir.
