@@ -1,6 +1,7 @@
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import get_ident
 
 import pytest
 
@@ -244,6 +245,24 @@ class FakeCoachingProcessor:
         )
         self.outcomes.append(outcome)
         return outcome
+
+
+class FakeCompletionPump(FakeCoachingProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.drain_calls: list[tuple[float, int]] = []
+
+    def drain_completed(
+        self,
+        *,
+        current_seconds: float,
+    ) -> tuple[StableCoachingOutcome, ...]:
+        self.drain_calls.append((current_seconds, get_ident()))
+        outcome = StableCoachingOutcome(
+            status=CoachingProcessingStatus.PROCESSED,
+            transcript_revision=len(self.drain_calls),
+        )
+        return (outcome,)
 
 
 class FakeRuntimeClassifier:
@@ -892,6 +911,31 @@ def test_structural_coaching_processor_is_injected_with_exact_arguments() -> Non
     assert active_labels == ()
     assert result.coaching_outcomes == (processor.outcomes[0],)
     assert result.coaching_outcomes[0] is processor.outcomes[0]
+
+
+def test_completion_pump_runs_after_each_chunk_and_final_reconciliation() -> None:
+    processor = FakeCompletionPump()
+    caller_thread = get_ident()
+
+    result = pipeline(
+        [chunk(0, 0.0, 1.0), chunk(1, 1.0, 1.0)],
+        FakeTranscriber(
+            [
+                [("synthetic partial", 0.0, 1.0)],
+                [("synthetic stable text", 0.0, 2.0)],
+            ]
+        ),
+        coaching_factory=lambda state: processor,
+    ).run(Path("synthetic.wav"), "call_001")
+
+    assert processor.drain_calls == [
+        (1.0, caller_thread),
+        (2.0, caller_thread),
+        (2.0, caller_thread),
+    ]
+    assert result.steps[0].coaching_outcomes[0].transcript_revision == 1
+    assert result.steps[1].coaching_outcomes[0].transcript_revision == 2
+    assert result.coaching_outcomes[-1].transcript_revision == 3
 
 
 @pytest.mark.parametrize(

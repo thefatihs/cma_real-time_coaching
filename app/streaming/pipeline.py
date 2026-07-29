@@ -18,6 +18,7 @@ from app.events.models import (
     ClassificationResultEvent,
     TranscriptEvent,
 )
+from app.integration.rag_coaching import CoachingCompletionPumpProtocol
 from app.streaming.audio_window import ASRAudioWindow, AudioWindowBuilder
 from app.streaming.chunk_generator import generate_audio_chunks
 from app.streaming.customer_routing import (
@@ -215,6 +216,12 @@ class StreamingASRPipeline:
 
             chunk_end_seconds = chunk.chunk_start_seconds + chunk.chunk_duration_seconds
             audio_duration_seconds = max(audio_duration_seconds, chunk_end_seconds)
+            completed_coaching = self._drain_completed_coaching(
+                coordinator=coaching_coordinator,
+                current_seconds=chunk_end_seconds,
+            )
+            step_coaching_outcomes.extend(completed_coaching)
+            all_coaching_outcomes.extend(completed_coaching)
             step = StreamingASRStep(
                 tenant_id=chunk.tenant_id,
                 call_id=chunk.call_id,
@@ -256,6 +263,12 @@ class StreamingASRPipeline:
                 all_customer_routing_outcomes.append(final_routing)
             if final_coaching is not None:
                 all_coaching_outcomes.append(final_coaching)
+        all_coaching_outcomes.extend(
+            self._drain_completed_coaching(
+                coordinator=coaching_coordinator,
+                current_seconds=audio_duration_seconds,
+            )
+        )
 
         return StreamingASRResult(
             tenant_id=call_state.tenant_id,
@@ -334,6 +347,16 @@ class StreamingASRPipeline:
             classification_outcome=classification,
         )
         return classification, coaching, decision.outcome
+
+    @staticmethod
+    def _drain_completed_coaching(
+        *,
+        coordinator: CoachingProcessorProtocol | None,
+        current_seconds: float,
+    ) -> tuple[StableCoachingOutcome, ...]:
+        if not isinstance(coordinator, CoachingCompletionPumpProtocol):
+            return ()
+        return coordinator.drain_completed(current_seconds=current_seconds)
 
     @staticmethod
     def _process_coaching(

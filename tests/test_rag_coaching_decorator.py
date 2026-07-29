@@ -13,6 +13,14 @@ from app.coaching.coordinator import (
     StableCoachingOutcome,
 )
 from app.coaching.rule_engine import RuleBasedCoachingEngine
+from app.composition import (
+    BoundedPostgreSQLRAGManager,
+    RAGOrchestrationCompletion,
+    RAGOrchestrationCompletionStatus,
+    RAGOrchestrationIdentity,
+    RAGOrchestrationSubmission,
+    RAGOrchestrationSubmissionStatus,
+)
 from app.events.models import (
     ClassificationLabel,
     ClassificationResultEvent,
@@ -24,6 +32,7 @@ from app.events.models import (
     TranscriptKind,
 )
 from app.integration import (
+    CoachingCompletionPumpProtocol,
     CoachingSuggestionFactory,
     OrchestrationRunner,
     RAGCoachingProcessorDecorator,
@@ -149,16 +158,64 @@ def external_suggestion(
 
 
 @dataclass
-class FakeOrchestrationRunner:
+class FakeBackgroundManager(BoundedPostgreSQLRAGManager):
     result: OrchestrationResult | None
     error: Exception | None = None
     requests: list[OrchestrationRequest] = field(default_factory=list)
+    announcements: list[RAGOrchestrationIdentity] = field(default_factory=list)
+    submission_status: RAGOrchestrationSubmissionStatus = (
+        RAGOrchestrationSubmissionStatus.ACCEPTED
+    )
+    delivered: bool = False
 
-    def run(self, request: OrchestrationRequest) -> OrchestrationResult | None:
+    def announce_current_revision(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        transcript_revision: int,
+    ) -> None:
+        self.announcements.append(
+            RAGOrchestrationIdentity(tenant_id, call_id, transcript_revision)
+        )
+
+    def submit(
+        self,
+        request: OrchestrationRequest,
+    ) -> RAGOrchestrationSubmission:
         self.requests.append(request)
+        return RAGOrchestrationSubmission(
+            RAGOrchestrationIdentity.from_request(request),
+            self.submission_status,
+        )
+
+    def poll(
+        self,
+        identity: RAGOrchestrationIdentity,
+    ) -> RAGOrchestrationCompletion | None:
+        if (
+            self.delivered
+            or not self.requests
+            or self.submission_status is not RAGOrchestrationSubmissionStatus.ACCEPTED
+        ):
+            return None
+        self.delivered = True
         if self.error is not None:
-            raise self.error
-        return self.result
+            return RAGOrchestrationCompletion(
+                identity,
+                RAGOrchestrationCompletionStatus.FAILED,
+                error=self.error,
+            )
+        if self.result is None:
+            return RAGOrchestrationCompletion(
+                identity,
+                RAGOrchestrationCompletionStatus.EMPTY,
+            )
+        return RAGOrchestrationCompletion(
+            identity,
+            RAGOrchestrationCompletionStatus.SUCCEEDED,
+            result=self.result,
+        )
 
 
 @dataclass
@@ -257,7 +314,7 @@ def decorator_dependencies(
 ) -> tuple[
     RAGCoachingProcessorDecorator,
     CoachingCoordinator,
-    FakeOrchestrationRunner,
+    FakeBackgroundManager,
     FakeSuggestionFactory,
     TranscriptEvent,
 ]:
@@ -268,7 +325,7 @@ def decorator_dependencies(
         prepared_state(actual_event),
         coordinator_type,
     )
-    runner = FakeOrchestrationRunner(
+    runner = FakeBackgroundManager(
         runner_result
         if runner_result is not None
         else orchestration_result(actual_event)
@@ -297,23 +354,110 @@ def run(
     decorator: RAGCoachingProcessorDecorator,
     event: TranscriptEvent,
 ) -> StableCoachingOutcome:
-    return decorator.process_safely(
+    base = decorator.process_safely(
         event,
         event.end_seconds,
         classification_event=classification(event),
         active_labels=("product_information",),
+    )
+    completed = decorator.drain_completed(current_seconds=event.end_seconds)
+    if not completed:
+        return base
+    external = completed[0]
+    if base.result is None or external.result is None:
+        return external
+    return StableCoachingOutcome(
+        status=base.status,
+        transcript_revision=base.transcript_revision,
+        result=CoachingCoordinatorResult(
+            classification_event=base.result.classification_event,
+            displayed_suggestions=(
+                *base.result.displayed_suggestions,
+                *external.result.displayed_suggestions,
+            ),
+            suppressed_suggestions=(
+                *base.result.suppressed_suggestions,
+                *external.result.suppressed_suggestions,
+            ),
+            matched_rule_ids=base.result.matched_rule_ids,
+            suppression_reasons=(
+                *base.result.suppression_reasons,
+                *external.result.suppression_reasons,
+            ),
+            transcript_revision=base.result.transcript_revision,
+            current_revision_labels=base.result.current_revision_labels,
+            replaced_suggestion_ids=(
+                *base.result.replaced_suggestion_ids,
+                *external.result.replaced_suggestion_ids,
+            ),
+            suggestion_decisions=(
+                *base.result.suggestion_decisions,
+                *external.result.suggestion_decisions,
+            ),
+        ),
     )
 
 
 def test_protocols_and_decorator_are_structurally_compatible() -> None:
     decorator, _, runner, factory, _ = decorator_dependencies()
     processor: CoachingProcessorProtocol = decorator
-    orchestration: OrchestrationRunner = runner
+    pump: CoachingCompletionPumpProtocol = decorator
     suggestion_factory: CoachingSuggestionFactory = factory
 
     assert processor is decorator
-    assert orchestration is runner
+    assert pump is decorator
+    assert isinstance(runner, BoundedPostgreSQLRAGManager)
     assert suggestion_factory is factory
+    assert OrchestrationRunner is not None
+
+
+def test_process_returns_base_before_completion_is_drained() -> None:
+    decorator, subject_coordinator, runner, factory, event = decorator_dependencies(
+        coordinator_type=TrackingCoordinator
+    )
+
+    base = decorator.process_safely(
+        event,
+        event.end_seconds,
+        classification_event=classification(event),
+        active_labels=("product_information",),
+    )
+
+    tracking = subject_coordinator
+    assert isinstance(tracking, TrackingCoordinator)
+    assert base is tracking.last_base_outcome
+    assert len(runner.requests) == 1
+    assert factory.calls == []
+    assert decorator.drain_completed(current_seconds=event.end_seconds)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        RAGOrchestrationSubmissionStatus.DUPLICATE,
+        RAGOrchestrationSubmissionStatus.STALE,
+        RAGOrchestrationSubmissionStatus.CAPACITY_REJECTED,
+        RAGOrchestrationSubmissionStatus.NOT_STARTED,
+        RAGOrchestrationSubmissionStatus.CLOSED,
+    ],
+)
+def test_rejected_submission_retains_no_context(
+    status: RAGOrchestrationSubmissionStatus,
+) -> None:
+    decorator, _, runner, factory, event = decorator_dependencies()
+    runner.submission_status = status
+
+    base = decorator.process_safely(
+        event,
+        event.end_seconds,
+        classification_event=classification(event),
+        active_labels=("product_information",),
+    )
+
+    assert base.status is CoachingProcessingStatus.PROCESSED
+    assert decorator.drain_completed(current_seconds=event.end_seconds) == ()
+    assert decorator._pending_contexts == {}  # noqa: SLF001
+    assert factory.calls == []
 
 
 def test_constructor_accepts_only_one_coordinator_and_internal_adapter_shares_it() -> (
@@ -325,7 +469,7 @@ def test_constructor_accepts_only_one_coordinator_and_internal_adapter_shares_it
     assert tuple(parameters) == (
         "coordinator",
         "tenant_config",
-        "orchestration_runner",
+        "background_manager",
         "suggestion_factory",
         "rag_llm_enabled_labels",
     )
@@ -346,7 +490,7 @@ def test_constructor_rejects_invalid_enabled_labels(labels: tuple[str, ...]) -> 
         RAGCoachingProcessorDecorator(
             subject_coordinator,
             config,
-            FakeOrchestrationRunner(orchestration_result(event)),
+            FakeBackgroundManager(orchestration_result(event)),
             FakeSuggestionFactory(external_suggestion(event)),
             labels,
         )
@@ -363,7 +507,7 @@ def test_config_skip_returns_exact_base_object(config: TenantConfig) -> None:
     event = transcript()
     state = prepared_state(event)
     subject_coordinator = coordinator(config, state, TrackingCoordinator)
-    runner = FakeOrchestrationRunner(orchestration_result(event))
+    runner = FakeBackgroundManager(orchestration_result(event))
     decorator = RAGCoachingProcessorDecorator(
         subject_coordinator,
         config,
@@ -398,7 +542,7 @@ def test_missing_or_ineligible_revision_labels_skip_orchestration() -> None:
     state = CallState(tenant_id=event.tenant_id, call_id=event.call_id)
     state.apply_transcript(event)
     subject_coordinator = coordinator(config, state)
-    runner = FakeOrchestrationRunner(orchestration_result(event))
+    runner = FakeBackgroundManager(orchestration_result(event))
     decorator = RAGCoachingProcessorDecorator(
         subject_coordinator,
         config,
@@ -424,7 +568,7 @@ def test_partial_and_duplicate_base_outcomes_skip_enrichment() -> None:
         transcript_revision=partial_event.revision,
     )
     partial_coordinator = coordinator(config, partial_state, TrackingCoordinator)
-    partial_runner = FakeOrchestrationRunner(orchestration_result(partial_event))
+    partial_runner = FakeBackgroundManager(orchestration_result(partial_event))
     partial_decorator = RAGCoachingProcessorDecorator(
         partial_coordinator,
         config,
@@ -502,19 +646,23 @@ def test_untrusted_or_empty_orchestration_result_skips_factory(
     assert factory.calls == []
 
 
-def test_orchestration_value_error_is_isolated_but_runtime_error_propagates() -> None:
+def test_background_failure_is_fixed_and_does_not_expose_exception() -> None:
     isolated, _, isolated_runner, isolated_factory, event = decorator_dependencies()
     isolated_runner.error = ValueError("synthetic trusted validation failure")
 
-    base = run(isolated, event)
+    failed = run(isolated, event)
 
-    assert base.status is CoachingProcessingStatus.PROCESSED
+    assert failed.status is CoachingProcessingStatus.FAILED
+    assert failed.error_type == "rag_orchestration"
+    assert failed.error_code == "background_failure"
+    assert "trusted validation failure" not in repr(failed)
     assert isolated_factory.calls == []
 
-    propagated, _, runner, _, event = decorator_dependencies()
-    runner.error = RuntimeError("synthetic programming failure")
-    with pytest.raises(RuntimeError, match="programming failure"):
-        run(propagated, event)
+    propagated, _, runner, factory, event = decorator_dependencies()
+    runner.error = RuntimeError("synthetic provider failure")
+    result = run(propagated, event)
+    assert result.status is CoachingProcessingStatus.FAILED
+    assert factory.calls == []
 
 
 @pytest.mark.parametrize(

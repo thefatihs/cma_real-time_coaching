@@ -7,6 +7,12 @@ from app.calls.models import CallState
 from app.classification.runtime import RuntimeSetFitClassifier
 from app.coaching.coordinator import CoachingCoordinator
 from app.coaching.safe_processor import SafeCoachingProcessorAdapter
+from app.composition import (
+    BoundedPostgreSQLRAGManager,
+    RAGOrchestrationCompletion,
+    RAGOrchestrationIdentity,
+    RAGOrchestrationSubmission,
+)
 from app.events.models import (
     CoachingAction,
     SuggestionPriority,
@@ -19,7 +25,7 @@ from app.integration import (
     RAGCoachingIntegrationPolicy,
     RAGCoachingProcessorDecorator,
 )
-from app.orchestration import OrchestrationRequest, OrchestrationResult
+from app.orchestration import OrchestrationRequest
 from app.streaming.audio_window import ASRAudioWindow
 from app.streaming.pipeline import CoachingProcessorProtocol, WindowTranscriberProtocol
 from app.streaming.window_transcriber import WindowTranscriptionResult
@@ -49,13 +55,30 @@ class TypedFakeTranscriber:
         raise AssertionError("transcription must not run in wiring tests")
 
 
-class FakeRunner:
+class FakeBackgroundManager(BoundedPostgreSQLRAGManager):
     def __init__(self) -> None:
         self.calls = 0
 
-    def run(self, request: OrchestrationRequest) -> OrchestrationResult | None:
+    def announce_current_revision(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+        transcript_revision: int,
+    ) -> None:
         self.calls += 1
-        raise AssertionError("runner must not execute during construction")
+        raise AssertionError("manager must not execute during construction")
+
+    def submit(self, request: OrchestrationRequest) -> RAGOrchestrationSubmission:
+        self.calls += 1
+        raise AssertionError("manager must not execute during construction")
+
+    def poll(
+        self,
+        identity: RAGOrchestrationIdentity,
+    ) -> RAGOrchestrationCompletion | None:
+        self.calls += 1
+        raise AssertionError("manager must not execute during construction")
 
 
 @dataclass
@@ -74,10 +97,10 @@ class CallbackTracker:
 
 def integration_dependencies() -> tuple[
     RAGCoachingIntegrationDependencies,
-    FakeRunner,
+    FakeBackgroundManager,
     CallbackTracker,
 ]:
-    runner = FakeRunner()
+    manager = FakeBackgroundManager()
     callbacks = CallbackTracker()
     policy = RAGCoachingIntegrationPolicy(
         rag_llm_enabled_labels=("product_information",),
@@ -89,12 +112,12 @@ def integration_dependencies() -> tuple[
     )
     return (
         RAGCoachingIntegrationDependencies(
-            orchestration_runner=runner,
+            background_manager=manager,
             policy=policy,
             suggestion_id_factory=callbacks.suggestion_id,
             utc_datetime_factory=callbacks.now,
         ),
-        runner,
+        manager,
         callbacks,
     )
 
@@ -336,7 +359,7 @@ def test_enabled_bundle_maps_exact_dependencies_without_invocation() -> None:
     assert coordinator.call_state is call_state
     assert processor._base_processor._coordinator is coordinator  # noqa: SLF001
     assert processor._tenant_config is tenant.config  # noqa: SLF001
-    assert processor._orchestration_runner is runner  # noqa: SLF001
+    assert processor._background_manager is runner  # noqa: SLF001
     assert processor._rag_llm_enabled_labels == (  # noqa: SLF001
         integration.policy.rag_llm_enabled_labels
     )
