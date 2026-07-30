@@ -4,14 +4,20 @@ from contextlib import nullcontext
 from dataclasses import replace
 import importlib
 import sys
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
 from app.events.models import SuggestionPriority
 from live_dashboard.demo_data import tenant_demos
 from live_dashboard.presentation import ui_scope_identity
+from live_dashboard.rag_runtime import DashboardRAGRuntimeController
 from live_dashboard.runtime_wiring import DashboardExecutionResourceRegistry
+from live_dashboard.runtime_wiring import (
+    ArtifactAvailability,
+    DashboardServiceSelection,
+)
 from live_dashboard.view_models import (
     create_local_execution,
     dashboard_tabs,
@@ -190,7 +196,8 @@ def test_dashboard_execution_resource_reuses_scope_and_session_keeps_only_key(
     recorder = _RecordingStreamlit()
     app = _load_dashboard_app(monkeypatch, recorder)
     registry = DashboardExecutionResourceRegistry(capacity=2)
-    monkeypatch.setattr(app, "_execution_resource_registry", lambda _capacity: registry)
+    controller = DashboardRAGRuntimeController(registry=registry, environment={})
+    monkeypatch.setattr(app, "_rag_runtime_controller", lambda _capacity: controller)
     runtime = create_local_execution(
         tenant_demos()["tenant_alpha"],
         "synthetic-call",
@@ -218,7 +225,8 @@ def test_dashboard_scope_change_closes_and_removes_previous_resource(
     recorder = _RecordingStreamlit()
     app = _load_dashboard_app(monkeypatch, recorder)
     registry = DashboardExecutionResourceRegistry(capacity=1)
-    monkeypatch.setattr(app, "_execution_resource_registry", lambda _capacity: registry)
+    controller = DashboardRAGRuntimeController(registry=registry, environment={})
+    monkeypatch.setattr(app, "_rag_runtime_controller", lambda _capacity: controller)
     first_runtime = create_local_execution(
         tenant_demos()["tenant_alpha"],
         "call-one",
@@ -237,6 +245,42 @@ def test_dashboard_scope_change_closes_and_removes_previous_resource(
     assert recorder.session_state["dashboard_execution_resource_key"] == (
         second.opaque_key
     )
+
+
+def test_pipeline_construction_receives_resource_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    runtime = create_local_execution(
+        tenant_demos()["tenant_alpha"],
+        "synthetic-call",
+    ).runtime
+    integration = object()
+    resource: Any = SimpleNamespace(integration=integration)
+    captured: dict[str, object] = {}
+    expected_pipeline = object()
+    monkeypatch.setattr(app, "_load_asr_model", lambda *_args: object())
+    monkeypatch.setattr(app, "WindowTranscriber", lambda engine: engine)
+
+    def build(*args: object, **kwargs: object) -> object:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return expected_pipeline
+
+    monkeypatch.setattr(app, "build_live_pipeline", build)
+
+    result = app._make_pipeline(
+        runtime,
+        DashboardServiceSelection(enable_setfit=False, enable_coaching=True),
+        ArtifactAvailability(compatible=True),
+        resource,
+    )
+
+    assert result is expected_pipeline
+    captured_kwargs = cast(dict[str, object], captured["kwargs"])
+    assert captured_kwargs["integration"] is integration
+    assert captured_kwargs["execution_resource"] is resource
 
 
 def test_representative_renderer_handles_empty_history(

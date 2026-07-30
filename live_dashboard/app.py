@@ -30,6 +30,7 @@ from live_dashboard.runtime_wiring import (  # noqa: E402
     default_service_selection,
     inspect_default_artifacts,
 )
+from live_dashboard.rag_runtime import DashboardRAGRuntimeController  # noqa: E402
 from live_dashboard.presentation import (  # noqa: E402
     OperationalState,
     UIScopeIdentity,
@@ -127,8 +128,17 @@ def _execution_resource_registry(
     return DashboardExecutionResourceRegistry(capacity=capacity)
 
 
+@st.cache_resource(show_spinner=False)
+def _rag_runtime_controller(
+    capacity: int,
+) -> DashboardRAGRuntimeController:
+    return DashboardRAGRuntimeController(
+        registry=_execution_resource_registry(capacity),
+    )
+
+
 def _execution_resource(runtime: DashboardRuntime) -> DashboardExecutionResource:
-    registry = _execution_resource_registry(_EXECUTION_RESOURCE_CAPACITY)
+    controller = _rag_runtime_controller(_EXECUTION_RESOURCE_CAPACITY)
     identity = DashboardExecutionIdentity(
         runtime.tenant.config.context.tenant_id,
         runtime.call_id,
@@ -137,11 +147,10 @@ def _execution_resource(runtime: DashboardRuntime) -> DashboardExecutionResource
     if previous_key is not None and previous_key != identity.opaque_key:
         if not isinstance(previous_key, str):
             raise ValueError("dashboard execution resource key is invalid")
-        registry.close_and_remove(previous_key)
-    resource = registry.acquire(
-        tenant_id=identity.tenant_id,
+        controller.close_and_remove(previous_key)
+    _, resource = controller.activate(
+        tenant_config=runtime.tenant.config,
         call_id=identity.call_id,
-        integration=None,
     )
     st.session_state[_EXECUTION_RESOURCE_SESSION_KEY] = resource.opaque_key
     return resource
@@ -153,7 +162,7 @@ def _close_execution_resource() -> None:
         return
     if not isinstance(key, str):
         raise ValueError("dashboard execution resource key is invalid")
-    _execution_resource_registry(_EXECUTION_RESOURCE_CAPACITY).close_and_remove(key)
+    _rag_runtime_controller(_EXECUTION_RESOURCE_CAPACITY).close_and_remove(key)
 
 
 def _make_pipeline(
@@ -177,7 +186,7 @@ def _make_pipeline(
         selection=selection,
         availability=availability,
         classifier_provider=_load_runtime_classifier,
-        integration=None,
+        integration=execution_resource.integration,
         execution_resource=execution_resource,
     )
 

@@ -563,3 +563,28 @@ Tarih: 29 Temmuz 2026
   conflict-marker script ve 5 conflict-marker testi passed.
 - Sonraki planli adim: provider activation ve post-final outcome UI consumption
   ayri, ownership-onayli bir PR'da ele alinacak.
+
+## PR50-D2 - Call-Scoped Dashboard RAG Runtime Activation
+
+Tarih: 30 Temmuz 2026
+
+- PostgreSQL/vLLM RAG aktivasyonu yalnizca explicit dashboard call-start
+  lifecycle'inda, strict server-side environment ve JSON policy dogrulamasindan
+  sonra yapilir; eksik veya kapali konfigurasyon `DISABLED`, gecersiz veya
+  hazirlanamayan konfigurasyon `UNAVAILABLE`, basarili hazirlik `READY` olur.
+- PR50-D1 registry ayni tenant/call rerun'inda exact resource'u yeniden kullanir;
+  readiness/profile hazirligi tekrarlanmaz ve bounded manager resource close
+  uzerinden etkili olarak tam bir kez kapatilir.
+- Aktivasyon migration, provisioning, ingestion veya pooling yapmaz; embedding
+  ve vLLM provider'lari readiness/profile hazirligindan sonra da lazy kalir.
+- Degisen dosyalar: `live_dashboard/app.py`,
+  `live_dashboard/runtime_wiring.py`, iki mevcut focused test; yeni
+  `live_dashboard/rag_runtime.py` ve
+  `tests/test_live_dashboard_rag_runtime.py`.
+- Focused dashboard runtime/lifecycle/rendering testleri: 79 passed, 1 skipped
+  (Windows symlink olusturma yetkisi yok).
+- Full suite: 2046 passed, 12 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`,
+  conflict-marker script ve 5 conflict-marker testi passed.
+- Sonraki planli adim: status rendering, gercek provider smoke testi ve pooling
+  ayri, ownership-onayli PR'lara ertelendi.

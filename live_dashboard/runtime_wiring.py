@@ -210,6 +210,24 @@ class DashboardExecutionResourceRegistry:
             self._resources[key] = resource
             return resource
 
+    def find(
+        self,
+        *,
+        tenant_id: str,
+        call_id: str,
+    ) -> DashboardExecutionResource | None:
+        """Return an existing open exact-scope resource without creating one."""
+        identity = DashboardExecutionIdentity(tenant_id, call_id)
+        with self._lock:
+            resource = self._resources.get(identity.opaque_key)
+            if resource is None:
+                return None
+            if resource.identity != identity:
+                raise ValueError("dashboard execution resource scope does not match")
+            if resource.closed:
+                raise RuntimeError("closed dashboard execution resource is retained")
+            return resource
+
     def lookup(
         self,
         opaque_key: str,
