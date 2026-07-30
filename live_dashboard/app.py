@@ -62,7 +62,9 @@ from live_dashboard.uploaded_audio import (  # noqa: E402
 )
 from live_dashboard.view_models import (  # noqa: E402
     DashboardRuntime,
+    DashboardExecutionMode,
     DashboardExecutionSnapshot,
+    DashboardExecutionStage,
     DashboardExecutionStatus,
     DashboardTabsViewModel,
     LocalExecutionState,
@@ -96,6 +98,19 @@ _EXECUTION_RESOURCE_CAPACITY = 8
 _EXECUTION_RESOURCE_SESSION_KEY = "dashboard_execution_resource_key"
 _RAG_RUNTIME_STATUS_SESSION_KEY = "dashboard_rag_runtime_status"
 _RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
+_EXECUTION_STAGE_TEXT = {
+    DashboardExecutionStage.STARTING: "Analiz başlatılıyor",
+    DashboardExecutionStage.FILE_PREPARING: "Ses dosyası hazırlanıyor",
+    DashboardExecutionStage.ENGINE_RUNNING: "Analiz motoru çalışıyor",
+    DashboardExecutionStage.CHUNK_PROCESSING: "Ses parçaları işleniyor",
+    DashboardExecutionStage.COMPLETED: "Analiz tamamlandı",
+    DashboardExecutionStage.CANCELLED: "Analiz durduruldu",
+    DashboardExecutionStage.FAILED: "Analiz başarısız",
+}
+_EXECUTION_MODE_TEXT = {
+    DashboardExecutionMode.FAST_ANALYSIS: "Hızlı analiz",
+    DashboardExecutionMode.REALTIME_SIMULATION: "Gerçek zaman simülasyonu",
+}
 
 
 @st.cache_resource(show_spinner="ASR modeli yükleniyor…")
@@ -693,7 +708,10 @@ def _render_dashboard_view(
     view: DashboardTabsViewModel,
     scope: UIScopeIdentity,
     rag_runtime_status: object = _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
+    execution: DashboardExecutionSnapshot | None = None,
 ) -> None:
+    if execution is not None:
+        _render_execution_status(execution)
     if rag_runtime_status is not _RAG_RUNTIME_STATUS_NOT_AVAILABLE:
         st.caption(rag_runtime_status_text(rag_runtime_status))
     representative, technical, result = st.tabs(
@@ -710,6 +728,64 @@ def _render_dashboard_view(
         _render_technical(view, scope)
     with result:
         _render_result_view(call_id, view)
+
+
+def _render_execution_status(snapshot: DashboardExecutionSnapshot) -> None:
+    stage_text = _EXECUTION_STAGE_TEXT[snapshot.execution_stage]
+    if (
+        snapshot.execution_stage is DashboardExecutionStage.CHUNK_PROCESSING
+        and snapshot.total_chunks
+    ):
+        stage_text = (
+            f"Ses parçası {snapshot.processed_chunks} / "
+            f"{snapshot.total_chunks} işleniyor"
+        )
+    mode_text = _EXECUTION_MODE_TEXT[snapshot.execution_mode]
+    message = f"{stage_text} · {mode_text}"
+    if snapshot.lifecycle_status is DashboardExecutionStatus.COMPLETED:
+        st.success(message)
+    elif snapshot.lifecycle_status is DashboardExecutionStatus.CANCELLED:
+        st.warning(message)
+    elif snapshot.lifecycle_status is DashboardExecutionStatus.FAILED:
+        st.error(message)
+    else:
+        st.info(message)
+
+    if snapshot.total_chunks:
+        percentage = min(
+            max(snapshot.processed_chunks / snapshot.total_chunks * 100, 0.0),
+            100.0,
+        )
+        chunk_progress = (
+            f"{snapshot.processed_chunks}/{snapshot.total_chunks} · %{percentage:.0f}"
+        )
+    else:
+        chunk_progress = (
+            f"{snapshot.processed_chunks} parça · Toplam henüz hesaplanıyor"
+        )
+    if snapshot.total_audio_seconds is not None:
+        processed_audio = snapshot.processed_audio_seconds or 0.0
+        audio_progress = f"{processed_audio:.2f}/{snapshot.total_audio_seconds:.2f} sn"
+    elif snapshot.processed_audio_seconds is not None:
+        audio_progress = f"{snapshot.processed_audio_seconds:.2f} sn işlendi"
+    else:
+        audio_progress = "Henüz hesaplanıyor"
+    _metric_rows(
+        (
+            StatusCardViewModel("İşlenen parça", chunk_progress),
+            StatusCardViewModel("İşlenen ses", audio_progress),
+            StatusCardViewModel("Çalışma modu", mode_text),
+            StatusCardViewModel("Anlık revizyon", str(snapshot.revision)),
+        )
+    )
+    if (
+        snapshot.lifecycle_status is DashboardExecutionStatus.RUNNING
+        and snapshot.processed_chunks
+    ):
+        st.caption(
+            "Konuşma metni güncelleniyor · Intent ve risk analizi yapılıyor · "
+            "Koçluk önerileri hazırlanıyor"
+        )
 
 
 demos = tenant_demos()
@@ -852,11 +928,18 @@ with st.sidebar:
         )
         local_state_for_render = local
         st.warning("CPU çıkarımı gerçek zamandan daha yavaş olabilir.")
+        retained_before_start = _retained_execution_resource(local.runtime)
+        running_before_start = (
+            retained_before_start is not None
+            and retained_before_start.latest_snapshot is not None
+            and retained_before_start.latest_snapshot.lifecycle_status
+            is DashboardExecutionStatus.RUNNING
+        )
         if st.button(
             "Başlat",
             type="primary",
             use_container_width=True,
-            disabled=not local.start_enabled,
+            disabled=not local.start_enabled or running_before_start,
         ):
             if source_mode == "Dosya yükle" and uploaded is None:
                 st.error("Önce bir ses dosyası yükleyin.")
@@ -864,7 +947,7 @@ with st.sidebar:
                 st.error("Yerel ses dosyası yolunu girin.")
             else:
                 local.request_start()
-                local.stage = "Model yükleniyor"
+                local.stage = _EXECUTION_STAGE_TEXT[DashboardExecutionStage.STARTING]
 
                 try:
                     execution_resource = _execution_resource(local.runtime)
@@ -874,10 +957,17 @@ with st.sidebar:
                         if isinstance(safe_metadata, SafeUploadMetadata)
                         else None
                     )
+                    execution_mode = (
+                        DashboardExecutionMode.REALTIME_SIMULATION
+                        if playback_mode == "Gerçek zaman simülasyonu"
+                        else DashboardExecutionMode.FAST_ANALYSIS
+                    )
                     initial = execution_snapshot(
                         local,
                         revision=0,
                         lifecycle_status=DashboardExecutionStatus.RUNNING,
+                        execution_mode=execution_mode,
+                        execution_stage=DashboardExecutionStage.STARTING,
                         audio_metadata=selected_metadata,
                     )
                     selected_upload = (
@@ -888,38 +978,50 @@ with st.sidebar:
                         else None
                     )
                     selected_path = audio_path_text
-                    realtime = playback_mode == "Gerçek zaman simülasyonu"
+                    realtime = (
+                        execution_mode is DashboardExecutionMode.REALTIME_SIMULATION
+                    )
 
                     def process_uploaded_audio(
                         cancellation: Event,
                         publish: Callable[[DashboardExecutionSnapshot], None],
                     ) -> DashboardExecutionSnapshot:
+                        revision = 0
+                        pacing_started_at = perf_counter()
+
+                        def publish_stage(stage: DashboardExecutionStage) -> None:
+                            nonlocal revision
+                            local.stage = _EXECUTION_STAGE_TEXT[stage]
+                            revision += 1
+                            publish(
+                                execution_snapshot(
+                                    local,
+                                    revision=revision,
+                                    lifecycle_status=DashboardExecutionStatus.RUNNING,
+                                    execution_mode=execution_mode,
+                                    execution_stage=stage,
+                                    audio_metadata=selected_metadata,
+                                )
+                            )
+
+                        publish_stage(DashboardExecutionStage.FILE_PREPARING)
                         pipeline = _make_pipeline(
                             local.runtime,
                             service_selection,
                             artifact_availability,
                             execution_resource,
                         )
-                        revision = 0
-                        pacing_started_at = perf_counter()
+                        publish_stage(DashboardExecutionStage.ENGINE_RUNNING)
 
                         def show_plan(_plan: StreamingASRPlan) -> None:
                             if cancellation.is_set():
                                 raise RuntimeError("dashboard_execution_cancelled")
+                            publish_stage(DashboardExecutionStage.ENGINE_RUNNING)
 
                         def show_step(step: StreamingASRStep) -> None:
-                            nonlocal revision
                             if cancellation.is_set():
                                 raise RuntimeError("dashboard_execution_cancelled")
-                            revision += 1
-                            publish(
-                                execution_snapshot(
-                                    local,
-                                    revision=revision,
-                                    lifecycle_status=(DashboardExecutionStatus.RUNNING),
-                                    audio_metadata=selected_metadata,
-                                )
-                            )
+                            publish_stage(DashboardExecutionStage.CHUNK_PROCESSING)
                             if wait_for_live_cadence(
                                 step,
                                 started_at=pacing_started_at,
@@ -960,6 +1062,8 @@ with st.sidebar:
                             local,
                             revision=revision,
                             lifecycle_status=DashboardExecutionStatus.COMPLETED,
+                            execution_mode=execution_mode,
+                            execution_stage=DashboardExecutionStage.COMPLETED,
                             audio_metadata=selected_metadata,
                         )
 
@@ -972,7 +1076,12 @@ with st.sidebar:
                         except Exception:
                             cancelled = cancellation.is_set()
                             local.status = "cancelled" if cancelled else "error"
-                            local.stage = "İptal edildi" if cancelled else "Başarısız"
+                            terminal_stage = (
+                                DashboardExecutionStage.CANCELLED
+                                if cancelled
+                                else DashboardExecutionStage.FAILED
+                            )
+                            local.stage = _EXECUTION_STAGE_TEXT[terminal_stage]
                             local.error_message = (
                                 None
                                 if cancelled
@@ -980,19 +1089,30 @@ with st.sidebar:
                             )
                             return execution_snapshot(
                                 local,
-                                revision=local.current_chunk + 1,
+                                revision=(
+                                    (
+                                        execution_resource.latest_snapshot.revision
+                                        if execution_resource.latest_snapshot
+                                        is not None
+                                        else 0
+                                    )
+                                    + 1
+                                ),
                                 lifecycle_status=(
                                     DashboardExecutionStatus.CANCELLED
                                     if cancelled
                                     else DashboardExecutionStatus.FAILED
                                 ),
+                                execution_mode=execution_mode,
+                                execution_stage=terminal_stage,
                                 audio_metadata=selected_metadata,
                                 failure_reason=(
                                     None if cancelled else "processing_failed"
                                 ),
                             )
 
-                    execution_resource.start_worker(initial, run_uploaded_audio)
+                    if execution_resource.start_worker(initial, run_uploaded_audio):
+                        st.rerun()
                 except Exception:
                     local.status = "error"
                     local.stage = "Başarısız"
@@ -1000,7 +1120,7 @@ with st.sidebar:
                     st.error(local.error_message)
         if st.button(
             "Durdur",
-            disabled=not local.stop_enabled,
+            disabled=not (local.stop_enabled or running_before_start),
             use_container_width=True,
         ):
             retained = _retained_execution_resource(local.runtime)
@@ -1044,9 +1164,13 @@ else:
     render_local_state = local_state_for_render
     safe_metadata = st.session_state.get("safe_audio_metadata")
     retained_resource = _retained_execution_resource(render_local_state.runtime)
+    retained_snapshot = (
+        None if retained_resource is None else retained_resource.latest_snapshot
+    )
     polling_interval = (
         0.5
-        if retained_resource is not None and retained_resource.worker_active
+        if retained_snapshot is not None
+        and retained_snapshot.lifecycle_status is DashboardExecutionStatus.RUNNING
         else None
     )
 
@@ -1073,6 +1197,7 @@ else:
             view=snapshot.tabs,
             scope=active_ui_scope,
             rag_runtime_status=rag_status,
+            execution=snapshot,
         )
 
     local_live_area()

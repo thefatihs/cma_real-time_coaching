@@ -35,6 +35,7 @@ from app.streaming.pipeline import (
 from live_dashboard.demo_data import TenantDemo
 from live_dashboard.view_models import (
     DashboardExecutionSnapshot,
+    DashboardExecutionStage,
     DashboardExecutionStatus,
     DashboardRuntime,
 )
@@ -230,6 +231,11 @@ class DashboardExecutionResource:
                         latest,
                         revision=latest.revision + 1,
                         lifecycle_status=status,
+                        execution_stage=(
+                            DashboardExecutionStage.CANCELLED
+                            if status is DashboardExecutionStatus.CANCELLED
+                            else DashboardExecutionStage.FAILED
+                        ),
                         failure_reason=(
                             None
                             if status is DashboardExecutionStatus.CANCELLED

@@ -119,6 +119,21 @@ class DashboardExecutionStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class DashboardExecutionMode(str, Enum):
+    FAST_ANALYSIS = "FAST_ANALYSIS"
+    REALTIME_SIMULATION = "REALTIME_SIMULATION"
+
+
+class DashboardExecutionStage(str, Enum):
+    STARTING = "STARTING"
+    FILE_PREPARING = "FILE_PREPARING"
+    ENGINE_RUNNING = "ENGINE_RUNNING"
+    CHUNK_PROCESSING = "CHUNK_PROCESSING"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+
+
 @dataclass(frozen=True, slots=True)
 class TranscriptViewModel:
     stable_text: str
@@ -284,8 +299,12 @@ class DashboardExecutionSnapshot:
     call_id: str
     revision: int
     lifecycle_status: DashboardExecutionStatus
+    execution_mode: DashboardExecutionMode
+    execution_stage: DashboardExecutionStage
     processed_chunks: int
     total_chunks: int
+    processed_audio_seconds: float | None
+    total_audio_seconds: float | None
     transcript_revision: int
     transcript: TranscriptViewModel
     intent_risk: tuple[IntentChipViewModel, ...]
@@ -903,15 +922,21 @@ def dashboard_tabs(
         if complete
         else (local_state.stage if local_state else "Demo hazır")
     )
+    chunk_status = (
+        f"{progress.completed_chunks}/{progress.total_chunks}"
+        if progress.total_chunks
+        else str(progress.completed_chunks)
+    )
+    completion_status = (
+        f"%{progress.percentage:.0f}" if progress.total_chunks else "Hesaplanıyor"
+    )
     status = (
         StatusCardViewModel("Tenant", runtime.tenant.config.context.tenant_name),
         StatusCardViewModel("Çağrı", runtime.call_id),
         StatusCardViewModel("Durum", call_status),
         StatusCardViewModel("Geçen süre", progress.elapsed),
-        StatusCardViewModel(
-            "Parça", f"{progress.completed_chunks}/{progress.total_chunks}"
-        ),
-        StatusCardViewModel("Tamamlanma", f"%{progress.percentage:.0f}"),
+        StatusCardViewModel("Parça", chunk_status),
+        StatusCardViewModel("Tamamlanma", completion_status),
     )
     current_names = tuple(
         canonical_labels(
@@ -1236,6 +1261,8 @@ def execution_snapshot(
     *,
     revision: int,
     lifecycle_status: DashboardExecutionStatus,
+    execution_mode: DashboardExecutionMode = DashboardExecutionMode.FAST_ANALYSIS,
+    execution_stage: DashboardExecutionStage | None = None,
     audio_metadata: SafeUploadMetadata | None = None,
     failure_reason: str | None = None,
 ) -> DashboardExecutionSnapshot:
@@ -1244,6 +1271,11 @@ def execution_snapshot(
         raise ValueError("snapshot revision cannot be negative")
     if failure_reason not in {None, "processing_failed"}:
         raise ValueError("snapshot failure reason is invalid")
+    resolved_stage = execution_stage or {
+        DashboardExecutionStatus.COMPLETED: DashboardExecutionStage.COMPLETED,
+        DashboardExecutionStatus.CANCELLED: DashboardExecutionStage.CANCELLED,
+        DashboardExecutionStatus.FAILED: DashboardExecutionStage.FAILED,
+    }.get(lifecycle_status, DashboardExecutionStage.STARTING)
     tabs = dashboard_tabs(state.runtime, state, audio_metadata)
     representative = tabs.representative
     transcript = replace(
@@ -1281,8 +1313,16 @@ def execution_snapshot(
         call_id=state.runtime.call_id,
         revision=revision,
         lifecycle_status=lifecycle_status,
+        execution_mode=execution_mode,
+        execution_stage=resolved_stage,
         processed_chunks=state.current_chunk,
         total_chunks=state.total_chunks,
+        processed_audio_seconds=(
+            state.latest_step.chunk_end_seconds
+            if state.latest_step is not None
+            else None
+        ),
+        total_audio_seconds=state.audio_duration_seconds,
         transcript_revision=state.runtime.call_state.transcript_revision,
         transcript=transcript,
         intent_risk=representative.intent_chips,

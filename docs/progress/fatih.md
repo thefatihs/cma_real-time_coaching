@@ -173,3 +173,10 @@ This log uses local chronological numbering and records only Fatih-owned work.
   Pyright passed.
 - Next planned step: review incremental polling and exactly-once cleanup
   behavior before integration.
+- Manual acceptance follow-up: made the async Start handoff deterministic with
+  one post-submit rerun and lifecycle-driven polling; added model-free fast and
+  real-time upload/Start regression coverage.
+- Added immutable execution mode/stage metadata and immediate Turkish
+  start, preparation, engine, chunk-progress and terminal feedback without
+  render-side processing; duplicate starts remain disabled while RUNNING.
+  Focused tests: 154 passed.

@@ -2,14 +2,20 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import replace
+from datetime import UTC, datetime
 import importlib
+from pathlib import Path
 import sys
+from threading import Event
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from streamlit.testing.v1 import AppTest
 
-from app.events.models import SuggestionPriority
+from app.events.models import AudioChunkEvent, SuggestionPriority
+from app.streaming.pipeline import StreamingASRPipeline
+from app.streaming.window_transcriber import WindowTranscriptionResult
 from live_dashboard.demo_data import tenant_demos
 from live_dashboard.presentation import ui_scope_identity
 from live_dashboard.rag_runtime import DashboardRAGRuntimeController
@@ -19,6 +25,8 @@ from live_dashboard.runtime_wiring import (
     DashboardServiceSelection,
 )
 from live_dashboard.view_models import (
+    DashboardExecutionMode,
+    DashboardExecutionStage,
     DashboardExecutionStatus,
     create_local_execution,
     dashboard_tabs,
@@ -62,6 +70,9 @@ class _RecordingStreamlit:
         self.session_state = _SessionState()
         self.captions: list[str] = []
         self.infos: list[str] = []
+        self.errors: list[str] = []
+        self.successes: list[str] = []
+        self.warnings: list[str] = []
         self.writes: list[str] = []
         self.metrics: list[tuple[str, ...]] = []
         self.markdown_kwargs: list[dict[str, object]] = []
@@ -145,6 +156,15 @@ class _RecordingStreamlit:
 
     def info(self, value: object, **_kwargs: object) -> None:
         self.infos.append(str(value))
+
+    def error(self, value: object, **_kwargs: object) -> None:
+        self.errors.append(str(value))
+
+    def success(self, value: object, **_kwargs: object) -> None:
+        self.successes.append(str(value))
+
+    def warning(self, value: object, **_kwargs: object) -> None:
+        self.warnings.append(str(value))
 
     def write(self, value: object, **_kwargs: object) -> None:
         self.writes.append(str(value))
@@ -560,3 +580,264 @@ def test_incremental_snapshot_render_is_presentation_only(
     )
 
     assert ("İlerleme", "1/3 parça") in recorder.metrics
+
+
+def test_execution_status_unknown_totals_are_indeterminate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-status")
+    snapshot = execution_snapshot(
+        state,
+        revision=0,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        execution_mode=DashboardExecutionMode.FAST_ANALYSIS,
+        execution_stage=DashboardExecutionStage.STARTING,
+    )
+    recorder.metrics.clear()
+    recorder.infos.clear()
+
+    app._render_execution_status(snapshot)
+
+    assert recorder.infos == ["Analiz başlatılıyor · Hızlı analiz"]
+    assert (
+        "İşlenen parça",
+        "0 parça · Toplam henüz hesaplanıyor",
+    ) in recorder.metrics
+    assert not any("%0" in value for metric in recorder.metrics for value in metric)
+
+
+def test_execution_status_progress_updates_across_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-progress")
+    base = execution_snapshot(
+        state,
+        revision=4,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        execution_mode=DashboardExecutionMode.REALTIME_SIMULATION,
+        execution_stage=DashboardExecutionStage.CHUNK_PROCESSING,
+    )
+    first = replace(
+        base,
+        processed_chunks=1,
+        total_chunks=4,
+        processed_audio_seconds=2.0,
+        total_audio_seconds=8.0,
+    )
+    second = replace(
+        first,
+        revision=5,
+        processed_chunks=2,
+        processed_audio_seconds=4.0,
+    )
+    recorder.metrics.clear()
+    recorder.infos.clear()
+
+    app._render_execution_status(first)
+    app._render_execution_status(second)
+
+    assert recorder.infos == [
+        "Ses parçası 1 / 4 işleniyor · Gerçek zaman simülasyonu",
+        "Ses parçası 2 / 4 işleniyor · Gerçek zaman simülasyonu",
+    ]
+    assert ("İşlenen parça", "1/4 · %25") in recorder.metrics
+    assert ("İşlenen parça", "2/4 · %50") in recorder.metrics
+    assert ("Anlık revizyon", "4") in recorder.metrics
+    assert ("Anlık revizyon", "5") in recorder.metrics
+
+
+@pytest.mark.parametrize(
+    ("status", "stage", "collection", "message"),
+    [
+        (
+            DashboardExecutionStatus.COMPLETED,
+            DashboardExecutionStage.COMPLETED,
+            "successes",
+            "Analiz tamamlandı · Hızlı analiz",
+        ),
+        (
+            DashboardExecutionStatus.CANCELLED,
+            DashboardExecutionStage.CANCELLED,
+            "warnings",
+            "Analiz durduruldu · Hızlı analiz",
+        ),
+        (
+            DashboardExecutionStatus.FAILED,
+            DashboardExecutionStage.FAILED,
+            "errors",
+            "Analiz başarısız · Hızlı analiz",
+        ),
+    ],
+)
+def test_execution_terminal_status_messages_are_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+    status: DashboardExecutionStatus,
+    stage: DashboardExecutionStage,
+    collection: str,
+    message: str,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-terminal")
+    snapshot = execution_snapshot(
+        state,
+        revision=2,
+        lifecycle_status=status,
+        execution_stage=stage,
+    )
+    recorder.errors.clear()
+    recorder.successes.clear()
+    recorder.warnings.clear()
+
+    app._render_execution_status(snapshot)
+
+    assert getattr(recorder, collection) == [message]
+
+
+@pytest.mark.parametrize(
+    ("playback_index", "expected_realtime"),
+    [(0, False), (1, True)],
+)
+def test_uploaded_start_handoff_is_visible_and_survives_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+    playback_index: int,
+    expected_realtime: bool,
+) -> None:
+    import app.asr.faster_whisper_engine as asr_module
+    import live_dashboard.runtime_wiring as wiring
+
+    blocked_before_second = Event()
+    release = Event()
+    resources: list[Any] = []
+    pacing_modes: list[bool] = []
+    generator_calls = 0
+
+    class FakeEngine:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+    class FakeTranscriber:
+        def transcribe(self, window: Any) -> WindowTranscriptionResult:
+            return WindowTranscriptionResult(
+                tenant_id=window.tenant_id,
+                call_id=window.call_id,
+                first_sequence=window.first_sequence,
+                last_sequence=window.last_sequence,
+                window_start_seconds=window.start_seconds,
+                window_end_seconds=window.end_seconds,
+                window_duration_seconds=window.duration_seconds,
+                text="",
+                detected_language="tr",
+                language_probability=1.0,
+                processing_time_seconds=0.01,
+                segments=(),
+            )
+
+    def chunks(
+        _path: Path,
+        tenant_id: str,
+        call_id: str,
+        _duration: float,
+    ):
+        nonlocal generator_calls
+        generator_calls += 1
+        processing_pass = generator_calls == 2
+        for sequence in range(2):
+            if processing_pass and sequence == 1:
+                blocked_before_second.set()
+                assert release.wait(timeout=5)
+            yield AudioChunkEvent(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                sequence_number=sequence,
+                received_at_utc=datetime.now(UTC),
+                chunk_start_seconds=float(sequence),
+                chunk_duration_seconds=1.0,
+                sample_rate_hz=16_000,
+                channel_count=1,
+                codec_name="pcm_s16le",
+                audio_bytes=b"\0\0",
+            )
+
+    def fake_build(
+        runtime: Any,
+        _window_transcriber: object,
+        *,
+        execution_resource: Any,
+        **_kwargs: object,
+    ) -> StreamingASRPipeline:
+        pipeline = StreamingASRPipeline(
+            runtime.tenant.config.context,
+            runtime.tenant.config.asr,
+            FakeTranscriber(),
+            chunk_generator=chunks,
+        )
+        execution_resource.attach_pipeline(pipeline)
+        resources.append(execution_resource)
+        return pipeline
+
+    def fake_pacing(_step: object, *, realtime: bool, **_kwargs: object) -> bool:
+        pacing_modes.append(realtime)
+        return False
+
+    monkeypatch.setattr(asr_module, "FasterWhisperEngine", FakeEngine)
+    monkeypatch.setattr(wiring, "build_live_pipeline", fake_build)
+    monkeypatch.setattr(wiring, "wait_for_live_cadence", fake_pacing)
+    test = AppTest.from_file(
+        Path(__file__).parents[1] / "live_dashboard" / "app.py",
+        default_timeout=10,
+    ).run()
+    test.text_input[0].set_value(f"start-mode-{playback_index}").run()
+    test.radio[0].set_value(test.radio[0].options[1]).run()
+    test.radio[2].set_value(test.radio[2].options[playback_index]).run()
+    test.file_uploader[0].set_value(
+        ("synthetic.wav", b"RIFF-synthetic", "audio/wav")
+    ).run()
+
+    test.button[0].click().run()
+    assert blocked_before_second.wait(timeout=5)
+    resource = resources[0]
+    first_key = test.session_state.filtered_state["dashboard_execution_resource_key"]
+    first = resource.latest_snapshot
+    assert first is not None
+    assert first.lifecycle_status is DashboardExecutionStatus.RUNNING
+    assert first.revision > 0
+    assert first.processed_chunks == 1
+    assert not resource.closed
+
+    test.run()
+    assert (
+        test.session_state.filtered_state["dashboard_execution_resource_key"]
+        == first_key
+    )
+    assert resources == [resource]
+    assert not resource.closed
+    assert expected_realtime in pacing_modes
+    assert any(metric.value == "1/2 parça" for metric in test.metric)
+    assert test.button[0].disabled
+    assert not test.button[1].disabled
+    assert any(
+        "Ses parçası 1 / 2 işleniyor" in str(message.value) for message in test.info
+    )
+
+    release.set()
+    resource.join_worker()
+    resource.close()
+
+
+def test_uploaded_start_without_file_remains_fail_closed() -> None:
+    test = AppTest.from_file(
+        Path(__file__).parents[1] / "live_dashboard" / "app.py",
+        default_timeout=10,
+    ).run()
+    test.radio[0].set_value(test.radio[0].options[1]).run()
+
+    test.button[0].click().run()
+
+    assert test.error
+    assert test.error[0].value == "Önce bir ses dosyası yükleyin."
+    assert "dashboard_execution_resource_key" not in test.session_state.filtered_state
