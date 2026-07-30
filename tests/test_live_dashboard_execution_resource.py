@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from threading import Thread
+from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -23,7 +24,18 @@ from live_dashboard.runtime_wiring import (
     DashboardExecutionIdentity,
     DashboardExecutionResource,
     DashboardExecutionResourceRegistry,
+    SnapshotPublisher,
+    wait_for_live_cadence,
 )
+from live_dashboard.demo_data import tenant_demos
+from live_dashboard.uploaded_audio import temporary_uploaded_audio
+from live_dashboard.view_models import (
+    DashboardExecutionSnapshot,
+    DashboardExecutionStatus,
+    create_local_execution,
+    execution_snapshot,
+)
+from app.streaming.pipeline import StreamingASRStep
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
 
@@ -327,3 +339,172 @@ def test_resource_and_registry_do_not_retain_payload_fields() -> None:
     assert forbidden.isdisjoint(vars(resource))
     assert forbidden.isdisjoint(vars(registry))
     assert registered.opaque_key == identity().opaque_key
+
+
+def _snapshot(
+    revision: int,
+    status: DashboardExecutionStatus,
+    *,
+    completed: int,
+) -> DashboardExecutionSnapshot:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call_001")
+    state.status = "running"
+    state.total_chunks = 2
+    state.current_chunk = completed
+    return execution_snapshot(
+        state,
+        revision=revision,
+        lifecycle_status=status,
+    )
+
+
+def test_worker_publishes_first_chunk_before_terminal_and_retains_latest_only() -> None:
+    resource = DashboardExecutionResource(identity(), integration=None)
+    first_published = Event()
+    release = Event()
+
+    def task(
+        cancel: Event,
+        publish: SnapshotPublisher,
+    ) -> DashboardExecutionSnapshot:
+        del cancel
+        publish(_snapshot(1, DashboardExecutionStatus.RUNNING, completed=1))
+        publish(_snapshot(1, DashboardExecutionStatus.RUNNING, completed=1))
+        first_published.set()
+        assert release.wait(timeout=2)
+        return _snapshot(2, DashboardExecutionStatus.COMPLETED, completed=2)
+
+    assert resource.start_worker(
+        _snapshot(0, DashboardExecutionStatus.RUNNING, completed=0),
+        task,
+    )
+    assert first_published.wait(timeout=2)
+    first = resource.latest_snapshot
+    assert first is not None
+    assert (first.revision, first.processed_chunks) == (1, 1)
+    assert first.lifecycle_status is DashboardExecutionStatus.RUNNING
+    assert not resource.start_worker(
+        _snapshot(0, DashboardExecutionStatus.RUNNING, completed=0),
+        task,
+    )
+    release.set()
+    resource.join_worker()
+    terminal = resource.latest_snapshot
+    assert terminal is not None
+    assert terminal.lifecycle_status is DashboardExecutionStatus.COMPLETED
+    assert resource.diagnostics.published_snapshots == 3
+    assert resource.diagnostics.rejected_snapshots == 1
+    assert not hasattr(resource, "_snapshots")
+
+
+def test_worker_failure_is_sanitized_and_terminal_is_published_once() -> None:
+    resource = DashboardExecutionResource(identity(), integration=None)
+
+    def task(
+        _cancel: Event,
+        _publish: SnapshotPublisher,
+    ) -> DashboardExecutionSnapshot:
+        raise RuntimeError("private path and provider response")
+
+    resource.start_worker(
+        _snapshot(0, DashboardExecutionStatus.RUNNING, completed=0),
+        task,
+    )
+    resource.join_worker()
+    snapshot = resource.latest_snapshot
+    assert snapshot is not None
+    assert snapshot.lifecycle_status is DashboardExecutionStatus.FAILED
+    assert snapshot.failure_reason == "processing_failed"
+    assert "private path" not in repr(snapshot)
+
+
+def test_close_cancels_worker_then_closes_manager_exactly_once() -> None:
+    manager = FakeBackgroundManager()
+    resource = DashboardExecutionResource(identity(), integration=integration(manager))
+    entered = Event()
+
+    def task(
+        cancel: Event,
+        _publish: SnapshotPublisher,
+    ) -> DashboardExecutionSnapshot:
+        entered.set()
+        cancel.wait()
+        raise RuntimeError("cancelled")
+
+    resource.start_worker(
+        _snapshot(0, DashboardExecutionStatus.RUNNING, completed=0),
+        task,
+    )
+    assert entered.wait(timeout=2)
+    resource.close()
+    resource.close()
+    assert resource.latest_snapshot is not None
+    assert (
+        resource.latest_snapshot.lifecycle_status is DashboardExecutionStatus.CANCELLED
+    )
+    assert manager.close_calls == [False]
+
+
+def test_live_cadence_uses_injected_clock_and_wait_without_sleep() -> None:
+    step = StreamingASRStep(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        sequence_number=0,
+        chunk_start_seconds=0.0,
+        chunk_end_seconds=2.0,
+        window_start_seconds=0.0,
+        window_end_seconds=2.0,
+        window_duration_seconds=2.0,
+        raw_window_text="",
+        transcript_events=(),
+        stable_transcript="",
+        partial_transcript="",
+        transcription_time_seconds=0.25,
+    )
+    waits: list[float] = []
+
+    assert not wait_for_live_cadence(
+        step,
+        started_at=10.0,
+        realtime=True,
+        clock=lambda: 10.5,
+        cancellation_wait=lambda delay: waits.append(delay) or False,
+    )
+    assert waits == [1.5]
+    waits.clear()
+    assert not wait_for_live_cadence(
+        step,
+        started_at=10.0,
+        realtime=False,
+        clock=lambda: 0.0,
+        cancellation_wait=lambda delay: waits.append(delay) or False,
+    )
+    assert waits == []
+
+
+def test_worker_keeps_temporary_upload_until_processing_is_released() -> None:
+    resource = DashboardExecutionResource(identity(), integration=None)
+    entered = Event()
+    release = Event()
+    observed_paths: list[Path] = []
+
+    def task(
+        _cancel: Event,
+        _publish: SnapshotPublisher,
+    ) -> DashboardExecutionSnapshot:
+        with temporary_uploaded_audio("synthetic.wav", b"synthetic") as path:
+            observed_paths.append(path)
+            entered.set()
+            assert release.wait(timeout=2)
+            assert path.exists()
+        return _snapshot(1, DashboardExecutionStatus.COMPLETED, completed=0)
+
+    resource.start_worker(
+        _snapshot(0, DashboardExecutionStatus.RUNNING, completed=0),
+        task,
+    )
+    assert entered.wait(timeout=2)
+    assert observed_paths[0].exists()
+    release.set()
+    resource.join_worker()
+    assert not observed_paths[0].exists()

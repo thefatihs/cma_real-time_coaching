@@ -1,8 +1,10 @@
 """Professional synthetic and opt-in local-file coaching dashboard."""
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from time import sleep
+from threading import Event
+from time import perf_counter
 
 import streamlit as st
 
@@ -29,6 +31,7 @@ from live_dashboard.runtime_wiring import (  # noqa: E402
     build_live_pipeline,
     default_service_selection,
     inspect_default_artifacts,
+    wait_for_live_cadence,
 )
 from live_dashboard.rag_runtime import DashboardRAGRuntimeController  # noqa: E402
 from live_dashboard.presentation import (  # noqa: E402
@@ -59,6 +62,8 @@ from live_dashboard.uploaded_audio import (  # noqa: E402
 )
 from live_dashboard.view_models import (  # noqa: E402
     DashboardRuntime,
+    DashboardExecutionSnapshot,
+    DashboardExecutionStatus,
     DashboardTabsViewModel,
     LocalExecutionState,
     StatusCardViewModel,
@@ -69,7 +74,7 @@ from live_dashboard.view_models import (  # noqa: E402
     create_runtime,
     dashboard_tabs,
     execute_local_once,
-    progress_view,
+    execution_snapshot,
     responsive_rows,
 )
 
@@ -168,6 +173,21 @@ def _close_execution_resource() -> None:
     if not isinstance(key, str):
         raise ValueError("dashboard execution resource key is invalid")
     _rag_runtime_controller(_EXECUTION_RESOURCE_CAPACITY).close_and_remove(key)
+
+
+def _retained_execution_resource(
+    runtime: DashboardRuntime,
+) -> DashboardExecutionResource | None:
+    key = st.session_state.get(_EXECUTION_RESOURCE_SESSION_KEY)
+    if key is None:
+        return None
+    if not isinstance(key, str):
+        raise ValueError("dashboard execution resource key is invalid")
+    return _execution_resource_registry(_EXECUTION_RESOURCE_CAPACITY).lookup(
+        key,
+        tenant_id=runtime.call_state.tenant_id,
+        call_id=runtime.call_id,
+    )
 
 
 def _make_pipeline(
@@ -276,13 +296,28 @@ def _render_representative(
     view: DashboardTabsViewModel,
     scope: UIScopeIdentity,
 ) -> None:
+    _render_representative_view(
+        call_id=runtime.call_id,
+        transcript_revision=runtime.call_state.transcript_revision,
+        view=view,
+        scope=scope,
+    )
+
+
+def _render_representative_view(
+    *,
+    call_id: str,
+    transcript_revision: int,
+    view: DashboardTabsViewModel,
+    scope: UIScopeIdentity,
+) -> None:
     representative = view.representative
     operation = operational_status(view)
     with st.container(border=True):
         header = call_status_header(
             view,
-            call_id=runtime.call_id,
-            transcript_revision=runtime.call_state.transcript_revision,
+            call_id=call_id,
+            transcript_revision=transcript_revision,
         )
         st.caption("CANLI GÖRÜŞME")
         header_columns = st.columns(5)
@@ -583,6 +618,10 @@ def _render_technical(
 
 
 def _render_result(runtime: DashboardRuntime, view: DashboardTabsViewModel) -> None:
+    _render_result_view(runtime.call_id, view)
+
+
+def _render_result_view(call_id: str, view: DashboardTabsViewModel) -> None:
     result = view.result
     if not result.completed:
         st.info(result.waiting_message)
@@ -625,7 +664,7 @@ def _render_result(runtime: DashboardRuntime, view: DashboardTabsViewModel) -> N
         st.download_button(
             "Final transkripti indir",
             result.final_transcript,
-            file_name=f"{runtime.call_id}-transkript.txt",
+            file_name=f"{call_id}-transkript.txt",
             mime="text/plain",
         )
 
@@ -638,17 +677,39 @@ def _render_dashboard(
     rag_runtime_status: object = _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
 ) -> None:
     view = dashboard_tabs(runtime, local_state, metadata)
+    _render_dashboard_view(
+        call_id=runtime.call_id,
+        transcript_revision=runtime.call_state.transcript_revision,
+        view=view,
+        scope=scope,
+        rag_runtime_status=rag_runtime_status,
+    )
+
+
+def _render_dashboard_view(
+    *,
+    call_id: str,
+    transcript_revision: int,
+    view: DashboardTabsViewModel,
+    scope: UIScopeIdentity,
+    rag_runtime_status: object = _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
+) -> None:
     if rag_runtime_status is not _RAG_RUNTIME_STATUS_NOT_AVAILABLE:
         st.caption(rag_runtime_status_text(rag_runtime_status))
     representative, technical, result = st.tabs(
         ("Temsilci Görünümü", "Teknik İzleme", "Görüşme Sonucu")
     )
     with representative:
-        _render_representative(runtime, view, scope)
+        _render_representative_view(
+            call_id=call_id,
+            transcript_revision=transcript_revision,
+            view=view,
+            scope=scope,
+        )
     with technical:
         _render_technical(view, scope)
     with result:
-        _render_result(runtime, view)
+        _render_result_view(call_id, view)
 
 
 demos = tenant_demos()
@@ -804,65 +865,147 @@ with st.sidebar:
             else:
                 local.request_start()
                 local.stage = "Model yükleniyor"
-                live_progress = st.progress(0, text="Aşama: Model yükleniyor")
-
-                def show_plan(plan: StreamingASRPlan) -> None:
-                    live_progress.progress(
-                        0,
-                        text=(
-                            f"ASR işleniyor · 0/{plan.total_chunks} parça · %0 · "
-                            "Tahmin hazırlanıyor"
-                        ),
-                    )
-
-                def show_step(step: StreamingASRStep) -> None:
-                    progress = progress_view(local)
-                    live_progress.progress(
-                        progress.percentage / 100,
-                        text=(
-                            f"{progress.stage} · {progress.completed_chunks}/"
-                            f"{progress.total_chunks} · %{progress.percentage:.0f} · "
-                            f"{progress.eta}"
-                        ),
-                    )
-                    if playback_mode == "Gerçek zaman simülasyonu":
-                        duration = step.chunk_end_seconds - step.chunk_start_seconds
-                        sleep(max(duration - step.transcription_time_seconds, 0.0))
 
                 try:
                     execution_resource = _execution_resource(local.runtime)
-                    pipeline = _make_pipeline(
-                        local.runtime,
-                        service_selection,
-                        artifact_availability,
-                        execution_resource,
+                    safe_metadata = st.session_state.get("safe_audio_metadata")
+                    selected_metadata = (
+                        safe_metadata
+                        if isinstance(safe_metadata, SafeUploadMetadata)
+                        else None
                     )
-                    if (
-                        source_mode == "Dosya yükle"
+                    initial = execution_snapshot(
+                        local,
+                        revision=0,
+                        lifecycle_status=DashboardExecutionStatus.RUNNING,
+                        audio_metadata=selected_metadata,
+                    )
+                    selected_upload = (
+                        (uploaded.name, uploaded_content)
+                        if source_mode == "Dosya yükle"
                         and uploaded is not None
                         and uploaded_content is not None
-                    ):
-                        with temporary_uploaded_audio(
-                            uploaded.name, uploaded_content
-                        ) as path:
-                            execute_local_once(
-                                local, pipeline, path, show_step, show_plan
-                            )
-                    else:
-                        path = Path(audio_path_text).expanduser()
-                        if not path.is_file():
-                            raise ValueError("Ses dosyası bulunamadı")
-                        execute_local_once(local, pipeline, path, show_step, show_plan)
-                    execution_resource.drain_completed(
-                        current_seconds=local.audio_duration_seconds or 0.0,
+                        else None
                     )
-                    live_progress.progress(1.0, text="Tamamlandı · %100")
+                    selected_path = audio_path_text
+                    realtime = playback_mode == "Gerçek zaman simülasyonu"
+
+                    def process_uploaded_audio(
+                        cancellation: Event,
+                        publish: Callable[[DashboardExecutionSnapshot], None],
+                    ) -> DashboardExecutionSnapshot:
+                        pipeline = _make_pipeline(
+                            local.runtime,
+                            service_selection,
+                            artifact_availability,
+                            execution_resource,
+                        )
+                        revision = 0
+                        pacing_started_at = perf_counter()
+
+                        def show_plan(_plan: StreamingASRPlan) -> None:
+                            if cancellation.is_set():
+                                raise RuntimeError("dashboard_execution_cancelled")
+
+                        def show_step(step: StreamingASRStep) -> None:
+                            nonlocal revision
+                            if cancellation.is_set():
+                                raise RuntimeError("dashboard_execution_cancelled")
+                            revision += 1
+                            publish(
+                                execution_snapshot(
+                                    local,
+                                    revision=revision,
+                                    lifecycle_status=(DashboardExecutionStatus.RUNNING),
+                                    audio_metadata=selected_metadata,
+                                )
+                            )
+                            if wait_for_live_cadence(
+                                step,
+                                started_at=pacing_started_at,
+                                realtime=realtime,
+                                clock=perf_counter,
+                                cancellation_wait=cancellation.wait,
+                            ):
+                                raise RuntimeError("dashboard_execution_cancelled")
+
+                        if selected_upload is not None:
+                            upload_name, content = selected_upload
+                            with temporary_uploaded_audio(upload_name, content) as path:
+                                execute_local_once(
+                                    local,
+                                    pipeline,
+                                    path,
+                                    show_step,
+                                    show_plan,
+                                    retain_pipeline_history=False,
+                                )
+                        else:
+                            path = Path(selected_path).expanduser()
+                            if not path.is_file():
+                                raise ValueError("Ses dosyası bulunamadı")
+                            execute_local_once(
+                                local,
+                                pipeline,
+                                path,
+                                show_step,
+                                show_plan,
+                                retain_pipeline_history=False,
+                            )
+                        execution_resource.drain_completed(
+                            current_seconds=local.audio_duration_seconds or 0.0,
+                        )
+                        revision += 1
+                        return execution_snapshot(
+                            local,
+                            revision=revision,
+                            lifecycle_status=DashboardExecutionStatus.COMPLETED,
+                            audio_metadata=selected_metadata,
+                        )
+
+                    def run_uploaded_audio(
+                        cancellation: Event,
+                        publish: Callable[[DashboardExecutionSnapshot], None],
+                    ) -> DashboardExecutionSnapshot:
+                        try:
+                            return process_uploaded_audio(cancellation, publish)
+                        except Exception:
+                            cancelled = cancellation.is_set()
+                            local.status = "cancelled" if cancelled else "error"
+                            local.stage = "İptal edildi" if cancelled else "Başarısız"
+                            local.error_message = (
+                                None
+                                if cancelled
+                                else "Ses işleme güvenli biçimde tamamlanamadı."
+                            )
+                            return execution_snapshot(
+                                local,
+                                revision=local.current_chunk + 1,
+                                lifecycle_status=(
+                                    DashboardExecutionStatus.CANCELLED
+                                    if cancelled
+                                    else DashboardExecutionStatus.FAILED
+                                ),
+                                audio_metadata=selected_metadata,
+                                failure_reason=(
+                                    None if cancelled else "processing_failed"
+                                ),
+                            )
+
+                    execution_resource.start_worker(initial, run_uploaded_audio)
                 except Exception:
                     local.status = "error"
                     local.stage = "Başarısız"
                     local.error_message = "Ses işleme güvenli biçimde tamamlanamadı."
                     st.error(local.error_message)
-        st.button("Durdur", disabled=not local.stop_enabled, use_container_width=True)
+        if st.button(
+            "Durdur",
+            disabled=not local.stop_enabled,
+            use_container_width=True,
+        ):
+            retained = _retained_execution_resource(local.runtime)
+            if retained is not None:
+                retained.cancel()
         if st.button("Sıfırla", use_container_width=True):
             _close_execution_resource()
             if source_mode == "Dosya yükle":
@@ -898,14 +1041,38 @@ if mode == "Sentetik Demo":
 else:
     if local_state_for_render is None:
         raise RuntimeError("Local dashboard state was not initialized")
+    render_local_state = local_state_for_render
     safe_metadata = st.session_state.get("safe_audio_metadata")
-    _render_dashboard(
-        local_state_for_render.runtime,
-        local_state_for_render,
-        safe_metadata,
-        active_ui_scope,
-        st.session_state.get(
+    retained_resource = _retained_execution_resource(render_local_state.runtime)
+    polling_interval = (
+        0.5
+        if retained_resource is not None and retained_resource.worker_active
+        else None
+    )
+
+    @st.fragment(run_every=polling_interval)
+    def local_live_area() -> None:
+        resource = _retained_execution_resource(render_local_state.runtime)
+        snapshot = None if resource is None else resource.latest_snapshot
+        rag_status = st.session_state.get(
             _RAG_RUNTIME_STATUS_SESSION_KEY,
             _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
-        ),
-    )
+        )
+        if snapshot is None:
+            _render_dashboard(
+                render_local_state.runtime,
+                render_local_state,
+                safe_metadata,
+                active_ui_scope,
+                rag_status,
+            )
+            return
+        _render_dashboard_view(
+            call_id=snapshot.call_id,
+            transcript_revision=snapshot.transcript_revision,
+            view=snapshot.tabs,
+            scope=active_ui_scope,
+            rag_runtime_status=rag_status,
+        )
+
+    local_live_area()

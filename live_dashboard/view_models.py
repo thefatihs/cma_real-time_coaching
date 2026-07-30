@@ -3,11 +3,12 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import Enum
 from itertools import count
 import logging
 from pathlib import Path
 from time import perf_counter
-from typing import Protocol
+from typing import Protocol, cast
 
 from app.calls.models import CallRevisionLabelDiagnostic, CallState
 from app.events.labels import canonical_label, canonical_labels
@@ -37,6 +38,7 @@ from app.events.models import (
     TranscriptKind,
 )
 from app.streaming.pipeline import (
+    StreamingASRPipeline,
     StreamingASRPlan,
     StreamingASRResult,
     StreamingASRStep,
@@ -63,6 +65,11 @@ ACTION_LABELS = {
     CoachingAction.RAG_ACTION: "Bilgi arama",
     CoachingAction.ESCALATE: "Yetkiliye aktar",
 }
+_MAX_LOCAL_ASR_WINDOWS = 64
+_MAX_LOCAL_TIMELINE_ITEMS = 128
+_MAX_LOCAL_SUGGESTION_HISTORY = 64
+_MAX_LOCAL_DECISIONS = 128
+_MAX_LOCAL_DEDUPLICATION_KEYS = 256
 INTENT_LABELS = {
     "product_information": "Ürün Bilgisi",
     "price_objection": "Fiyat İtirazı",
@@ -102,6 +109,14 @@ class LocalPipelineProtocol(Protocol):
         step_callback: Callable[[StreamingASRStep], None] | None = None,
         plan_callback: Callable[[StreamingASRPlan], None] | None = None,
     ) -> StreamingASRResult: ...
+
+
+class DashboardExecutionStatus(str, Enum):
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +274,26 @@ class DashboardTabsViewModel:
     representative: RepresentativeTabViewModel
     technical: TechnicalTabViewModel
     result: CallResultTabViewModel
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardExecutionSnapshot:
+    """Latest bounded, immutable presentation state for one local call."""
+
+    tenant_id: str
+    call_id: str
+    revision: int
+    lifecycle_status: DashboardExecutionStatus
+    processed_chunks: int
+    total_chunks: int
+    transcript_revision: int
+    transcript: TranscriptViewModel
+    intent_risk: tuple[IntentChipViewModel, ...]
+    active_coaching: tuple[SuggestionCardViewModel, ...]
+    speaker_state: SpeakerDashboardViewModel | None
+    latency: LatencyViewModel | None
+    failure_reason: str | None
+    tabs: DashboardTabsViewModel
 
 
 @dataclass(slots=True)
@@ -477,6 +512,7 @@ def execute_local_once(
     plan_progress_callback: Callable[[StreamingASRPlan], None] | None = None,
     clock: Callable[[], float] = perf_counter,
     logger: logging.Logger | None = None,
+    retain_pipeline_history: bool = True,
 ) -> bool:
     """Run only after an explicit request and at most once for this state."""
     if not state.start_requested or state.status != "idle":
@@ -511,12 +547,21 @@ def execute_local_once(
 
     started_at = clock()
     try:
-        result = pipeline.run(
-            audio_path,
-            state.runtime.call_id,
-            step_callback=on_step,
-            plan_callback=on_plan,
-        )
+        if retain_pipeline_history:
+            result = pipeline.run(
+                audio_path,
+                state.runtime.call_id,
+                step_callback=on_step,
+                plan_callback=on_plan,
+            )
+        else:
+            result = cast(StreamingASRPipeline, pipeline).run(
+                audio_path,
+                state.runtime.call_id,
+                step_callback=on_step,
+                plan_callback=on_plan,
+                retain_history=False,
+            )
         _consume_pipeline_result(state, result)
     except Exception as error:
         state.status = "error"
@@ -1186,6 +1231,69 @@ def dashboard_tabs(
     )
 
 
+def execution_snapshot(
+    state: LocalExecutionState,
+    *,
+    revision: int,
+    lifecycle_status: DashboardExecutionStatus,
+    audio_metadata: SafeUploadMetadata | None = None,
+    failure_reason: str | None = None,
+) -> DashboardExecutionSnapshot:
+    """Freeze one bounded latest-value projection without retaining audio."""
+    if revision < 0:
+        raise ValueError("snapshot revision cannot be negative")
+    if failure_reason not in {None, "processing_failed"}:
+        raise ValueError("snapshot failure reason is invalid")
+    tabs = dashboard_tabs(state.runtime, state, audio_metadata)
+    representative = tabs.representative
+    transcript = replace(
+        representative.transcript,
+        stable_text=representative.transcript.stable_text[-12_000:],
+        partial_text=representative.transcript.partial_text[-4_000:],
+    )
+    representative = replace(
+        representative,
+        transcript=transcript,
+        intent_chips=representative.intent_chips[-32:],
+        detected_intent_chips=representative.detected_intent_chips[-32:],
+        active_suggestions=representative.active_suggestions[:8],
+        suggestion_history=representative.suggestion_history[-8:],
+    )
+    technical = replace(
+        tabs.technical,
+        asr_chart=tabs.technical.asr_chart[-64:],
+        revision_label_timeline=tabs.technical.revision_label_timeline[-32:],
+        suggestion_decisions=tabs.technical.suggestion_decisions[-32:],
+    )
+    result = replace(
+        tabs.result,
+        final_transcript=tabs.result.final_transcript[-12_000:],
+        suggestion_timeline=tabs.result.suggestion_timeline[-32:],
+    )
+    bounded_tabs = replace(
+        tabs,
+        representative=representative,
+        technical=technical,
+        result=result,
+    )
+    return DashboardExecutionSnapshot(
+        tenant_id=state.runtime.call_state.tenant_id,
+        call_id=state.runtime.call_id,
+        revision=revision,
+        lifecycle_status=lifecycle_status,
+        processed_chunks=state.current_chunk,
+        total_chunks=state.total_chunks,
+        transcript_revision=state.runtime.call_state.transcript_revision,
+        transcript=transcript,
+        intent_risk=representative.intent_chips,
+        active_coaching=representative.active_suggestions,
+        speaker_state=representative.speaker_dashboard,
+        latency=technical.latency,
+        failure_reason=failure_reason,
+        tabs=bounded_tabs,
+    )
+
+
 def _synthetic_progress(runtime: DashboardRuntime) -> ProgressViewModel:
     total = len(runtime.scenario.events) if runtime.scenario else 0
     completed = min(runtime.next_event_index, total)
@@ -1267,6 +1375,26 @@ def _consume_step(state: LocalExecutionState, step: StreamingASRStep) -> None:
         total_ms=step.transcription_time_seconds * 1000 + rule_ms + coaching_ms,
     )
     state.asr_window_ms.append(step.transcription_time_seconds * 1000)
+    del state.asr_window_ms[:-_MAX_LOCAL_ASR_WINDOWS]
+    runtime = state.runtime
+    del runtime.timeline[:-_MAX_LOCAL_TIMELINE_ITEMS]
+    del runtime.suggestion_history[:-_MAX_LOCAL_SUGGESTION_HISTORY]
+    del runtime.suppression_reasons[:-_MAX_LOCAL_DECISIONS]
+    del runtime.suggestion_decisions[:-_MAX_LOCAL_DECISIONS]
+    if len(runtime.consumed_suggestion_ids) > _MAX_LOCAL_DEDUPLICATION_KEYS:
+        runtime.consumed_suggestion_ids = set(
+            sorted(runtime.consumed_suggestion_ids)[-_MAX_LOCAL_DEDUPLICATION_KEYS:]
+        )
+    if len(runtime.consumed_classification_event_ids) > _MAX_LOCAL_DEDUPLICATION_KEYS:
+        runtime.consumed_classification_event_ids = set(
+            sorted(runtime.consumed_classification_event_ids)[
+                -_MAX_LOCAL_DEDUPLICATION_KEYS:
+            ]
+        )
+    if len(runtime.consumed_coaching_revisions) > _MAX_LOCAL_DEDUPLICATION_KEYS:
+        runtime.consumed_coaching_revisions = set(
+            sorted(runtime.consumed_coaching_revisions)[-_MAX_LOCAL_DEDUPLICATION_KEYS:]
+        )
 
 
 def _apply_transcript_event(

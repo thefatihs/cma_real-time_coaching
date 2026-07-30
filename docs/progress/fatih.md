@@ -154,3 +154,22 @@ This log uses local chronological numbering and records only Fatih-owned work.
   warning). Ruff and Pyright passed.
 - Next planned step: review PR50-D3 for integration without adding provider
   lifecycle or dashboard state contracts.
+
+## F-020 — Incremental Uploaded-Audio Dashboard
+
+- Added a call-scoped single worker with cancellation, an immutable
+  latest-value snapshot mailbox, monotonic per-chunk revisions and bounded
+  privacy-safe diagnostics on the existing dashboard execution resource.
+- Uploaded-audio processing now publishes transcript, intent/risk, coaching,
+  progress and latency presentation state before END; rendering only polls
+  retained snapshots. Real-time pacing uses an injectable clock/wait seam.
+- Added an opt-in pipeline mode that omits accumulated step history while
+  preserving callbacks and the default result contract for existing callers.
+- Changed files: `live_dashboard/app.py`, `live_dashboard/runtime_wiring.py`,
+  `live_dashboard/view_models.py`, `app/streaming/pipeline.py`, the four
+  focused test modules, and `docs/progress/fatih.md`.
+- Tests: focused dashboard/pipeline tests 146 passed; full suite 2099 passed
+  and 13 opt-in tests skipped (1 existing dependency warning). Ruff and
+  Pyright passed.
+- Next planned step: review incremental polling and exactly-once cleanup
+  behavior before integration.

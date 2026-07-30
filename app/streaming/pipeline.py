@@ -131,6 +131,7 @@ class StreamingASRPipeline:
         *,
         step_callback: StepCallback | None = None,
         plan_callback: PlanCallback | None = None,
+        retain_history: bool = True,
     ) -> StreamingASRResult:
         call_state = CallState(
             tenant_id=self._tenant_context.tenant_id,
@@ -151,6 +152,7 @@ class StreamingASRPipeline:
             else None
         )
         audio_duration_seconds = 0.0
+        processed_chunks = 0
 
         planning_chunks = self._chunk_generator(
             audio_path,
@@ -183,6 +185,7 @@ class StreamingASRPipeline:
             self._asr_config.chunk_duration_seconds,
         )
         for chunk in chunks:
+            processed_chunks += 1
             call_state.apply_audio_chunk(chunk)
             buffer.append(chunk)
             window = window_builder.build(buffer)
@@ -206,13 +209,16 @@ class StreamingASRPipeline:
                     )
                 )
                 step_classification_outcomes.append(outcome)
-                all_classification_outcomes.append(outcome)
+                if retain_history:
+                    all_classification_outcomes.append(outcome)
                 if routing_outcome is not None:
                     step_customer_routing_outcomes.append(routing_outcome)
-                    all_customer_routing_outcomes.append(routing_outcome)
+                    if retain_history:
+                        all_customer_routing_outcomes.append(routing_outcome)
                 if coaching_outcome is not None:
                     step_coaching_outcomes.append(coaching_outcome)
-                    all_coaching_outcomes.append(coaching_outcome)
+                    if retain_history:
+                        all_coaching_outcomes.append(coaching_outcome)
 
             chunk_end_seconds = chunk.chunk_start_seconds + chunk.chunk_duration_seconds
             audio_duration_seconds = max(audio_duration_seconds, chunk_end_seconds)
@@ -221,7 +227,8 @@ class StreamingASRPipeline:
                 current_seconds=chunk_end_seconds,
             )
             step_coaching_outcomes.extend(completed_coaching)
-            all_coaching_outcomes.extend(completed_coaching)
+            if retain_history:
+                all_coaching_outcomes.extend(completed_coaching)
             step = StreamingASRStep(
                 tenant_id=chunk.tenant_id,
                 call_id=chunk.call_id,
@@ -240,7 +247,8 @@ class StreamingASRPipeline:
                 partial_transcript=reconciler.partial_transcript,
                 transcription_time_seconds=(transcription.processing_time_seconds),
             )
-            steps.append(step)
+            if retain_history:
+                steps.append(step)
             if step_callback is not None:
                 step_callback(step)
 
@@ -263,12 +271,11 @@ class StreamingASRPipeline:
                 all_customer_routing_outcomes.append(final_routing)
             if final_coaching is not None:
                 all_coaching_outcomes.append(final_coaching)
-        all_coaching_outcomes.extend(
-            self._drain_completed_coaching(
-                coordinator=coaching_coordinator,
-                current_seconds=audio_duration_seconds,
-            )
+        final_completed_coaching = self._drain_completed_coaching(
+            coordinator=coaching_coordinator,
+            current_seconds=audio_duration_seconds,
         )
+        all_coaching_outcomes.extend(final_completed_coaching)
 
         return StreamingASRResult(
             tenant_id=call_state.tenant_id,
@@ -281,7 +288,7 @@ class StreamingASRPipeline:
             customer_routing_outcomes=tuple(all_customer_routing_outcomes),
             stable_transcript=reconciler.stable_transcript,
             partial_transcript=reconciler.partial_transcript,
-            total_chunks=len(steps),
+            total_chunks=processed_chunks,
             audio_duration_seconds=audio_duration_seconds,
         )
 

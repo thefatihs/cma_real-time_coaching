@@ -36,12 +36,14 @@ from live_dashboard.uploaded_audio import (
     temporary_uploaded_audio,
 )
 from live_dashboard.view_models import (
+    DashboardExecutionStatus,
     advance_runtime,
     apply_feedback,
     create_local_execution,
     create_runtime,
     dashboard_tabs,
     execute_local_once,
+    execution_snapshot,
     intent_chips,
     intent_label,
     LabelViewModel,
@@ -601,6 +603,32 @@ def test_progress_total_is_known_before_first_completed_chunk() -> None:
         ),
     )
     assert snapshots == [(2, 0)]
+
+
+def test_execution_snapshot_is_bounded_immutable_and_exposes_current_progress() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    state.request_start()
+    execute_local_once(
+        state,
+        FakePipeline(),
+        Path("fake.wav"),
+        clock=iter((1.0, 1.1, 1.2, 1.3)).__next__,
+    )
+    state.runtime.suggestion_history *= 20
+    state.asr_window_ms *= 40
+
+    snapshot = execution_snapshot(
+        state,
+        revision=3,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+    )
+
+    assert snapshot.revision == 3
+    assert snapshot.processed_chunks == snapshot.total_chunks == 2
+    assert len(snapshot.tabs.representative.suggestion_history) <= 8
+    assert len(snapshot.tabs.technical.asr_chart) <= 64
+    with pytest.raises((AttributeError, TypeError)):
+        snapshot.revision = 4  # type: ignore[misc]
 
 
 def test_progress_percentage_eta_and_completed_state() -> None:

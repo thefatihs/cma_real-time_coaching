@@ -19,8 +19,10 @@ from live_dashboard.runtime_wiring import (
     DashboardServiceSelection,
 )
 from live_dashboard.view_models import (
+    DashboardExecutionStatus,
     create_local_execution,
     dashboard_tabs,
+    execution_snapshot,
     SpeakerCardViewModel,
     SpeakerDashboardViewModel,
     SuggestionCardViewModel,
@@ -526,3 +528,35 @@ def test_representative_renderer_bounds_transcript_and_history_without_mutation(
     assert "1000 eski karakter" in rendered
     assert len(state.runtime.suggestion_history) == 8
     assert repr(state.runtime) == runtime_before
+
+
+def test_incremental_snapshot_render_is_presentation_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-render")
+    state.status = "running"
+    state.total_chunks = 3
+    state.current_chunk = 1
+    snapshot = execution_snapshot(
+        state,
+        revision=1,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("runtime operation occurred during snapshot rendering")
+
+    monkeypatch.setattr(app, "_execution_resource", forbidden)
+    monkeypatch.setattr(app, "_make_pipeline", forbidden)
+    monkeypatch.setattr(app, "_close_execution_resource", forbidden)
+    recorder.metrics.clear()
+    app._render_dashboard_view(
+        call_id=snapshot.call_id,
+        transcript_revision=snapshot.transcript_revision,
+        view=snapshot.tabs,
+        scope=_scope(),
+    )
+
+    assert ("İlerleme", "1/3 parça") in recorder.metrics

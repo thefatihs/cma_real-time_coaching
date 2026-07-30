@@ -582,6 +582,34 @@ def test_optional_step_callback_receives_each_safe_step() -> None:
     assert "audio_bytes" not in repr(received)
 
 
+def test_history_can_be_disabled_without_changing_step_callbacks() -> None:
+    source = [chunk(0, 0.0, 1.0), chunk(1, 1.0, 1.0)]
+    subject = pipeline(source, FakeTranscriber([[], []]))
+    received: list[object] = []
+
+    result = subject.run(
+        Path("synthetic.wav"),
+        "call_001",
+        step_callback=received.append,
+        retain_history=False,
+    )
+
+    assert [step.sequence_number for step in received] == [0, 1]  # type: ignore[union-attr]
+    assert result.steps == ()
+    assert result.total_chunks == 2
+
+
+def test_history_retention_remains_enabled_by_default() -> None:
+    subject = pipeline(
+        [chunk(0, 0.0, 1.0), chunk(1, 1.0, 1.0)],
+        FakeTranscriber([[], []]),
+    )
+
+    result = subject.run(Path("synthetic.wav"), "call_001")
+
+    assert len(result.steps) == result.total_chunks == 2
+
+
 def test_plan_has_exact_total_and_short_final_chunk_before_inference() -> None:
     source = [chunk(index, index * 2.0, 2.0, 100) for index in range(6)]
     source.append(chunk(6, 12.0, 0.03, 100))

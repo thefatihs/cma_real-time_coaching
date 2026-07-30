@@ -1,10 +1,10 @@
 """Dashboard-only construction of existing classification and coaching services."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread, current_thread
 
 from app.calls.models import CallState
 from app.classification.artifacts import load_training_metadata, sha256_file
@@ -29,10 +29,15 @@ from app.coaching.coordinator import StableCoachingOutcome
 from app.streaming.pipeline import (
     CoachingProcessorProtocol,
     StreamingASRPipeline,
+    StreamingASRStep,
     WindowTranscriberProtocol,
 )
 from live_dashboard.demo_data import TenantDemo
-from live_dashboard.view_models import DashboardRuntime
+from live_dashboard.view_models import (
+    DashboardExecutionSnapshot,
+    DashboardExecutionStatus,
+    DashboardRuntime,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +53,36 @@ class DashboardServiceSelection:
 
 
 ClassifierProvider = Callable[[], RuntimeSetFitClassifier]
+SnapshotPublisher = Callable[[DashboardExecutionSnapshot], None]
+DashboardWorkerTask = Callable[
+    [Event, SnapshotPublisher],
+    DashboardExecutionSnapshot,
+]
+MonotonicClock = Callable[[], float]
+CancellationWait = Callable[[float], bool]
+
+
+@dataclass(frozen=True, slots=True)
+class DashboardExecutionDiagnostics:
+    published_snapshots: int
+    rejected_snapshots: int
+    worker_starts: int
+
+
+def wait_for_live_cadence(
+    step: StreamingASRStep,
+    *,
+    started_at: float,
+    realtime: bool,
+    clock: MonotonicClock,
+    cancellation_wait: CancellationWait,
+) -> bool:
+    """Pace against audio time; return true when cancellation interrupts."""
+    if not realtime:
+        return False
+    target = started_at + step.chunk_end_seconds
+    delay = max(target - clock(), 0.0)
+    return cancellation_wait(delay)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +125,13 @@ class DashboardExecutionResource:
         self._manager = None if integration is None else integration.background_manager
         self._pipeline: StreamingASRPipeline | None = None
         self._completion_pump: CoachingCompletionPumpProtocol | None = None
+        self._worker: Thread | None = None
+        self._cancellation = Event()
+        self._latest_snapshot: DashboardExecutionSnapshot | None = None
+        self._terminal_snapshot: DashboardExecutionSnapshot | None = None
+        self._published_snapshots = 0
+        self._rejected_snapshots = 0
+        self._worker_starts = 0
         self._lock = Lock()
         self._closed = False
         self._manager_closed = False
@@ -110,6 +152,121 @@ class DashboardExecutionResource:
     @property
     def integration(self) -> RAGCoachingIntegrationDependencies | None:
         return self._integration
+
+    @property
+    def latest_snapshot(self) -> DashboardExecutionSnapshot | None:
+        with self._lock:
+            return self._latest_snapshot
+
+    @property
+    def worker_active(self) -> bool:
+        with self._lock:
+            worker = self._worker
+            return worker is not None and worker.is_alive()
+
+    @property
+    def diagnostics(self) -> DashboardExecutionDiagnostics:
+        with self._lock:
+            return DashboardExecutionDiagnostics(
+                published_snapshots=self._published_snapshots,
+                rejected_snapshots=self._rejected_snapshots,
+                worker_starts=self._worker_starts,
+            )
+
+    def start_worker(
+        self,
+        initial_snapshot: DashboardExecutionSnapshot,
+        task: DashboardWorkerTask,
+    ) -> bool:
+        """Start at most one call worker and retain only its latest snapshot."""
+        if not callable(task):
+            raise ValueError("dashboard worker task must be callable")
+        self._validate_snapshot_scope(initial_snapshot)
+        if initial_snapshot.revision != 0:
+            raise ValueError("initial snapshot revision must be zero")
+        with self._lock:
+            self._require_open()
+            if self._worker is not None:
+                return False
+            self._latest_snapshot = initial_snapshot
+            self._published_snapshots = 1
+            self._cancellation.clear()
+            worker = Thread(
+                target=self._run_worker,
+                args=(task,),
+                name=f"dashboard-call-{self.opaque_key[:12]}",
+                daemon=True,
+            )
+            self._worker = worker
+            self._worker_starts = 1
+            worker.start()
+            return True
+
+    def cancel(self) -> None:
+        self._cancellation.set()
+
+    def join_worker(self) -> None:
+        with self._lock:
+            worker = self._worker
+        if worker is not None and worker is not current_thread():
+            worker.join()
+
+    def _run_worker(self, task: DashboardWorkerTask) -> None:
+        try:
+            terminal = task(self._cancellation, self._publish_snapshot)
+            self._publish_snapshot(terminal)
+        except Exception:
+            with self._lock:
+                latest = self._latest_snapshot
+                terminal_exists = self._terminal_snapshot is not None
+            if latest is not None and not terminal_exists:
+                status = (
+                    DashboardExecutionStatus.CANCELLED
+                    if self._cancellation.is_set()
+                    else DashboardExecutionStatus.FAILED
+                )
+                self._publish_snapshot(
+                    replace(
+                        latest,
+                        revision=latest.revision + 1,
+                        lifecycle_status=status,
+                        failure_reason=(
+                            None
+                            if status is DashboardExecutionStatus.CANCELLED
+                            else "processing_failed"
+                        ),
+                    )
+                )
+
+    def _publish_snapshot(self, snapshot: DashboardExecutionSnapshot) -> None:
+        self._validate_snapshot_scope(snapshot)
+        with self._lock:
+            latest = self._latest_snapshot
+            if (
+                self._terminal_snapshot is not None
+                or latest is None
+                or snapshot.revision <= latest.revision
+                or snapshot.processed_chunks < latest.processed_chunks
+            ):
+                self._rejected_snapshots += 1
+                return
+            self._latest_snapshot = snapshot
+            self._published_snapshots += 1
+            if snapshot.lifecycle_status in {
+                DashboardExecutionStatus.COMPLETED,
+                DashboardExecutionStatus.CANCELLED,
+                DashboardExecutionStatus.FAILED,
+            }:
+                self._terminal_snapshot = snapshot
+
+    def _validate_snapshot_scope(self, snapshot: DashboardExecutionSnapshot) -> None:
+        if not isinstance(snapshot, DashboardExecutionSnapshot):
+            raise ValueError("snapshot must be DashboardExecutionSnapshot")
+        if (
+            snapshot.tenant_id != self._identity.tenant_id
+            or snapshot.call_id != self._identity.call_id
+        ):
+            raise ValueError("dashboard snapshot scope does not match")
 
     def attach_pipeline(self, pipeline: StreamingASRPipeline) -> None:
         if not isinstance(pipeline, StreamingASRPipeline):
@@ -148,6 +305,8 @@ class DashboardExecutionResource:
         return pump.drain_completed(current_seconds=current_seconds)
 
     def close(self) -> None:
+        self._cancellation.set()
+        self.join_worker()
         manager = None
         with self._lock:
             if self._closed:
@@ -155,6 +314,7 @@ class DashboardExecutionResource:
             self._closed = True
             self._pipeline = None
             self._completion_pump = None
+            self._worker = None
             if not self._manager_closed:
                 self._manager_closed = True
                 manager = self._manager
