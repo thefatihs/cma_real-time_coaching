@@ -588,3 +588,62 @@ Tarih: 30 Temmuz 2026
   conflict-marker script ve 5 conflict-marker testi passed.
 - Sonraki planli adim: status rendering, gercek provider smoke testi ve pooling
   ayri, ownership-onayli PR'lara ertelendi.
+
+## PR51 - Opt-In Dashboard RAG Smoke Tenant
+
+Tarih: 30 Temmuz 2026
+
+- Mevcut sentetik tenant varsayilanlari RAG/LLM kapali kalir; yalnizca strict,
+  mutlak ve server-side
+  `CALLMETRIC_DASHBOARD_SMOKE_TENANT_OVERRIDE_PATH` dosyasi secilen mevcut
+  tenant'in bagimsiz kopyasini smoke testi icin etkinlestirir.
+- Override dosyasi sabit alti alan, duplicate/unknown/secret-like key reddi,
+  canonical scope, bounded UTF-8 regular-file okuma ve secret-safe sabit hata
+  davranisi uygular.
+- Yeni non-secret ornek ve runbook; harici TLS PostgreSQL `verify-full`,
+  onceden hazirlanmis local-only 384 boyutlu embedding modeli ve harici
+  Linux/GPU HTTPS vLLM gereksinimlerini kaydeder. Mevcut integration Compose
+  TLS sagladigini iddia etmez.
+- Degisen dosyalar: `live_dashboard/demo_data.py`,
+  `tests/test_live_dashboard_view_models.py`, yeni
+  `live_dashboard/smoke_tenant_override.py`,
+  `tests/test_live_dashboard_smoke_tenant_override.py`,
+  `docs/examples/dashboard-rag-smoke-tenant.json`,
+  `docs/runbooks/postgres_rag_smoke.md` ve `docs/progress/beyza.md`.
+- Focused smoke-override/view-model testleri: 88 passed, 1 skipped (Windows
+  symlink olusturma yetkisi yok).
+- Full suite: 2132 passed, 14 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`
+  passed.
+- Sonraki planli adim: gercek smoke calistirmasi yalnizca onayli harici TLS
+  PostgreSQL, onceden hazirlanmis embedding modeli ve Linux/GPU vLLM ile
+  operasyonel olarak yurutulecek.
+
+## PR52 - PostgreSQL TLS Smoke Environment
+
+Tarih: 30 Temmuz 2026
+
+- Ayri ve opt-in TLS smoke ortami; ephemeral sertifikalarla
+  `sslmode=verify-full`, missing-trust ve hostname-mismatch reddi ile
+  `pg_stat_ssl=true` davranisini dogrular.
+- Exact pinned image:
+  `pgvector/pgvector:0.8.5-pg16-bookworm@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb`;
+  OpenSSL preflight: `OpenSSL 3.0.20 7 Apr 2026`.
+- Uygulama dosyalari: `compose.postgres-tls-smoke.yml`,
+  `scripts/run_postgres_tls_smoke.py`,
+  `tests/integration/test_postgres_tls_smoke.py`,
+  `tests/test_postgres_tls_smoke_runner.py`,
+  `docs/runbooks/postgres_rag_smoke.md`.
+- Migration idempotency, readiness, profile idempotency ve deterministic
+  tenant-scoped ingestion/retrieval gercek TLS PostgreSQL ile dogrulandi;
+  Docker TLS smoke: 1 passed in 87.57s.
+- Runner/unit testleri: 30 passed; focused
+  migration/readiness/provisioning/ingestion/retrieval testleri: 135 passed;
+  full suite: 2162 passed, 15 skipped, 0 failed in 35.96s.
+- Ruff check/format passed; Pyright 0 errors; lock, conflict-marker,
+  conflict-test ve diff kontrolleri passed. Bir mevcut Starlette/httpx
+  deprecation warning'i devam ediyor.
+- Cleanup sonrasi PR52 container, network, volume ve sertifika dizini sayilari
+  sifirdir.
+- Sonraki planli adim: PR53 external HTTPS vLLM service on the approved Linux
+  GPU VM.

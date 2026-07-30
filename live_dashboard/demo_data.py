@@ -18,6 +18,7 @@ from app.tenancy.models import (
     TenantContext,
     TenantRAGConfig,
 )
+from live_dashboard.smoke_tenant_override import apply_smoke_tenant_override
 
 
 DEMO_START = datetime(2026, 7, 22, 9, 0, tzinfo=UTC)
@@ -256,7 +257,7 @@ def tenant_demos() -> dict[str, TenantDemo]:
             action=CoachingAction.ESCALATE,
         ),
     )
-    return {
+    demos = {
         alpha: TenantDemo(
             _config(
                 alpha,
@@ -281,6 +282,7 @@ def tenant_demos() -> dict[str, TenantDemo]:
             beta_scenarios,
         ),
     }
+    return apply_smoke_tenant_override(demos)
 
 
 def scenario_for(tenant_id: str, scenario_id: str) -> DemoScenario:
