@@ -630,12 +630,22 @@ def test_eta_uses_human_readable_rolling_asr_average() -> None:
     assert progress_view(state).eta == "Tahmini kalan süre: 2 dk 15 sn"
 
 
-def test_tenant_display_names_change_but_ids_do_not() -> None:
+def test_tenant_display_names_change_but_ids_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(
+        "CALLMETRIC_DASHBOARD_SMOKE_TENANT_OVERRIDE_PATH",
+        raising=False,
+    )
     demos = tenant_demos()
     assert demos["tenant_alpha"].config.context.tenant_name == "Demo Telekom"
     assert demos["tenant_beta"].config.context.tenant_name == "Demo Yazılım"
     assert demos["tenant_alpha"].config.context.tenant_id == "tenant_alpha"
     assert demos["tenant_beta"].config.context.tenant_id == "tenant_beta"
+    assert not demos["tenant_alpha"].config.rag.enabled
+    assert not demos["tenant_beta"].config.rag.enabled
+    assert not demos["tenant_alpha"].config.coaching.enable_llm
+    assert not demos["tenant_beta"].config.coaching.enable_llm
 
 
 def test_three_tab_data_has_clear_presentation_boundaries() -> None:

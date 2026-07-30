@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "tenant_id": "tenant_alpha",
+  "knowledge_base_id": "kb_smoke",
+  "top_k": 3,
+  "minimum_score": 0.6,
+  "enable_llm": true
+}
