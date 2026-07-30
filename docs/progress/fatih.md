@@ -121,3 +121,20 @@ This log uses local chronological numbering and records only Fatih-owned work.
   Pyright passed.
 - Next planned step: wire the aggregate view into an explicitly diarization-
   enabled live runtime while preserving the legacy dashboard path.
+
+## F-018 — Provider-Neutral Mono Live-Audio Ingress
+
+- Added immutable bounded START/AUDIO_CHUNK/END contracts and a non-blocking,
+  call-scoped mono ingress lifecycle with strict ordering, idempotent exact
+  duplicates, fixed overload outcomes, immediate END/cancellation cleanup and
+  privacy-safe latency/queue counters.
+- Added bounded in-memory adaptation to the existing `AudioChunkEvent`
+  contract without selecting a provider transport or invoking downstream work.
+- Changed files: `app/audio_ingress/__init__.py`,
+  `app/audio_ingress/contracts.py`, `app/audio_ingress/boundary.py`,
+  `tests/test_live_audio_ingress.py`, `docs/progress/fatih.md`.
+- Tests: focused ingress/legacy audio tests 62 passed; full suite 2019 passed
+  and 12 opt-in integration tests skipped (1 existing dependency warning).
+  Ruff and Pyright passed.
+- Next planned step: bind a reviewed provider transport only after its codec,
+  authentication, framing and lifecycle contracts are available.
