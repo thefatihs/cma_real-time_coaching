@@ -32,6 +32,12 @@ class CoachingSuggestionSource(str, Enum):
     LLM = "llm"
 
 
+class CoachingSuggestionLifecycle(str, Enum):
+    PROVISIONAL = "PROVISIONAL"
+    CONFIRMED = "CONFIRMED"
+    WITHDRAWN = "WITHDRAWN"
+
+
 class AudioChunkEvent(BaseModel):
     tenant_id: str
     call_id: str
@@ -174,6 +180,7 @@ class ClassificationResultEvent(BaseModel):
     probabilities: dict[str, float] = Field(default_factory=dict)
     thresholds: dict[str, float] = Field(default_factory=dict)
     processing_time_ms: float | None = None
+    provisional: bool = False
     created_at_utc: datetime
 
     @field_validator("tenant_id", "call_id", "transcript_event_id", "model_id")
@@ -270,6 +277,7 @@ class CoachingSuggestionEvent(BaseModel):
     action: CoachingAction
     priority: SuggestionPriority
     source: CoachingSuggestionSource = CoachingSuggestionSource.RULE
+    lifecycle: CoachingSuggestionLifecycle = CoachingSuggestionLifecycle.CONFIRMED
     label_id: str | None = None
     title: str
     suggestion: str

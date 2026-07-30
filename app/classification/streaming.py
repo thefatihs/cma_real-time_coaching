@@ -1,9 +1,11 @@
 """Failure-isolated stable transcript classification stage."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 import logging
 import re
+from time import monotonic
 from typing import Protocol
 
 from app.calls.models import CallState
@@ -15,6 +17,7 @@ from app.classification.postprocessing import (
 )
 from app.events.labels import ClassificationViewSource
 from app.events.models import (
+    CoachingAction,
     ClassificationResultEvent,
     TranscriptEvent,
     TranscriptKind,
@@ -36,6 +39,7 @@ class RuntimeClassifierProtocol(Protocol):
 
 class ClassificationProcessingStatus(str, Enum):
     CLASSIFIED = "classified"
+    PROVISIONAL_CLASSIFIED = "provisional_classified"
     PARTIAL_SKIPPED = "partial_skipped"
     UNCHANGED_SKIPPED = "unchanged_skipped"
     DUPLICATE_REVISION_SKIPPED = "duplicate_revision_skipped"
@@ -70,6 +74,57 @@ class StableClassificationOutcome:
     delta_labels: tuple[str, ...] = ()
     context_labels: tuple[str, ...] = ()
     label_view_sources: tuple[tuple[str, ClassificationViewSource], ...] = ()
+    provisional: bool = False
+
+
+_DEFAULT_PROVISIONAL_LABELS = frozenset(
+    {
+        "cancellation_request",
+        "churn_risk",
+        "complaint",
+        "price_objection",
+        "product_information",
+        "renewal_interest",
+        "technical_issue",
+    }
+)
+_DEFAULT_CRITICAL_PROVISIONAL_LABELS = frozenset(
+    {"cancellation_request", "churn_risk", "complaint"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionalClassificationPolicy:
+    enabled: bool = False
+    minimum_words: int = 3
+    minimum_growth_words: int = 1
+    minimum_interval_seconds: float = 1.0
+    threshold_increment: float = 0.15
+    minimum_threshold: float = 0.85
+    critical_threshold_increment: float = 0.10
+    critical_minimum_threshold: float = 0.90
+    allowed_labels: frozenset[str] = _DEFAULT_PROVISIONAL_LABELS
+    critical_labels: frozenset[str] = _DEFAULT_CRITICAL_PROVISIONAL_LABELS
+
+    def __post_init__(self) -> None:
+        if self.minimum_words < 1 or self.minimum_words > 32:
+            raise ValueError("minimum_words must be between 1 and 32")
+        if self.minimum_growth_words < 1 or self.minimum_growth_words > 32:
+            raise ValueError("minimum_growth_words must be between 1 and 32")
+        if not 0 <= self.minimum_interval_seconds <= 60:
+            raise ValueError("minimum_interval_seconds must be between 0 and 60")
+        for value in (
+            self.threshold_increment,
+            self.minimum_threshold,
+            self.critical_threshold_increment,
+            self.critical_minimum_threshold,
+        ):
+            if not 0 <= value <= 1:
+                raise ValueError("provisional thresholds must be between 0 and 1")
+        if not self.allowed_labels:
+            raise ValueError("allowed_labels cannot be empty")
+        if not self.critical_labels.issubset(self.allowed_labels):
+            raise ValueError("critical_labels must be included in allowed_labels")
 
 
 class StableTranscriptClassificationStage:
@@ -79,12 +134,36 @@ class StableTranscriptClassificationStage:
         *,
         logger: logging.Logger | None = None,
         maximum_preceding_sentences: int = 2,
+        provisional_policy: ProvisionalClassificationPolicy | None = None,
+        monotonic_clock: Callable[[], float] = monotonic,
     ) -> None:
         if maximum_preceding_sentences < 0 or maximum_preceding_sentences > 2:
             raise ValueError("maximum_preceding_sentences must be between 0 and 2")
         self._classifier = classifier
         self._logger = logger or logging.getLogger(__name__)
         self._maximum_preceding_sentences = maximum_preceding_sentences
+        self._provisional_policy = (
+            provisional_policy or ProvisionalClassificationPolicy()
+        )
+        self._monotonic_clock = monotonic_clock
+        self._processed_partial_chunk_keys: list[int] = []
+        self._last_partial_text = ""
+        self._last_partial_word_count = 0
+        self._last_partial_evaluation_seconds: float | None = None
+
+    def configure_provisional_policy(
+        self,
+        policy: ProvisionalClassificationPolicy,
+        *,
+        monotonic_clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._provisional_policy = policy
+        if monotonic_clock is not None:
+            self._monotonic_clock = monotonic_clock
+        self._processed_partial_chunk_keys.clear()
+        self._last_partial_text = ""
+        self._last_partial_word_count = 0
+        self._last_partial_evaluation_seconds = None
 
     def process(
         self,
@@ -95,9 +174,14 @@ class StableTranscriptClassificationStage:
         call_state: CallState,
         stable_delta: str | None = None,
         preceding_stable_transcript: str = "",
+        allow_provisional: bool = True,
     ) -> StableClassificationOutcome:
         if event.kind is TranscriptKind.PARTIAL:
-            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+            return self._process_partial(
+                event,
+                preceding_stable_transcript=preceding_stable_transcript,
+                allow_provisional=allow_provisional,
+            )
         if not stable_changed:
             return self._outcome(
                 ClassificationProcessingStatus.UNCHANGED_SKIPPED, event
@@ -234,6 +318,145 @@ class StableTranscriptClassificationStage:
                 context_sentence_count=sentence_count,
                 preceding_sentence_count=preceding_count,
                 delta_word_count=len(delta.split()),
+            )
+
+    def _process_partial(
+        self,
+        event: TranscriptEvent,
+        *,
+        preceding_stable_transcript: str,
+        allow_provisional: bool,
+    ) -> StableClassificationOutcome:
+        policy = self._provisional_policy
+        if not policy.enabled or not allow_provisional or self._classifier is None:
+            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+        chunk_key = (
+            event.source_chunk_sequence
+            if event.source_chunk_sequence is not None
+            else event.revision
+        )
+        if chunk_key in self._processed_partial_chunk_keys:
+            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+        normalized = " ".join(event.text.casefold().split())
+        words = normalized.split()
+        if not normalized or len(words) < policy.minimum_words:
+            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+        if normalized == self._last_partial_text:
+            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+        if (
+            self._last_partial_text
+            and normalized.startswith(self._last_partial_text)
+            and len(words) - self._last_partial_word_count < policy.minimum_growth_words
+        ):
+            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+        now = self._monotonic_clock()
+        if now < 0:
+            raise ValueError("monotonic clock cannot be negative")
+        if (
+            self._last_partial_evaluation_seconds is not None
+            and now - self._last_partial_evaluation_seconds
+            < policy.minimum_interval_seconds
+        ):
+            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+        self._processed_partial_chunk_keys.append(chunk_key)
+        del self._processed_partial_chunk_keys[:-64]
+        self._last_partial_text = normalized
+        self._last_partial_word_count = len(words)
+        self._last_partial_evaluation_seconds = now
+        classification_text, preceding_count, sentence_count = _bounded_context(
+            preceding_stable_transcript,
+            event.text,
+            maximum_preceding_sentences=self._maximum_preceding_sentences,
+        )
+        try:
+            raw_delta_result = self._classifier.classify(
+                tenant_id=event.tenant_id,
+                call_id=event.call_id,
+                text=event.text,
+                transcript_event_id=event.event_id,
+                revision=event.revision,
+                sequence_number=event.source_chunk_sequence,
+            )
+            raw_context_result = self._classifier.classify(
+                tenant_id=event.tenant_id,
+                call_id=event.call_id,
+                text=classification_text,
+                transcript_event_id=event.event_id,
+                revision=event.revision,
+                sequence_number=event.source_chunk_sequence,
+            )
+            delta_result = canonicalize_classification_result(raw_delta_result)
+            context_result = canonicalize_classification_result(raw_context_result)
+            merged_result, label_view_sources = merge_classification_views(
+                delta_result,
+                context_result,
+            )
+            result, postprocessing = apply_classification_contrast_guards(
+                classification_text,
+                merged_result,
+            )
+            admitted_labels = []
+            for label in result.labels:
+                if label.name not in policy.allowed_labels:
+                    continue
+                committed_threshold = result.thresholds.get(label.name)
+                probability = result.probabilities.get(label.name, label.score)
+                if committed_threshold is None:
+                    continue
+                critical = label.name in policy.critical_labels
+                increment = (
+                    policy.critical_threshold_increment
+                    if critical
+                    else policy.threshold_increment
+                )
+                floor = (
+                    policy.critical_minimum_threshold
+                    if critical
+                    else policy.minimum_threshold
+                )
+                if probability >= max(committed_threshold + increment, floor):
+                    admitted_labels.append(label)
+            filtered = result.model_copy(
+                update={
+                    "labels": admitted_labels,
+                    "action": (
+                        result.action if admitted_labels else CoachingAction.NO_ACTION
+                    ),
+                    "provisional": True,
+                }
+            )
+            active_names = {label.name for label in admitted_labels}
+            return StableClassificationOutcome(
+                status=ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED,
+                transcript_revision=event.revision,
+                source_sequence=event.source_chunk_sequence,
+                classification_event=filtered,
+                postprocessing=postprocessing,
+                context_sentence_count=sentence_count,
+                preceding_sentence_count=preceding_count,
+                delta_word_count=len(words),
+                delta_inference_ran=True,
+                context_inference_ran=True,
+                delta_inference_time_ms=delta_result.processing_time_ms,
+                context_inference_time_ms=context_result.processing_time_ms,
+                delta_labels=tuple(label.name for label in delta_result.labels),
+                context_labels=tuple(label.name for label in context_result.labels),
+                label_view_sources=tuple(
+                    (label, source)
+                    for label, source in label_view_sources.items()
+                    if label in active_names
+                ),
+                provisional=True,
+            )
+        except Exception as error:
+            safe_error = SafeClassificationError(error_type=type(error).__name__)
+            return StableClassificationOutcome(
+                status=ClassificationProcessingStatus.FAILED,
+                transcript_revision=event.revision,
+                source_sequence=event.source_chunk_sequence,
+                error=safe_error,
+                delta_word_count=len(words),
+                provisional=True,
             )
 
     @staticmethod

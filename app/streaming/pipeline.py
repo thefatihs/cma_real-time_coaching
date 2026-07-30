@@ -8,6 +8,7 @@ from typing import Protocol
 from app.calls.models import CallClassificationMetadata, CallState
 from app.classification.streaming import (
     ClassificationProcessingStatus,
+    ProvisionalClassificationPolicy,
     RuntimeClassifierProtocol,
     StableClassificationOutcome,
     StableTranscriptClassificationStage,
@@ -122,6 +123,18 @@ class StreamingASRPipeline:
         self._customer_router = CustomerOnlyClassificationRouter(
             enabled=customer_only_classification_enabled,
             projection_provider=customer_projection_provider,
+        )
+
+    def configure_provisional_coaching(
+        self,
+        policy: ProvisionalClassificationPolicy,
+        *,
+        monotonic_clock: Callable[[], float] | None = None,
+    ) -> None:
+        """Explicitly opt this pipeline into bounded PARTIAL classification."""
+        self._classification_stage.configure_provisional_policy(
+            policy,
+            monotonic_clock=monotonic_clock,
         )
 
     def run(
@@ -313,8 +326,21 @@ class StreamingASRPipeline:
                 call_state=call_state,
                 stable_delta=event.text,
                 preceding_stable_transcript=previous_stable,
+                allow_provisional=not self._customer_router.enabled,
             )
-            return classification, None, None
+            coaching = (
+                self._process_coaching(
+                    coordinator=coordinator,
+                    event=event,
+                    stable_changed=stable_changed,
+                    classification_outcome=classification,
+                )
+                if event.kind.value == "PARTIAL"
+                and classification.classification_event is not None
+                and classification.classification_event.labels
+                else None
+            )
+            return classification, coaching, None
 
         decision = self._customer_router.prepare(event, call_state)
         if (
@@ -375,8 +401,10 @@ class StreamingASRPipeline:
     ) -> StableCoachingOutcome | None:
         if (
             coordinator is None
-            or event.kind.value == "PARTIAL"
-            or not stable_changed
+            or (
+                event.kind.value == "PARTIAL" and not classification_outcome.provisional
+            )
+            or (event.kind.value != "PARTIAL" and not stable_changed)
             or not event.text.strip()
         ):
             return None

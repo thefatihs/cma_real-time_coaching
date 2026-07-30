@@ -12,6 +12,7 @@ from app.events.models import (
     ClassificationResultEvent,
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -464,6 +465,7 @@ class CallState(BaseModel):
             action=event.action,
             priority=event.priority,
             source=event.source,
+            lifecycle=event.lifecycle,
             label_id=event.label_id,
             transcript_revision=transcript_revision,
             display_order=len(self.coaching_suggestions),
@@ -473,11 +475,19 @@ class CallState(BaseModel):
                 threshold_profile_id if event.source.value != "rule" else None
             ),
         )
-        if metadata.suggestion_id not in {
+        if metadata.suggestion_id in {
             item.suggestion_id for item in self.coaching_suggestions
         }:
+            self.coaching_suggestions = [
+                metadata if item.suggestion_id == metadata.suggestion_id else item
+                for item in self.coaching_suggestions
+            ]
+        else:
             self.coaching_suggestions = [*self.coaching_suggestions, metadata]
-        if event.label_id is not None:
+        if (
+            event.label_id is not None
+            and event.lifecycle is CoachingSuggestionLifecycle.CONFIRMED
+        ):
             self.record_detected_labels(
                 [event.label_id],
                 transcript_revision=transcript_revision,
@@ -485,7 +495,8 @@ class CallState(BaseModel):
                 model_id=model_id,
                 threshold_profile_id=threshold_profile_id,
             )
-        self.coaching_transcript_revision = transcript_revision
+        if event.lifecycle is CoachingSuggestionLifecycle.CONFIRMED:
+            self.coaching_transcript_revision = transcript_revision
 
     def admit_coaching_suggestion(
         self,
@@ -504,6 +515,7 @@ class CallState(BaseModel):
             action=event.action,
             priority=event.priority,
             source=event.source,
+            lifecycle=event.lifecycle,
             label_id=event.label_id,
             transcript_revision=transcript_revision,
             display_order=len(self.coaching_suggestions),
@@ -541,7 +553,10 @@ class CallState(BaseModel):
             key=_coaching_rank,
             reverse=True,
         )
-        if event.label_id is not None:
+        if (
+            event.label_id is not None
+            and event.lifecycle is CoachingSuggestionLifecycle.CONFIRMED
+        ):
             self.record_detected_labels(
                 [event.label_id],
                 transcript_revision=transcript_revision,
@@ -549,8 +564,103 @@ class CallState(BaseModel):
                 model_id=model_id,
                 threshold_profile_id=threshold_profile_id,
             )
-        self.coaching_transcript_revision = transcript_revision
+        if event.lifecycle is CoachingSuggestionLifecycle.CONFIRMED:
+            self.coaching_transcript_revision = transcript_revision
         return True, replaced
+
+    def update_coaching_suggestion(
+        self,
+        event: CoachingSuggestionEvent,
+        *,
+        transcript_revision: int,
+        model_id: str | None,
+        threshold_profile_id: str | None,
+    ) -> None:
+        """Update one logical active card without admitting a duplicate."""
+        self._ensure_same_scope(event)
+        existing = next(
+            (
+                item
+                for item in self.active_coaching_suggestions
+                if item.suggestion_id == event.suggestion_id
+            ),
+            None,
+        )
+        if existing is None:
+            raise ValueError("coaching suggestion is not active")
+        updated = existing.model_copy(
+            update={
+                "action": event.action,
+                "priority": event.priority,
+                "source": event.source,
+                "lifecycle": event.lifecycle,
+                "label_id": event.label_id,
+                "transcript_revision": transcript_revision,
+                "created_at_utc": event.created_at_utc,
+                "model_id": model_id if event.source.value != "rule" else None,
+                "threshold_profile_id": (
+                    threshold_profile_id if event.source.value != "rule" else None
+                ),
+            }
+        )
+        self.active_coaching_suggestions = [
+            updated if item.suggestion_id == event.suggestion_id else item
+            for item in self.active_coaching_suggestions
+        ]
+        self.active_coaching_suggestions.sort(key=_coaching_rank, reverse=True)
+        self.coaching_suggestions = [
+            updated if item.suggestion_id == event.suggestion_id else item
+            for item in self.coaching_suggestions
+        ]
+        if event.lifecycle is CoachingSuggestionLifecycle.CONFIRMED:
+            if event.label_id is not None:
+                self.record_detected_labels(
+                    [event.label_id],
+                    transcript_revision=transcript_revision,
+                    source=event.source,
+                    model_id=model_id,
+                    threshold_profile_id=threshold_profile_id,
+                )
+            self.coaching_transcript_revision = transcript_revision
+
+    def withdraw_coaching_suggestion(self, suggestion_id: str) -> bool:
+        """Remove one provisional card from active state and retain bounded metadata."""
+        active = next(
+            (
+                item
+                for item in self.active_coaching_suggestions
+                if item.suggestion_id == suggestion_id
+            ),
+            None,
+        )
+        if active is None:
+            active = next(
+                (
+                    item
+                    for item in self.coaching_suggestions
+                    if item.suggestion_id == suggestion_id
+                ),
+                None,
+            )
+        if active is None:
+            return False
+        withdrawn = active.model_copy(
+            update={"lifecycle": CoachingSuggestionLifecycle.WITHDRAWN}
+        )
+        self.active_coaching_suggestions = [
+            item
+            for item in self.active_coaching_suggestions
+            if item.suggestion_id != suggestion_id
+        ]
+        self.coaching_suggestions = [
+            withdrawn if item.suggestion_id == suggestion_id else item
+            for item in self.coaching_suggestions
+        ]
+        self.coaching_suggestion_history = [
+            *self.coaching_suggestion_history,
+            withdrawn,
+        ]
+        return True
 
     def mark_suggestion_shown(self, suggestion_id: str) -> None:
         cleaned = suggestion_id.strip()
@@ -672,6 +782,7 @@ class CallCoachingMetadata(BaseModel):
     action: CoachingAction
     priority: SuggestionPriority
     source: CoachingSuggestionSource
+    lifecycle: CoachingSuggestionLifecycle = CoachingSuggestionLifecycle.CONFIRMED
     label_id: str | None = None
     transcript_revision: int
     display_order: int = 0

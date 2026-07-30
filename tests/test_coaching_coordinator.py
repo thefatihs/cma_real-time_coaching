@@ -15,6 +15,7 @@ from app.events.models import (
     ClassificationResultEvent,
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -120,7 +121,10 @@ def coordinator(
     return CoachingCoordinator(tenant, state, engine), state
 
 
-def classification(*labels: str) -> ClassificationResultEvent:
+def classification(
+    *labels: str,
+    provisional: bool = False,
+) -> ClassificationResultEvent:
     return ClassificationResultEvent(
         tenant_id="tenant_alpha",
         call_id="call_001",
@@ -129,6 +133,7 @@ def classification(*labels: str) -> ClassificationResultEvent:
         action=CoachingAction.TEMPLATE_ACTION,
         model_id="common_turkish_setfit_v2",
         threshold_profile_id="common_turkish_setfit_v2:calibrated:v1",
+        provisional=provisional,
         created_at_utc=NOW,
     )
 
@@ -181,6 +186,162 @@ def test_partial_is_ignored() -> None:
     assert result.classification_event is None
     assert result.displayed_suggestions == result.suppressed_suggestions == ()
     assert state.active_labels == []
+
+
+def test_partial_classification_creates_provisional_card() -> None:
+    subject, state = coordinator()
+    transcript = event(TranscriptKind.PARTIAL, text="synthetic complaint now")
+    result = subject.process(
+        transcript,
+        1.0,
+        classification_event=classification("complaint", provisional=True),
+        active_labels=("complaint",),
+    )
+
+    assert len(result.displayed_suggestions) == 1
+    suggestion = result.displayed_suggestions[0]
+    assert suggestion.lifecycle is CoachingSuggestionLifecycle.PROVISIONAL
+    assert result.lifecycle is CoachingSuggestionLifecycle.PROVISIONAL
+    assert state.classification_transcript_revision is None
+    assert state.coaching_transcript_revision is None
+    assert (
+        state.active_coaching_suggestions[0].lifecycle
+        is CoachingSuggestionLifecycle.PROVISIONAL
+    )
+
+
+def test_matching_commit_promotes_same_logical_card_without_duplicate() -> None:
+    subject, state = coordinator()
+    provisional = subject.process(
+        event(TranscriptKind.PARTIAL, text="synthetic complaint now"),
+        1.0,
+        classification_event=classification("complaint", provisional=True),
+        active_labels=("complaint",),
+    ).displayed_suggestions[0]
+    committed_event = event(
+        TranscriptKind.STABLE,
+        event_id="stable-2",
+        revision=2,
+        text="synthetic complaint confirmed",
+    )
+    committed_classification = classification("complaint").model_copy(
+        update={"transcript_event_id": committed_event.event_id}
+    )
+
+    confirmed = subject.process(
+        committed_event,
+        2.0,
+        classification_event=committed_classification,
+        active_labels=("complaint",),
+    )
+
+    assert [item.suggestion_id for item in confirmed.displayed_suggestions] == [
+        provisional.suggestion_id
+    ]
+    assert (
+        confirmed.displayed_suggestions[0].lifecycle
+        is CoachingSuggestionLifecycle.CONFIRMED
+    )
+    assert len(state.active_coaching_suggestions) == 1
+    assert (
+        state.active_coaching_suggestions[0].lifecycle
+        is CoachingSuggestionLifecycle.CONFIRMED
+    )
+
+
+def test_unsupported_commit_withdraws_provisional_card() -> None:
+    subject, state = coordinator()
+    provisional = subject.process(
+        event(TranscriptKind.PARTIAL, text="synthetic complaint now"),
+        1.0,
+        classification_event=classification("complaint", provisional=True),
+        active_labels=("complaint",),
+    ).displayed_suggestions[0]
+    committed_event = event(
+        TranscriptKind.STABLE,
+        event_id="stable-2",
+        revision=2,
+        text="neutral committed text",
+    )
+
+    committed = subject.process(
+        committed_event,
+        2.0,
+        classification_event=classification().model_copy(
+            update={
+                "transcript_event_id": committed_event.event_id,
+                "action": CoachingAction.NO_ACTION,
+            }
+        ),
+        active_labels=(),
+    )
+
+    assert committed.withdrawn_suggestion_ids == (provisional.suggestion_id,)
+    assert state.active_coaching_suggestions == []
+    assert (
+        state.coaching_suggestion_history[-1].lifecycle
+        is CoachingSuggestionLifecycle.WITHDRAWN
+    )
+
+
+def test_changed_commit_replaces_provisional_with_confirmed_card() -> None:
+    subject, state = coordinator()
+    provisional = subject.process(
+        event(TranscriptKind.PARTIAL, text="synthetic complaint now"),
+        1.0,
+        classification_event=classification("complaint", provisional=True),
+        active_labels=("complaint",),
+    ).displayed_suggestions[0]
+    committed_event = event(
+        TranscriptKind.STABLE,
+        event_id="stable-2",
+        revision=2,
+        text="synthetic churn risk confirmed",
+    )
+
+    committed = subject.process(
+        committed_event,
+        12.0,
+        classification_event=classification("churn_risk").model_copy(
+            update={"transcript_event_id": committed_event.event_id}
+        ),
+        active_labels=("churn_risk",),
+    )
+
+    assert provisional.suggestion_id in committed.withdrawn_suggestion_ids
+    assert len(committed.displayed_suggestions) == 1
+    assert committed.displayed_suggestions[0].label_id == "churn_risk"
+    assert (
+        committed.displayed_suggestions[0].lifecycle
+        is CoachingSuggestionLifecycle.CONFIRMED
+    )
+    assert len(state.active_coaching_suggestions) == 1
+
+
+def test_provisional_partial_key_history_is_bounded() -> None:
+    subject, _ = coordinator()
+
+    for revision in range(1, 70):
+        transcript = event(
+            TranscriptKind.PARTIAL,
+            event_id=f"partial-{revision}",
+            revision=revision,
+            source_chunk_sequence=revision,
+            text="synthetic complaint now",
+        )
+        subject.process(
+            transcript,
+            float(revision),
+            classification_event=classification(
+                "complaint", provisional=True
+            ).model_copy(update={"transcript_event_id": transcript.event_id}),
+            active_labels=("complaint",),
+        )
+
+    snapshot = subject.snapshot_coaching_state()
+    assert len(snapshot.processed_partial_keys) == 64
+    assert snapshot.processed_partial_keys == tuple(range(6, 70))
+    assert len(snapshot.provisional_suggestions) == 1
 
 
 @pytest.mark.parametrize("kind", [TranscriptKind.STABLE, TranscriptKind.FINAL])

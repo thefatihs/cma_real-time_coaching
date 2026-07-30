@@ -15,6 +15,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.asr.faster_whisper_engine import FasterWhisperEngine  # noqa: E402
 from app.classification.runtime import RuntimeSetFitClassifier  # noqa: E402
+from app.classification.streaming import ProvisionalClassificationPolicy  # noqa: E402
+from app.events.models import CoachingSuggestionLifecycle  # noqa: E402
 from app.streaming.pipeline import (  # noqa: E402
     StreamingASRPipeline,
     StreamingASRPlan,
@@ -422,6 +424,11 @@ def _render_representative_view(
             key = coaching_feedback_key(scope, card)
             with st.container(border=True):
                 st.caption(f"{card.priority_symbol} {card.priority_text}")
+                st.caption(
+                    "Geçici anlık öneri"
+                    if card.lifecycle is CoachingSuggestionLifecycle.PROVISIONAL
+                    else "Kesinleşmiş öneri"
+                )
                 st.write(card.title)
                 st.write(card.suggestion)
                 details = [
@@ -1010,6 +1017,9 @@ with st.sidebar:
                             service_selection,
                             artifact_availability,
                             execution_resource,
+                        )
+                        pipeline.configure_provisional_coaching(
+                            ProvisionalClassificationPolicy(enabled=True)
                         )
                         publish_stage(DashboardExecutionStage.ENGINE_RUNNING)
 

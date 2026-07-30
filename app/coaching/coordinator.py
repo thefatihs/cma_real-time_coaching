@@ -19,6 +19,7 @@ from app.events.models import (
     ClassificationResultEvent,
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -38,7 +39,9 @@ class CoachingCoordinatorResult:
     transcript_revision: int | None = None
     current_revision_labels: tuple[str, ...] = ()
     replaced_suggestion_ids: tuple[str, ...] = ()
+    withdrawn_suggestion_ids: tuple[str, ...] = ()
     suggestion_decisions: tuple["SafeSuggestionDecision", ...] = ()
+    lifecycle: CoachingSuggestionLifecycle = CoachingSuggestionLifecycle.CONFIRMED
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +124,8 @@ class CoachingStateSnapshot:
     displayed_candidate_times: tuple[tuple[str, float], ...]
     processed_revisions: frozenset[int]
     processed_external_revisions: frozenset[int]
+    provisional_suggestions: tuple[tuple[str, CoachingSuggestionEvent], ...]
+    processed_partial_keys: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +160,8 @@ class CoachingCoordinator:
         self._displayed_candidate_times: dict[str, float] = {}
         self._processed_revisions: set[int] = set()
         self._processed_external_revisions: set[int] = set()
+        self._provisional_suggestions: dict[str, CoachingSuggestionEvent] = {}
+        self._processed_partial_keys: list[int] = []
         self._logger = logger or logging.getLogger(__name__)
 
     @property
@@ -184,6 +191,10 @@ class CoachingCoordinator:
             ),
             processed_revisions=frozenset(self._processed_revisions),
             processed_external_revisions=frozenset(self._processed_external_revisions),
+            provisional_suggestions=tuple(
+                sorted(self._provisional_suggestions.items())
+            ),
+            processed_partial_keys=tuple(self._processed_partial_keys),
         )
 
     def restore_coaching_state(self, snapshot: CoachingStateSnapshot) -> None:
@@ -210,6 +221,8 @@ class CoachingCoordinator:
         self._displayed_candidate_times = dict(snapshot.displayed_candidate_times)
         self._processed_revisions = set(snapshot.processed_revisions)
         self._processed_external_revisions = set(snapshot.processed_external_revisions)
+        self._provisional_suggestions = dict(snapshot.provisional_suggestions)
+        self._processed_partial_keys = list(snapshot.processed_partial_keys)
 
     def process(
         self,
@@ -224,7 +237,12 @@ class CoachingCoordinator:
         ensure_same_tenant(self._tenant_config.context, self._call_state, event)
         ensure_same_call(self._call_state, event)
         if event.kind is TranscriptKind.PARTIAL:
-            return CoachingCoordinatorResult(None, (), (), (), (), event.revision)
+            return self._process_provisional(
+                event,
+                current_seconds,
+                classification_event=classification_event,
+                active_labels=active_labels or (),
+            )
         if event.revision in self._processed_revisions:
             return CoachingCoordinatorResult(
                 classification_event,
@@ -252,9 +270,49 @@ class CoachingCoordinator:
             labels = [label for label in labels if label != "no_action"]
         self._call_state.update_active_labels(labels)
 
+        candidates = _merge_current_candidates(evaluation.suggestion_events)
+        promoted: list[CoachingSuggestionEvent] = []
+        remaining: list[CoachingSuggestionEvent] = []
+        confirmed_labels: set[str] = set()
+        for suggestion in candidates:
+            label = _candidate_key(suggestion)
+            confirmed_labels.add(label)
+            provisional = self._provisional_suggestions.pop(label, None)
+            if provisional is None:
+                remaining.append(suggestion)
+                continue
+            confirmed = suggestion.model_copy(
+                update={
+                    "suggestion_id": provisional.suggestion_id,
+                    "lifecycle": CoachingSuggestionLifecycle.CONFIRMED,
+                }
+            )
+            self._call_state.update_coaching_suggestion(
+                confirmed,
+                transcript_revision=event.revision,
+                model_id=(
+                    classification_event.model_id
+                    if classification_event is not None
+                    else None
+                ),
+                threshold_profile_id=(
+                    classification_event.threshold_profile_id
+                    if classification_event is not None
+                    else None
+                ),
+            )
+            promoted.append(confirmed)
+        withdrawn_ids: list[str] = []
+        for label, provisional in tuple(self._provisional_suggestions.items()):
+            if label in confirmed_labels:
+                continue
+            if self._call_state.withdraw_coaching_suggestion(provisional.suggestion_id):
+                withdrawn_ids.append(provisional.suggestion_id)
+            del self._provisional_suggestions[label]
+
         admission = self._apply_suggestion_policy(
             event,
-            _merge_current_candidates(evaluation.suggestion_events),
+            tuple(remaining),
             current_seconds,
             model_id=(
                 classification_event.model_id
@@ -270,14 +328,85 @@ class CoachingCoordinator:
 
         return CoachingCoordinatorResult(
             classification_event=classification,
-            displayed_suggestions=admission.displayed,
+            displayed_suggestions=(*promoted, *admission.displayed),
             suppressed_suggestions=admission.suppressed,
             matched_rule_ids=evaluation.matched_rule_ids,
             suppression_reasons=admission.suppression_reasons,
             transcript_revision=event.revision,
             current_revision_labels=tuple(labels),
             replaced_suggestion_ids=admission.replaced_suggestion_ids,
+            withdrawn_suggestion_ids=tuple(withdrawn_ids),
             suggestion_decisions=admission.decisions,
+        )
+
+    def _process_provisional(
+        self,
+        event: TranscriptEvent,
+        current_seconds: float,
+        *,
+        classification_event: ClassificationResultEvent | None,
+        active_labels: tuple[str, ...],
+    ) -> CoachingCoordinatorResult:
+        if (
+            classification_event is None
+            or not classification_event.provisional
+            or not active_labels
+        ):
+            return CoachingCoordinatorResult(
+                None,
+                (),
+                (),
+                (),
+                (),
+                event.revision,
+                lifecycle=CoachingSuggestionLifecycle.PROVISIONAL,
+            )
+        ensure_same_tenant(event, classification_event)
+        ensure_same_call(event, classification_event)
+        partial_key = (
+            event.source_chunk_sequence
+            if event.source_chunk_sequence is not None
+            else event.revision
+        )
+        if partial_key in self._processed_partial_keys:
+            return CoachingCoordinatorResult(
+                classification_event,
+                (),
+                (),
+                (),
+                ("duplicate_partial_chunk",),
+                event.revision,
+                lifecycle=CoachingSuggestionLifecycle.PROVISIONAL,
+            )
+        self._processed_partial_keys.append(partial_key)
+        del self._processed_partial_keys[:-64]
+        evaluation = self._rule_engine.evaluate(event, active_labels)
+        candidates = _merge_current_candidates(evaluation.suggestion_events)
+        fresh = tuple(
+            suggestion
+            for suggestion in candidates
+            if _candidate_key(suggestion) not in self._provisional_suggestions
+        )
+        admission = self._apply_suggestion_policy(
+            event,
+            fresh,
+            current_seconds,
+            model_id=classification_event.model_id,
+            threshold_profile_id=classification_event.threshold_profile_id,
+        )
+        for suggestion in admission.displayed:
+            self._provisional_suggestions[_candidate_key(suggestion)] = suggestion
+        return CoachingCoordinatorResult(
+            classification_event=classification_event,
+            displayed_suggestions=admission.displayed,
+            suppressed_suggestions=admission.suppressed,
+            matched_rule_ids=evaluation.matched_rule_ids,
+            suppression_reasons=admission.suppression_reasons,
+            transcript_revision=event.revision,
+            current_revision_labels=active_labels,
+            replaced_suggestion_ids=admission.replaced_suggestion_ids,
+            suggestion_decisions=admission.decisions,
+            lifecycle=CoachingSuggestionLifecycle.PROVISIONAL,
         )
 
     def process_external_suggestion(
@@ -375,7 +504,10 @@ class CoachingCoordinator:
         decisions: list[SafeSuggestionDecision] = []
 
         for suggestion in suggestions:
-            if suggestion.label_id is not None:
+            if (
+                suggestion.label_id is not None
+                and suggestion.lifecycle is CoachingSuggestionLifecycle.CONFIRMED
+            ):
                 self._call_state.record_detected_labels(
                     [suggestion.label_id],
                     transcript_revision=event.revision,
@@ -588,11 +720,16 @@ class CoachingCoordinator:
         classification_event: ClassificationResultEvent | None = None,
         active_labels: tuple[str, ...] | None = None,
     ) -> StableCoachingOutcome:
-        if event.kind is TranscriptKind.PARTIAL:
+        if event.kind is TranscriptKind.PARTIAL and (
+            classification_event is None or not classification_event.provisional
+        ):
             return StableCoachingOutcome(
                 CoachingProcessingStatus.PARTIAL_SKIPPED, event.revision
             )
-        if event.revision in self._processed_revisions:
+        if (
+            event.kind is not TranscriptKind.PARTIAL
+            and event.revision in self._processed_revisions
+        ):
             return StableCoachingOutcome(
                 CoachingProcessingStatus.DUPLICATE_REVISION_SKIPPED, event.revision
             )
@@ -609,7 +746,8 @@ class CoachingCoordinator:
                 result=result,
             )
         except Exception as error:
-            self._processed_revisions.add(event.revision)
+            if event.kind is not TranscriptKind.PARTIAL:
+                self._processed_revisions.add(event.revision)
             self._logger.error(
                 "stable transcript coaching failed",
                 extra={
@@ -637,6 +775,8 @@ class CoachingCoordinator:
         self._displayed_candidate_times.clear()
         self._processed_revisions.clear()
         self._processed_external_revisions.clear()
+        self._provisional_suggestions.clear()
+        self._processed_partial_keys.clear()
 
 
 def _suggestion_fingerprint(

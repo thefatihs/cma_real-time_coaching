@@ -22,6 +22,7 @@ from app.events.models import (
     ClassificationResultEvent,
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -64,12 +65,13 @@ def transcript(
     *,
     tenant_id: str = "tenant_alpha",
     call_id: str = "call_001",
+    kind: TranscriptKind = TranscriptKind.STABLE,
 ) -> TranscriptEvent:
     return TranscriptEvent(
         tenant_id=tenant_id,
         call_id=call_id,
         event_id=f"transcript_{revision}",
-        kind=TranscriptKind.STABLE,
+        kind=kind,
         text=f"Synthetic complaint {revision}.",
         start_seconds=float(revision - 1),
         end_seconds=float(revision),
@@ -124,6 +126,7 @@ def classification(
         labels=[ClassificationLabel(name="complaint", score=0.8)],
         action=CoachingAction.TEMPLATE_ACTION,
         model_id="synthetic-model",
+        provisional=event.kind is TranscriptKind.PARTIAL,
         created_at_utc=NOW,
     )
 
@@ -187,6 +190,29 @@ class RaiseAfterMutationCoordinator(CoachingCoordinator):
             active_labels=active_labels,
         )
         raise RuntimeError(f"{PRIVATE_SENTINEL} {PATH_SENTINEL}")
+
+
+def test_provisional_failure_rolls_back_separate_lifecycle_state() -> None:
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    event = transcript(kind=TranscriptKind.PARTIAL)
+    apply_current(state, event)
+    subject = coordinator(state, RaiseAfterMutationCoordinator)
+    before = subject.snapshot_coaching_state()
+
+    outcome = SafeCoachingProcessorAdapter(subject).process_safely(
+        event,
+        event.end_seconds,
+        classification_event=classification(event),
+        active_labels=("complaint",),
+    )
+
+    assert outcome.status is CoachingProcessingStatus.FAILED
+    assert subject.snapshot_coaching_state() == before
+    assert state.active_coaching_suggestions == []
+    assert not any(
+        item.lifecycle is CoachingSuggestionLifecycle.PROVISIONAL
+        for item in state.coaching_suggestions
+    )
 
 
 class ReturningCoordinator(CoachingCoordinator):

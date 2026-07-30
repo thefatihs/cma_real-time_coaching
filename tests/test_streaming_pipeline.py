@@ -7,6 +7,7 @@ import pytest
 
 from app.classification.streaming import (
     ClassificationProcessingStatus,
+    ProvisionalClassificationPolicy,
     RuntimeClassifierProtocol,
     StableClassificationOutcome,
     StableTranscriptClassificationStage,
@@ -24,6 +25,7 @@ from app.events.models import (
     ClassificationLabel,
     ClassificationResultEvent,
     CoachingAction,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -305,6 +307,167 @@ class FakeRuntimeClassifier:
             processing_time_ms=4.0,
             created_at_utc=NOW,
         )
+
+
+def partial_event(
+    text: str,
+    *,
+    revision: int = 1,
+    sequence: int = 0,
+) -> TranscriptEvent:
+    return TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        event_id=f"partial-{revision}",
+        kind=TranscriptKind.PARTIAL,
+        text=text,
+        start_seconds=0.0,
+        end_seconds=1.0,
+        revision=revision,
+        created_at_utc=NOW,
+        source_chunk_sequence=sequence,
+    )
+
+
+def test_provisional_classification_is_opt_in_and_does_not_commit_revision() -> None:
+    classifier = FakeRuntimeClassifier()
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    event = partial_event("synthetic complaint now")
+    state.apply_transcript(event)
+    disabled = StableTranscriptClassificationStage(classifier)
+
+    skipped = disabled.process(
+        event,
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+    )
+
+    assert skipped.status is ClassificationProcessingStatus.PARTIAL_SKIPPED
+    assert classifier.calls == []
+    assert state.classification_transcript_revision is None
+
+
+def test_meaningful_partial_uses_stricter_threshold_without_committing() -> None:
+    classifier = FixedLabelClassifier("complaint")
+    clock_values = iter((10.0, 10.5, 11.1))
+    stage = StableTranscriptClassificationStage(
+        classifier,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: next(clock_values),
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    first = partial_event("synthetic complaint now", revision=1, sequence=1)
+    state.apply_transcript(first)
+
+    accepted = stage.process(
+        first,
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+    )
+    duplicate_chunk = stage.process(
+        first.model_copy(update={"event_id": "partial-same-chunk"}),
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+    )
+    too_frequent = stage.process(
+        partial_event(
+            "synthetic complaint now please",
+            revision=2,
+            sequence=2,
+        ),
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+    )
+    accepted_later = stage.process(
+        partial_event(
+            "synthetic complaint now please help",
+            revision=3,
+            sequence=3,
+        ),
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+    )
+
+    assert accepted.status is ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED
+    assert accepted.provisional
+    assert accepted.classification_event is not None
+    assert [label.name for label in accepted.classification_event.labels] == [
+        "complaint"
+    ]
+    assert duplicate_chunk.status is ClassificationProcessingStatus.PARTIAL_SKIPPED
+    assert too_frequent.status is ClassificationProcessingStatus.PARTIAL_SKIPPED
+    assert (
+        accepted_later.status is ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED
+    )
+    assert state.classification_transcript_revision is None
+
+
+@pytest.mark.parametrize("text", ["one", "one two"])
+def test_short_partial_is_skipped(text: str) -> None:
+    classifier = FakeRuntimeClassifier()
+    stage = StableTranscriptClassificationStage(
+        classifier,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    event = partial_event(text)
+
+    outcome = stage.process(
+        event,
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+    )
+
+    assert outcome.status is ClassificationProcessingStatus.PARTIAL_SKIPPED
+    assert classifier.calls == []
+
+
+def test_provisional_threshold_rejects_committed_only_confidence() -> None:
+    classifier = FakeRuntimeClassifier()
+    stage = StableTranscriptClassificationStage(
+        classifier,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    event = partial_event("synthetic complaint now")
+
+    outcome = stage.process(
+        event,
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+    )
+
+    assert outcome.classification_event is not None
+    assert outcome.classification_event.labels == []
+    assert outcome.classification_event.action is CoachingAction.NO_ACTION
+
+
+def test_customer_only_scope_keeps_provisional_classification_disabled() -> None:
+    classifier = FixedLabelClassifier("complaint")
+    stage = StableTranscriptClassificationStage(
+        classifier,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    event = partial_event("synthetic complaint now")
+
+    outcome = stage.process(
+        event,
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+        allow_provisional=False,
+    )
+
+    assert outcome.status is ClassificationProcessingStatus.PARTIAL_SKIPPED
+    assert classifier.calls == []
 
 
 class StreamingProjectionProvider:
@@ -1373,3 +1536,43 @@ def test_three_partial_chunks_finalize_stable_transcript_without_failure() -> No
     assert result.final_event is not None
     assert result.final_event.kind is TranscriptKind.FINAL
     assert result.stable_transcript == sentence
+
+
+def test_pipeline_publishes_provisional_card_before_finalization() -> None:
+    subject = pipeline(
+        [chunk(0, 0.0, 2.0)],
+        FakeTranscriber([[("synthetic complaint now", 0.0, 2.0)]]),
+        runtime_classifier=FixedLabelClassifier("complaint"),
+        coaching_factory=coaching_factory(label="complaint"),
+    )
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: 1.0,
+    )
+    published = []
+
+    result = subject.run(
+        Path("synthetic.wav"),
+        "call_001",
+        step_callback=published.append,
+    )
+
+    assert len(published) == 1
+    provisional = published[0].coaching_outcomes[0].result
+    assert provisional is not None
+    assert provisional.lifecycle is CoachingSuggestionLifecycle.PROVISIONAL
+    assert (
+        provisional.displayed_suggestions[0].lifecycle
+        is CoachingSuggestionLifecycle.PROVISIONAL
+    )
+    assert result.final_event is not None
+    confirmed = result.coaching_outcomes[-1].result
+    assert confirmed is not None
+    assert (
+        confirmed.displayed_suggestions[0].suggestion_id
+        == provisional.displayed_suggestions[0].suggestion_id
+    )
+    assert (
+        confirmed.displayed_suggestions[0].lifecycle
+        is CoachingSuggestionLifecycle.CONFIRMED
+    )

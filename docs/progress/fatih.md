@@ -180,3 +180,18 @@ This log uses local chronological numbering and records only Fatih-owned work.
   start, preparation, engine, chunk-progress and terminal feedback without
   render-side processing; duplicate starts remain disabled while RUNNING.
   Focused tests: 154 passed.
+
+## F-021 — Provisional PARTIAL Coaching
+
+- Added an explicit, dashboard-opt-in PROVISIONAL/CONFIRMED/WITHDRAWN coaching
+  lifecycle with bounded per-chunk PARTIAL gating, a one-second injectable
+  cadence, fixed approved labels and stricter confidence thresholds.
+- Meaningful PARTIAL text can publish deterministic template coaching before
+  finalization; matching committed results promote the same card, while changed
+  or unsupported results replace or withdraw it without consuming committed
+  classification/coaching revision state.
+- Changed files: the Fatih-owned classification, coaching, call/event,
+  streaming and dashboard contracts plus four focused test modules.
+- Tests: focused suites 197 passed; full suite 2121 passed and 13 opt-in tests
+  skipped (1 existing dependency warning). Ruff and Pyright passed.
+- Next planned step: complete manual dashboard acceptance before committing.

@@ -13,7 +13,11 @@ from typing import Any, cast
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from app.events.models import AudioChunkEvent, SuggestionPriority
+from app.events.models import (
+    AudioChunkEvent,
+    CoachingSuggestionLifecycle,
+    SuggestionPriority,
+)
 from app.streaming.pipeline import StreamingASRPipeline
 from app.streaming.window_transcriber import WindowTranscriptionResult
 from live_dashboard.demo_data import tenant_demos
@@ -467,6 +471,39 @@ def test_representative_renderer_preserves_card_order_and_runtime_state(
         "Yüksek öncelik"
     )
     assert repr(state.runtime) == runtime_before
+
+
+def test_representative_renderer_distinguishes_provisional_and_confirmed_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    tabs = dashboard_tabs(state.runtime, state)
+    provisional = replace(
+        _history_card(),
+        suggestion_id="provisional",
+        lifecycle=CoachingSuggestionLifecycle.PROVISIONAL,
+    )
+    confirmed = replace(
+        _history_card(),
+        suggestion_id="confirmed",
+        lifecycle=CoachingSuggestionLifecycle.CONFIRMED,
+    )
+    representative = replace(
+        tabs.representative,
+        active_suggestions=(provisional, confirmed),
+    )
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    recorder.captions.clear()
+
+    app._render_representative(
+        state.runtime,
+        replace(tabs, representative=representative),
+        _scope(),
+    )
+
+    assert "Geçici anlık öneri" in recorder.captions
+    assert "Kesinleşmiş öneri" in recorder.captions
 
 
 def test_technical_renderer_is_collapsed_and_read_only(

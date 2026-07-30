@@ -15,6 +15,7 @@ from app.events.models import (
     ClassificationResultEvent,
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -194,14 +195,18 @@ class RuleBasedCoachingEngine:
         classification_labels: tuple[str, ...] = (),
     ) -> RuleEvaluationResult:
         ensure_same_tenant(self._tenant_config.context, event)
-        if event.kind is TranscriptKind.PARTIAL:
+        if event.kind is TranscriptKind.PARTIAL and not classification_labels:
             return RuleEvaluationResult(None, (), ())
 
         transcript_tokens = _tokens(event.text)
-        rule_matches = tuple(
-            rule
-            for rule in self._rules
-            if rule.enabled and _matches(rule, transcript_tokens)
+        rule_matches = (
+            ()
+            if event.kind is TranscriptKind.PARTIAL
+            else tuple(
+                rule
+                for rule in self._rules
+                if rule.enabled and _matches(rule, transcript_tokens)
+            )
         )
         classification_label_set = {
             canonical_label(label) or label for label in classification_labels
@@ -220,7 +225,8 @@ class RuleBasedCoachingEngine:
             _is_cancellation_label(rule.label) for rule in rule_matches
         )
         explicit_cancellation = (
-            _matches_explicit_cancellation(transcript_tokens)
+            event.kind is not TranscriptKind.PARTIAL
+            and _matches_explicit_cancellation(transcript_tokens)
             and not tenant_cancellation_matched
         )
         template_labels = classification_label_set.intersection(
@@ -325,6 +331,11 @@ class RuleBasedCoachingEngine:
             action=rule.action,
             priority=rule.priority,
             source=source,
+            lifecycle=(
+                CoachingSuggestionLifecycle.PROVISIONAL
+                if event.kind is TranscriptKind.PARTIAL
+                else CoachingSuggestionLifecycle.CONFIRMED
+            ),
             label_id=label,
             title=rule.title,
             suggestion=rule.suggestion,
@@ -348,6 +359,11 @@ class RuleBasedCoachingEngine:
             action=template.action,
             priority=template.priority,
             source=source,
+            lifecycle=(
+                CoachingSuggestionLifecycle.PROVISIONAL
+                if event.kind is TranscriptKind.PARTIAL
+                else CoachingSuggestionLifecycle.CONFIRMED
+            ),
             label_id=label,
             title=template.title,
             suggestion=template.suggestion,

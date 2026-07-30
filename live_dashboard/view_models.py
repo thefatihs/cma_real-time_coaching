@@ -32,6 +32,7 @@ from app.diarization.models import SpeakerRole
 from app.events.models import (
     CoachingAction,
     CoachingSuggestionEvent,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionSource,
     SuggestionPriority,
     TranscriptEvent,
@@ -164,6 +165,7 @@ class SuggestionCardViewModel:
     source: str
     transcript_revision: int | None
     is_new: bool
+    lifecycle: CoachingSuggestionLifecycle = CoachingSuggestionLifecycle.CONFIRMED
 
 
 @dataclass(frozen=True, slots=True)
@@ -680,6 +682,7 @@ def suggestion_card(
         SOURCE_LABELS[event.source],
         transcript_revision,
         True,
+        event.lifecycle,
     )
 
 
@@ -1480,21 +1483,22 @@ def _consume_classification_outcome(
         for label in current_labels
     )
     runtime.classification_probabilities = {}
-    runtime.call_state.apply_classification(
-        classification,
-        transcript_revision=outcome.transcript_revision or 0,
-        source_sequence=outcome.source_sequence,
-        context_sentence_count=outcome.context_sentence_count,
-        preceding_sentence_count=outcome.preceding_sentence_count,
-        delta_word_count=outcome.delta_word_count,
-        delta_inference_ran=outcome.delta_inference_ran,
-        context_inference_ran=outcome.context_inference_ran,
-        delta_inference_time_ms=outcome.delta_inference_time_ms,
-        context_inference_time_ms=outcome.context_inference_time_ms,
-        delta_labels=outcome.delta_labels,
-        context_labels=outcome.context_labels,
-        label_view_sources=dict(outcome.label_view_sources),
-    )
+    if not outcome.provisional:
+        runtime.call_state.apply_classification(
+            classification,
+            transcript_revision=outcome.transcript_revision or 0,
+            source_sequence=outcome.source_sequence,
+            context_sentence_count=outcome.context_sentence_count,
+            preceding_sentence_count=outcome.preceding_sentence_count,
+            delta_word_count=outcome.delta_word_count,
+            delta_inference_ran=outcome.delta_inference_ran,
+            context_inference_ran=outcome.context_inference_ran,
+            delta_inference_time_ms=outcome.delta_inference_time_ms,
+            context_inference_time_ms=outcome.context_inference_time_ms,
+            delta_labels=outcome.delta_labels,
+            context_labels=outcome.context_labels,
+            label_view_sources=dict(outcome.label_view_sources),
+        )
     for label in current_labels:
         if label not in runtime.detected_label_names:
             runtime.detected_label_names.append(label)
@@ -1560,8 +1564,26 @@ def _apply_coaching_result(
             for card in runtime.suggestions
             if card.suggestion_id not in replaced_ids
         ]
+    withdrawn_ids = set(result.withdrawn_suggestion_ids)
+    if withdrawn_ids:
+        runtime.suggestion_history.extend(
+            replace(card, lifecycle=CoachingSuggestionLifecycle.WITHDRAWN)
+            for card in runtime.suggestions
+            if card.suggestion_id in withdrawn_ids
+        )
+        runtime.suggestions = [
+            card
+            for card in runtime.suggestions
+            if card.suggestion_id not in withdrawn_ids
+        ]
+        if apply_state_metadata:
+            for suggestion_id in withdrawn_ids:
+                runtime.call_state.withdraw_coaching_suggestion(suggestion_id)
     runtime.suggestion_decisions.extend(result.suggestion_decisions)
-    if apply_state_metadata:
+    if (
+        apply_state_metadata
+        and result.lifecycle is CoachingSuggestionLifecycle.CONFIRMED
+    ):
         runtime.call_state.update_active_labels(list(result.current_revision_labels))
     if classification is not None and not apply_state_metadata:
         runtime.latest_action = classification.action
@@ -1601,15 +1623,35 @@ def _apply_coaching_result(
         runtime.latest_action = CoachingAction.NO_ACTION
         runtime.latest_labels = ()
     for item in result.displayed_suggestions:
+        card = suggestion_card(
+            item,
+            transcript_revision=result.transcript_revision,
+        )
+        existing_index = next(
+            (
+                index
+                for index, existing in enumerate(runtime.suggestions)
+                if existing.suggestion_id == item.suggestion_id
+            ),
+            None,
+        )
+        if existing_index is not None:
+            runtime.suggestions[existing_index] = card
+            if apply_state_metadata:
+                runtime.call_state.mark_suggestion_shown(item.suggestion_id)
+                runtime.call_state.apply_coaching_suggestion(
+                    item,
+                    transcript_revision=result.transcript_revision or 0,
+                    model_id=classification.model_id if classification else None,
+                    threshold_profile_id=(
+                        classification.threshold_profile_id if classification else None
+                    ),
+                )
+            continue
         if item.suggestion_id in runtime.consumed_suggestion_ids:
             continue
         runtime.consumed_suggestion_ids.add(item.suggestion_id)
-        runtime.suggestions.append(
-            suggestion_card(
-                item,
-                transcript_revision=result.transcript_revision,
-            )
-        )
+        runtime.suggestions.append(card)
         if apply_state_metadata:
             runtime.call_state.mark_suggestion_shown(item.suggestion_id)
             runtime.call_state.apply_coaching_suggestion(
