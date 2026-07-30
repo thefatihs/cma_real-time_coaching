@@ -6,6 +6,7 @@ from enum import Enum
 from hashlib import sha256
 from typing import Any, Generic, TypeVar
 
+from live_dashboard.rag_runtime import DashboardRAGRuntimeStatus
 from live_dashboard.view_models import DashboardTabsViewModel, SuggestionCardViewModel
 
 
@@ -66,6 +67,15 @@ class OperationalStatus:
     state: OperationalState
     label: str
     detail: str
+
+
+def rag_runtime_status_text(status: object) -> str:
+    """Map the immutable runtime state to fixed, secret-safe visible text."""
+    if status is DashboardRAGRuntimeStatus.READY:
+        return "RAG hazır"
+    if status is DashboardRAGRuntimeStatus.DISABLED:
+        return "RAG devre dışı"
+    return "RAG geçici olarak kullanılamıyor; temel görüşme analizi devam ediyor"
 
 
 def ui_scope_identity(

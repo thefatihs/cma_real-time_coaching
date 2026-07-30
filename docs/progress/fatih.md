@@ -138,3 +138,19 @@ This log uses local chronological numbering and records only Fatih-owned work.
   Ruff and Pyright passed.
 - Next planned step: bind a reviewed provider transport only after its codec,
   authentication, framing and lifecycle contracts are available.
+
+## F-019 — Secret-Safe RAG Runtime Status Presentation
+
+- Added deterministic visible READY, DISABLED and UNAVAILABLE presentation
+  from the existing immutable dashboard RAG runtime state, with malformed
+  values mapped to the fixed safe UNAVAILABLE text.
+- Rendering retains only the enum state across reruns and does not invoke
+  provider, manager, readiness, profile or completion lifecycle operations.
+- Changed files: `live_dashboard/app.py`, `live_dashboard/presentation.py`,
+  `tests/test_live_dashboard_rag_runtime_status.py`,
+  `docs/progress/fatih.md`.
+- Tests: focused D3 14 passed, speaker dashboard 5 passed, dashboard rendering
+  12 passed; full suite 2090 passed and 13 skipped (1 existing dependency
+  warning). Ruff and Pyright passed.
+- Next planned step: review PR50-D3 for integration without adding provider
+  lifecycle or dashboard state contracts.

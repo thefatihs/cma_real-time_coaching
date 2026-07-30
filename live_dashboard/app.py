@@ -43,6 +43,7 @@ from live_dashboard.presentation import (  # noqa: E402
     call_status_header,
     coaching_feedback_key,
     operational_status,
+    rag_runtime_status_text,
     representative_kpis,
     safe_failure_rows,
     scoped_widget_key,
@@ -88,6 +89,8 @@ div[data-testid="stVerticalBlock"] {gap:.75rem}
 
 _EXECUTION_RESOURCE_CAPACITY = 8
 _EXECUTION_RESOURCE_SESSION_KEY = "dashboard_execution_resource_key"
+_RAG_RUNTIME_STATUS_SESSION_KEY = "dashboard_rag_runtime_status"
+_RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
 
 
 @st.cache_resource(show_spinner="ASR modeli yükleniyor…")
@@ -148,15 +151,17 @@ def _execution_resource(runtime: DashboardRuntime) -> DashboardExecutionResource
         if not isinstance(previous_key, str):
             raise ValueError("dashboard execution resource key is invalid")
         controller.close_and_remove(previous_key)
-    _, resource = controller.activate(
+    status, resource = controller.activate(
         tenant_config=runtime.tenant.config,
         call_id=identity.call_id,
     )
     st.session_state[_EXECUTION_RESOURCE_SESSION_KEY] = resource.opaque_key
+    st.session_state[_RAG_RUNTIME_STATUS_SESSION_KEY] = status
     return resource
 
 
 def _close_execution_resource() -> None:
+    st.session_state.pop(_RAG_RUNTIME_STATUS_SESSION_KEY, None)
     key = st.session_state.pop(_EXECUTION_RESOURCE_SESSION_KEY, None)
     if key is None:
         return
@@ -630,8 +635,11 @@ def _render_dashboard(
     local_state: LocalExecutionState | None,
     metadata: SafeUploadMetadata | None,
     scope: UIScopeIdentity,
+    rag_runtime_status: object = _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
 ) -> None:
     view = dashboard_tabs(runtime, local_state, metadata)
+    if rag_runtime_status is not _RAG_RUNTIME_STATUS_NOT_AVAILABLE:
+        st.caption(rag_runtime_status_text(rag_runtime_status))
     representative, technical, result = st.tabs(
         ("Temsilci Görünümü", "Teknik İzleme", "Görüşme Sonucu")
     )
@@ -896,4 +904,8 @@ else:
         local_state_for_render,
         safe_metadata,
         active_ui_scope,
+        st.session_state.get(
+            _RAG_RUNTIME_STATUS_SESSION_KEY,
+            _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
+        ),
     )
