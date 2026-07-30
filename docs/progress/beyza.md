@@ -588,3 +588,33 @@ Tarih: 30 Temmuz 2026
   conflict-marker script ve 5 conflict-marker testi passed.
 - Sonraki planli adim: status rendering, gercek provider smoke testi ve pooling
   ayri, ownership-onayli PR'lara ertelendi.
+
+## PR51 - Opt-In Dashboard RAG Smoke Tenant
+
+Tarih: 30 Temmuz 2026
+
+- Mevcut sentetik tenant varsayilanlari RAG/LLM kapali kalir; yalnizca strict,
+  mutlak ve server-side
+  `CALLMETRIC_DASHBOARD_SMOKE_TENANT_OVERRIDE_PATH` dosyasi secilen mevcut
+  tenant'in bagimsiz kopyasini smoke testi icin etkinlestirir.
+- Override dosyasi sabit alti alan, duplicate/unknown/secret-like key reddi,
+  canonical scope, bounded UTF-8 regular-file okuma ve secret-safe sabit hata
+  davranisi uygular.
+- Yeni non-secret ornek ve runbook; harici TLS PostgreSQL `verify-full`,
+  onceden hazirlanmis local-only 384 boyutlu embedding modeli ve harici
+  Linux/GPU HTTPS vLLM gereksinimlerini kaydeder. Mevcut integration Compose
+  TLS sagladigini iddia etmez.
+- Degisen dosyalar: `live_dashboard/demo_data.py`,
+  `tests/test_live_dashboard_view_models.py`, yeni
+  `live_dashboard/smoke_tenant_override.py`,
+  `tests/test_live_dashboard_smoke_tenant_override.py`,
+  `docs/examples/dashboard-rag-smoke-tenant.json`,
+  `docs/runbooks/postgres_rag_smoke.md` ve `docs/progress/beyza.md`.
+- Focused smoke-override/view-model testleri: 88 passed, 1 skipped (Windows
+  symlink olusturma yetkisi yok).
+- Full suite: 2132 passed, 14 skipped, 1 mevcut Starlette deprecation warning.
+- Repository-wide Ruff check/format passed; Pyright 0 errors; `uv lock --check`
+  passed.
+- Sonraki planli adim: gercek smoke calistirmasi yalnizca onayli harici TLS
+  PostgreSQL, onceden hazirlanmis embedding modeli ve Linux/GPU vLLM ile
+  operasyonel olarak yurutulecek.
