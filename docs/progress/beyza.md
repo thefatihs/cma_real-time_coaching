@@ -618,3 +618,32 @@ Tarih: 30 Temmuz 2026
 - Sonraki planli adim: gercek smoke calistirmasi yalnizca onayli harici TLS
   PostgreSQL, onceden hazirlanmis embedding modeli ve Linux/GPU vLLM ile
   operasyonel olarak yurutulecek.
+
+## PR52 - PostgreSQL TLS Smoke Environment
+
+Tarih: 30 Temmuz 2026
+
+- Ayri ve opt-in TLS smoke ortami; ephemeral sertifikalarla
+  `sslmode=verify-full`, missing-trust ve hostname-mismatch reddi ile
+  `pg_stat_ssl=true` davranisini dogrular.
+- Exact pinned image:
+  `pgvector/pgvector:0.8.5-pg16-bookworm@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb`;
+  OpenSSL preflight: `OpenSSL 3.0.20 7 Apr 2026`.
+- Uygulama dosyalari: `compose.postgres-tls-smoke.yml`,
+  `scripts/run_postgres_tls_smoke.py`,
+  `tests/integration/test_postgres_tls_smoke.py`,
+  `tests/test_postgres_tls_smoke_runner.py`,
+  `docs/runbooks/postgres_rag_smoke.md`.
+- Migration idempotency, readiness, profile idempotency ve deterministic
+  tenant-scoped ingestion/retrieval gercek TLS PostgreSQL ile dogrulandi;
+  Docker TLS smoke: 1 passed in 87.57s.
+- Runner/unit testleri: 30 passed; focused
+  migration/readiness/provisioning/ingestion/retrieval testleri: 135 passed;
+  full suite: 2162 passed, 15 skipped, 0 failed in 35.96s.
+- Ruff check/format passed; Pyright 0 errors; lock, conflict-marker,
+  conflict-test ve diff kontrolleri passed. Bir mevcut Starlette/httpx
+  deprecation warning'i devam ediyor.
+- Cleanup sonrasi PR52 container, network, volume ve sertifika dizini sayilari
+  sifirdir.
+- Sonraki planli adim: PR53 external HTTPS vLLM service on the approved Linux
+  GPU VM.

@@ -1,0 +1,72 @@
+# Isolated synthetic TLS smoke environment. Never use this service in production.
+services:
+  certificate-init:
+    image: pgvector/pgvector:0.8.5-pg16-bookworm@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    restart: "no"
+    network_mode: none
+    entrypoint:
+      - /bin/sh
+      - -ceu
+    command:
+      - |
+        umask 077
+        openssl req -x509 -newkey rsa:2048 -sha256 -days 1 -nodes \
+          -subj "/CN=CallMetric TLS Smoke CA" \
+          -keyout /certificates/ca.key \
+          -out /certificates/ca.crt
+        openssl req -newkey rsa:2048 -sha256 -nodes \
+          -subj "/CN=localhost" \
+          -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+          -keyout /certificates/server.key \
+          -out /certificates/server.csr
+        openssl x509 -req -sha256 -days 1 \
+          -in /certificates/server.csr \
+          -CA /certificates/ca.crt \
+          -CAkey /certificates/ca.key \
+          -CAcreateserial \
+          -copy_extensions copy \
+          -out /certificates/server.crt
+        chown postgres:postgres \
+          /certificates/server.key \
+          /certificates/server.crt
+        chmod 0600 /certificates/ca.key /certificates/server.key
+        chmod 0644 /certificates/ca.crt /certificates/server.crt
+    volumes:
+      - type: bind
+        source: ${CALLMETRIC_POSTGRES_TLS_CERT_DIR:?certificate directory is required}
+        target: /certificates
+
+  postgres-vector-tls-smoke:
+    image: pgvector/pgvector:0.8.5-pg16-bookworm@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    restart: "no"
+    environment:
+      POSTGRES_DB: callmetric_vector_tls_smoke
+      POSTGRES_USER: callmetric_tls_migration
+      POSTGRES_PASSWORD: ${CALLMETRIC_POSTGRES_TLS_MIGRATION_PASSWORD:?migration password is required}
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certificates/server.crt
+      - -c
+      - ssl_key_file=/certificates/server.key
+    ports:
+      - "127.0.0.1::5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U callmetric_tls_migration -d callmetric_vector_tls_smoke
+      interval: 1s
+      timeout: 5s
+      retries: 60
+      start_period: 5s
+    volumes:
+      - postgres-tls-smoke-data:/var/lib/postgresql/data
+      - type: bind
+        source: ${CALLMETRIC_POSTGRES_TLS_CERT_DIR:?certificate directory is required}
+        target: /certificates
+        read_only: true
+
+volumes:
+  postgres-tls-smoke-data:
