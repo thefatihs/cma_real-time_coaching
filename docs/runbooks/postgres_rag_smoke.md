@@ -64,6 +64,34 @@ The result must be `true`. `compose.postgres-integration.yml` does not configure
 or prove TLS and remains limited to non-TLS integration tests. Do not weaken
 `PostgreSQLVectorStoreSettings` or use `sslmode=disable`.
 
+## Repository-owned TLS smoke
+
+PR52 adds a separate, opt-in environment in
+`compose.postgres-tls-smoke.yml`. It does not modify or reuse the ordinary
+non-TLS integration environment. Run it only through the bounded controller:
+
+```powershell
+uv run python scripts/run_postgres_tls_smoke.py
+```
+
+The controller uses the immutable pgvector 0.8.5 image digest, creates a fresh
+ephemeral CA and server certificate outside the repository, and gives the
+server certificate both `DNS:localhost` and `IP:127.0.0.1` subject alternative
+names. Application and migration connections use `localhost`,
+`sslmode=verify-full`, and that run's private trust root. The test also proves
+that missing trust and a mismatched hostname fail closed.
+
+The TLS smoke applies migration `0001` and verifies an idempotent second
+application, schema readiness, exact profile registration, deterministic
+synthetic ingestion and tenant-scoped retrieval. Its synthetic embedding
+backend validates database wiring only; it is not a real embedding-model smoke
+test.
+
+All passwords, DSNs, private keys, certificates and temporary paths are
+generated for one invocation and remain outside Git. The controller always
+removes its project-scoped container, network, volume and complete certificate
+directory. A failure must be reported with fixed secret-free output.
+
 ## External vLLM requirement
 
 Real generation requires a separately managed Linux/GPU vLLM service exposing
