@@ -51,6 +51,19 @@ def test_valid_mono_window_transcription_and_single_engine_call() -> None:
     np.testing.assert_allclose(engine.calls[0], [0.0, 0.5])
 
 
+def test_audio_preparation_timing_excludes_engine_inference() -> None:
+    engine = FakeEngine(make_result())
+    clock_values = iter([2.0, 2.125])
+
+    result = WindowTranscriber(
+        engine,
+        clock=lambda: next(clock_values),
+    ).transcribe(make_window())
+
+    assert result.audio_preparation_time_seconds == pytest.approx(0.125)
+    assert result.processing_time_seconds == pytest.approx(0.2)
+
+
 def test_8khz_mono_is_normalized_and_resampled_to_16khz() -> None:
     pcm = np.linspace(-32768, 32767, 8_000, dtype=np.int16)
     window = make_window(

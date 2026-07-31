@@ -1,10 +1,14 @@
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import get_ident
+from threading import Event, get_ident
 
 import pytest
 
+from app.audio_ingress.local_microphone import (
+    LOCAL_MIC_GATE_ENVIRONMENT_KEY,
+    create_local_mic_test_capability,
+)
 from app.classification.streaming import (
     ClassificationProcessingStatus,
     ProvisionalClassificationPolicy,
@@ -1576,3 +1580,75 @@ def test_pipeline_publishes_provisional_card_before_finalization() -> None:
         confirmed.displayed_suggestions[0].lifecycle
         is CoachingSuggestionLifecycle.CONFIRMED
     )
+
+
+def test_live_microphone_publishes_provisional_coaching_before_end() -> None:
+    subject = pipeline(
+        [],
+        FakeTranscriber([[("synthetic complaint now", 0.0, 2.0)]]),
+        runtime_classifier=FixedLabelClassifier("complaint"),
+        coaching_factory=coaching_factory(label="complaint"),
+    )
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: 1.0,
+    )
+    resource = object()
+    capability = create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={LOCAL_MIC_GATE_ENVIRONMENT_KEY: "1"},
+    )
+    published = []
+
+    def live_chunks():
+        yield chunk(0, 0.0, 2.0)
+        assert published
+        result = published[0].coaching_outcomes[0].result
+        assert result is not None
+        assert result.lifecycle is CoachingSuggestionLifecycle.PROVISIONAL
+
+    result = subject.run_live(
+        live_chunks(),
+        "call_001",
+        capability=capability,
+        execution_resource=resource,
+        cancellation=Event(),
+        step_callback=published.append,
+    )
+
+    assert result.total_chunks == 1
+    assert result.final_event is not None
+
+
+def test_live_microphone_capability_mismatch_and_revocation_fail_closed() -> None:
+    subject = pipeline([], FakeTranscriber([]))
+    resource = object()
+    capability = create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        resource=resource,
+        server_address="localhost",
+        environment={LOCAL_MIC_GATE_ENVIRONMENT_KEY: "1"},
+    )
+
+    with pytest.raises(PermissionError, match="invalid_local_microphone"):
+        subject.run_live(
+            (),
+            "call_001",
+            capability=capability,
+            execution_resource=object(),
+            cancellation=Event(),
+        )
+
+    capability.revoke()
+    with pytest.raises(PermissionError, match="invalid_local_microphone"):
+        subject.run_live(
+            (),
+            "call_001",
+            capability=capability,
+            execution_resource=resource,
+            cancellation=Event(),
+        )

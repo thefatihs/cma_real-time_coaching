@@ -3,8 +3,10 @@
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Protocol
 
+from app.audio_ingress.local_microphone import LocalMicTestCapability
 from app.calls.models import CallClassificationMetadata, CallState
 from app.classification.streaming import (
     ClassificationProcessingStatus,
@@ -52,6 +54,7 @@ class StreamingASRStep:
     classification_outcomes: tuple[StableClassificationOutcome, ...] = ()
     coaching_outcomes: tuple[StableCoachingOutcome, ...] = ()
     customer_routing_outcomes: tuple[CustomerRoutingOutcome, ...] = ()
+    audio_preparation_time_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,27 +149,7 @@ class StreamingASRPipeline:
         plan_callback: PlanCallback | None = None,
         retain_history: bool = True,
     ) -> StreamingASRResult:
-        call_state = CallState(
-            tenant_id=self._tenant_context.tenant_id,
-            call_id=call_id,
-        )
-        buffer = RollingAudioBuffer(self._asr_config.rolling_window_seconds)
-        window_builder = AudioWindowBuilder()
-        reconciler = TranscriptReconciler(
-            stable_region_seconds=self._asr_config.stable_region_seconds
-        )
-        steps: list[StreamingASRStep] = []
-        all_classification_outcomes: list[StableClassificationOutcome] = []
-        all_coaching_outcomes: list[StableCoachingOutcome] = []
-        all_customer_routing_outcomes: list[CustomerRoutingOutcome] = []
-        coaching_coordinator = (
-            self._coaching_coordinator_factory(call_state)
-            if self._coaching_coordinator_factory is not None
-            else None
-        )
         audio_duration_seconds = 0.0
-        processed_chunks = 0
-
         planning_chunks = self._chunk_generator(
             audio_path,
             self._tenant_context.tenant_id,
@@ -197,7 +180,74 @@ class StreamingASRPipeline:
             call_id,
             self._asr_config.chunk_duration_seconds,
         )
+        return self._execute_chunks(
+            chunks,
+            call_id=call_id,
+            initial_audio_duration_seconds=audio_duration_seconds,
+            step_callback=step_callback,
+            retain_history=retain_history,
+        )
+
+    def run_live(
+        self,
+        chunks: Iterable[AudioChunkEvent],
+        call_id: str,
+        *,
+        capability: LocalMicTestCapability,
+        execution_resource: object,
+        cancellation: Event,
+        step_callback: StepCallback | None = None,
+        retain_history: bool = False,
+    ) -> StreamingASRResult:
+        """Process an authorized bounded live chunk stream without file planning."""
+        if not capability.authorizes(
+            tenant_id=self._tenant_context.tenant_id,
+            call_id=call_id,
+            resource=execution_resource,
+        ):
+            raise PermissionError("invalid_local_microphone_capability")
+        return self._execute_chunks(
+            chunks,
+            call_id=call_id,
+            initial_audio_duration_seconds=0.0,
+            step_callback=step_callback,
+            retain_history=retain_history,
+            cancellation=cancellation,
+        )
+
+    def _execute_chunks(
+        self,
+        chunks: Iterable[AudioChunkEvent],
+        *,
+        call_id: str,
+        initial_audio_duration_seconds: float,
+        step_callback: StepCallback | None,
+        retain_history: bool,
+        cancellation: Event | None = None,
+    ) -> StreamingASRResult:
+        call_state = CallState(
+            tenant_id=self._tenant_context.tenant_id,
+            call_id=call_id,
+        )
+        buffer = RollingAudioBuffer(self._asr_config.rolling_window_seconds)
+        window_builder = AudioWindowBuilder()
+        reconciler = TranscriptReconciler(
+            stable_region_seconds=self._asr_config.stable_region_seconds
+        )
+        steps: list[StreamingASRStep] = []
+        all_classification_outcomes: list[StableClassificationOutcome] = []
+        all_coaching_outcomes: list[StableCoachingOutcome] = []
+        all_customer_routing_outcomes: list[CustomerRoutingOutcome] = []
+        coaching_coordinator = (
+            self._coaching_coordinator_factory(call_state)
+            if self._coaching_coordinator_factory is not None
+            else None
+        )
+        audio_duration_seconds = initial_audio_duration_seconds
+        processed_chunks = 0
         for chunk in chunks:
+            if cancellation is not None and cancellation.is_set():
+                break
             processed_chunks += 1
             call_state.apply_audio_chunk(chunk)
             buffer.append(chunk)
@@ -259,12 +309,17 @@ class StreamingASRPipeline:
                 stable_transcript=reconciler.stable_transcript,
                 partial_transcript=reconciler.partial_transcript,
                 transcription_time_seconds=(transcription.processing_time_seconds),
+                audio_preparation_time_seconds=(
+                    transcription.audio_preparation_time_seconds
+                ),
             )
             if retain_history:
                 steps.append(step)
             if step_callback is not None:
                 step_callback(step)
 
+        if processed_chunks == 0 and cancellation is None:
+            raise ValueError("Audio file generated no audio chunks")
         final_event = reconciler.finalize()
         if final_event is not None:
             previous_stable = call_state.stable_transcript

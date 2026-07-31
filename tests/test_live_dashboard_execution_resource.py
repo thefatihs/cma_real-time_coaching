@@ -3,8 +3,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
 
+import av
 import pytest
 
+from app.audio_ingress.local_microphone import (
+    LOCAL_MIC_CHUNK_BYTES,
+    LOCAL_MIC_GATE_ENVIRONMENT_KEY,
+    LocalMicrophoneASRReadiness,
+    LocalMicrophoneIngressSession,
+    _NormalizedAudio,
+    create_local_mic_test_capability,
+)
 from app.coaching.coordinator import (
     CoachingProcessingStatus,
     StableCoachingOutcome,
@@ -136,6 +145,104 @@ def test_same_scope_rerun_returns_exact_resource() -> None:
         )
         is first
     )
+
+
+def test_microphone_session_survives_rerun_and_resource_close_revokes_once() -> None:
+    registry = DashboardExecutionResourceRegistry(capacity=1)
+    resource = registry.acquire(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        integration=None,
+    )
+    capability = create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={LOCAL_MIC_GATE_ENVIRONMENT_KEY: "1"},
+    )
+    session = LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+
+    rerun_resource = registry.acquire(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        integration=None,
+    )
+    assert rerun_resource is resource
+    assert rerun_resource.microphone_session is session
+    assert capability.active
+
+    resource.close()
+    resource.close()
+    assert resource.closed
+    assert not capability.active
+    assert resource.microphone_session is None
+
+
+def test_microphone_first_chunk_advances_snapshot_before_disconnect_end() -> None:
+    class OneChunkNormalizer:
+        def normalize(self, frame: av.AudioFrame) -> tuple[_NormalizedAudio, ...]:
+            del frame
+            return (_NormalizedAudio(b"\0" * LOCAL_MIC_CHUNK_BYTES, 0.0),)
+
+        def flush(self) -> tuple[_NormalizedAudio, ...]:
+            return ()
+
+    resource = DashboardExecutionResource(identity(), integration=None)
+    capability = create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={LOCAL_MIC_GATE_ENVIRONMENT_KEY: "1"},
+    )
+    session = LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+        normalizer=OneChunkNormalizer(),
+    )
+    resource.attach_microphone_session(session)
+    first_processed = Event()
+
+    def task(
+        cancellation: Event,
+        publish: SnapshotPublisher,
+    ) -> DashboardExecutionSnapshot:
+        chunks = iter(session.iter_audio_chunks(cancellation=cancellation))
+        next(chunks)
+        publish(_snapshot(1, DashboardExecutionStatus.RUNNING, completed=1))
+        first_processed.set()
+        tuple(chunks)
+        return _snapshot(2, DashboardExecutionStatus.CANCELLED, completed=1)
+
+    assert resource.start_worker(
+        _snapshot(0, DashboardExecutionStatus.RUNNING, completed=0),
+        task,
+    )
+    session.set_asr_readiness(
+        LocalMicrophoneASRReadiness.WARMING_UP,
+        resource=resource,
+    )
+    session.set_asr_readiness(
+        LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+        resource=resource,
+    )
+    session.start(arrived_at_utc=NOW)
+    session.accept_frame(av.AudioFrame(), arrived_at_utc=NOW)
+    session.disconnect(arrived_at_utc=NOW)
+
+    assert first_processed.wait(timeout=2)
+    resource.join_worker()
+    latest = resource.latest_snapshot
+    assert latest is not None
+    assert latest.revision == 2
+    assert latest.processed_chunks == 1
+    assert session.diagnostics.end_emitted
+    assert not capability.active
 
 
 def test_scope_isolation_and_wrong_scope_lookup_fail_closed() -> None:

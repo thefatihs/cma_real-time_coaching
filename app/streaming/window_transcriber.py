@@ -1,7 +1,9 @@
 """In-memory transcription of tenant-aware ASR audio windows."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from numbers import Real
+from time import perf_counter
 from typing import Protocol
 
 import av
@@ -35,6 +37,7 @@ class WindowTranscriptionResult:
     language_probability: float
     processing_time_seconds: float
     segments: tuple[WindowTranscriptionSegment, ...]
+    audio_preparation_time_seconds: float = 0.0
 
 
 class InMemoryASREngine(Protocol):
@@ -47,8 +50,14 @@ class WindowTranscriber:
     _SUPPORTED_CODEC = "pcm_s16le"
     _TIMESTAMP_TOLERANCE_SECONDS = 1e-6
 
-    def __init__(self, engine: InMemoryASREngine) -> None:
+    def __init__(
+        self,
+        engine: InMemoryASREngine,
+        *,
+        clock: Callable[[], float] = perf_counter,
+    ) -> None:
         self._engine = engine
+        self._clock = clock
 
     def transcribe(self, window: ASRAudioWindow) -> WindowTranscriptionResult:
         if (
@@ -58,7 +67,9 @@ class WindowTranscriber:
         ):
             raise ValueError("ASR window times must be non-negative and ordered")
 
+        preparation_started = self._clock()
         waveform = prepare_whisper_waveform(window)
+        audio_preparation_time = max(self._clock() - preparation_started, 0.0)
         engine_result = self._engine.transcribe_audio(waveform)
 
         segments: list[WindowTranscriptionSegment] = []
@@ -106,6 +117,7 @@ class WindowTranscriber:
             language_probability=engine_result.language_probability,
             processing_time_seconds=max(0.0, engine_result.processing_time_seconds),
             segments=tuple(segments),
+            audio_preparation_time_seconds=audio_preparation_time,
         )
 
 

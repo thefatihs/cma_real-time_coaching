@@ -6,6 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 
+from app.audio_ingress.local_microphone import LocalMicrophoneSessionProtocol
 from app.calls.models import CallState
 from app.classification.artifacts import load_training_metadata, sha256_file
 from app.classification.calibration import sha256_directory
@@ -32,6 +33,7 @@ from app.streaming.pipeline import (
     StreamingASRStep,
     WindowTranscriberProtocol,
 )
+from app.tenancy.models import TenantASRConfig
 from live_dashboard.demo_data import TenantDemo
 from live_dashboard.view_models import (
     DashboardExecutionSnapshot,
@@ -126,6 +128,7 @@ class DashboardExecutionResource:
         self._manager = None if integration is None else integration.background_manager
         self._pipeline: StreamingASRPipeline | None = None
         self._completion_pump: CoachingCompletionPumpProtocol | None = None
+        self._microphone_session: LocalMicrophoneSessionProtocol | None = None
         self._worker: Thread | None = None
         self._cancellation = Event()
         self._latest_snapshot: DashboardExecutionSnapshot | None = None
@@ -164,6 +167,11 @@ class DashboardExecutionResource:
         with self._lock:
             worker = self._worker
             return worker is not None and worker.is_alive()
+
+    @property
+    def microphone_session(self) -> LocalMicrophoneSessionProtocol | None:
+        with self._lock:
+            return self._microphone_session
 
     @property
     def diagnostics(self) -> DashboardExecutionDiagnostics:
@@ -298,6 +306,27 @@ class DashboardExecutionResource:
                 raise RuntimeError("dashboard completion pump is already attached")
             self._completion_pump = processor
 
+    def attach_microphone_session(
+        self,
+        session: LocalMicrophoneSessionProtocol,
+    ) -> None:
+        if not isinstance(session, LocalMicrophoneSessionProtocol):
+            raise ValueError("session must satisfy LocalMicrophoneSessionProtocol")
+        if not session.capability.authorizes(
+            tenant_id=self._identity.tenant_id,
+            call_id=self._identity.call_id,
+            resource=self,
+        ):
+            raise ValueError("local microphone session scope does not match")
+        with self._lock:
+            self._require_open()
+            if (
+                self._microphone_session is not None
+                and self._microphone_session is not session
+            ):
+                raise RuntimeError("local microphone session is already attached")
+            self._microphone_session = session
+
     def drain_completed(
         self,
         *,
@@ -314,12 +343,15 @@ class DashboardExecutionResource:
         self._cancellation.set()
         self.join_worker()
         manager = None
+        microphone_session = None
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             self._pipeline = None
             self._completion_pump = None
+            microphone_session = self._microphone_session
+            self._microphone_session = None
             self._worker = None
             if not self._manager_closed:
                 self._manager_closed = True
@@ -328,6 +360,8 @@ class DashboardExecutionResource:
             self._integration = None
         if manager is not None:
             manager.close(wait=False)
+        if microphone_session is not None:
+            microphone_session.close()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -501,6 +535,7 @@ def build_live_pipeline(
     classifier_provider: ClassifierProvider,
     integration: RAGCoachingIntegrationDependencies | None = None,
     execution_resource: DashboardExecutionResource | None = None,
+    asr_config: TenantASRConfig | None = None,
 ) -> StreamingASRPipeline:
     """Build one uploaded-audio pipeline with optional existing services."""
     classifier = (
@@ -539,7 +574,7 @@ def build_live_pipeline(
     )
     pipeline = StreamingASRPipeline(
         runtime.tenant.config.context,
-        runtime.tenant.config.asr,
+        asr_config or runtime.tenant.config.asr,
         window_transcriber,
         runtime_classifier=classifier,
         coaching_coordinator_factory=coaching_factory,

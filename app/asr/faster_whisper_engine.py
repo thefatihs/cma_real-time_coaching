@@ -1,9 +1,12 @@
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from math import isfinite
+from threading import Lock
 from time import perf_counter
 from typing import Any, Protocol, cast
 
+import numpy as np
 from numpy.typing import NDArray
 
 from app.asr.models import (
@@ -24,6 +27,12 @@ class _WhisperModelProtocol(Protocol):
 
 
 type _WhisperModelConstructor = Callable[..., _WhisperModelProtocol]
+
+
+@dataclass(frozen=True, slots=True)
+class ASRModelPreparationTiming:
+    model_loading_seconds: float
+    warmup_inference_seconds: float
 
 
 def _load_whisper_model_constructor() -> _WhisperModelConstructor:
@@ -63,6 +72,7 @@ class FasterWhisperEngine:
             raise ValueError("max_skipped_zero_duration_words must be non-negative")
         self.max_skipped_zero_duration_words = max_skipped_zero_duration_words
         self._model: _WhisperModelProtocol | None = None
+        self._model_lock = Lock()
 
     def _create_model(self) -> _WhisperModelProtocol:
         model_constructor = _load_whisper_model_constructor()
@@ -74,9 +84,55 @@ class FasterWhisperEngine:
         )
 
     def _get_model(self) -> _WhisperModelProtocol:
-        if self._model is None:
-            self._model = self._create_model()
+        if self._model is not None:
+            return self._model
+        with self._model_lock:
+            if self._model is None:
+                self._model = self._create_model()
         return self._model
+
+    def prepare(
+        self,
+        *,
+        warmup_duration_seconds: float = 0.25,
+        clock: Callable[[], float] = perf_counter,
+    ) -> ASRModelPreparationTiming:
+        """Load exactly once, then run one bounded synthetic-silence warm-up."""
+        model_loading_seconds = self.load_model(clock=clock)
+        warmup_inference_seconds = self.warm_up(
+            duration_seconds=warmup_duration_seconds,
+            clock=clock,
+        )
+        return ASRModelPreparationTiming(
+            model_loading_seconds=model_loading_seconds,
+            warmup_inference_seconds=warmup_inference_seconds,
+        )
+
+    def load_model(
+        self,
+        *,
+        clock: Callable[[], float] = perf_counter,
+    ) -> float:
+        """Materialize model weights once and report only that elapsed time."""
+        loading_started = clock()
+        self._get_model()
+        return max(clock() - loading_started, 0.0)
+
+    def warm_up(
+        self,
+        *,
+        duration_seconds: float = 0.25,
+        clock: Callable[[], float] = perf_counter,
+    ) -> float:
+        """Run one bounded in-memory synthetic-silence inference."""
+        if not isfinite(duration_seconds) or duration_seconds <= 0:
+            raise ValueError("duration_seconds must be finite and positive")
+        self._get_model()
+        samples = max(int(round(duration_seconds * 16_000)), 1)
+        silence = np.zeros(samples, dtype=np.float32)
+        warmup_started = clock()
+        self.transcribe_audio(silence)
+        return max(clock() - warmup_started, 0.0)
 
     def transcribe_file(self, audio_path: Path) -> TranscriptionResult:
         self._validate_audio_path(audio_path)

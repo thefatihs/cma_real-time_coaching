@@ -39,6 +39,7 @@ from live_dashboard.view_models import (
     DashboardExecutionStatus,
     advance_runtime,
     apply_feedback,
+    consume_live_step,
     create_local_execution,
     create_runtime,
     dashboard_tabs,
@@ -629,6 +630,25 @@ def test_execution_snapshot_is_bounded_immutable_and_exposes_current_progress() 
     assert len(snapshot.tabs.technical.asr_chart) <= 64
     with pytest.raises((AttributeError, TypeError)):
         snapshot.revision = 4  # type: ignore[misc]
+
+
+def test_live_step_updates_latest_only_state_with_exact_scope() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    step = fake_pipeline_result().steps[0]
+
+    consume_live_step(state, step, elapsed_seconds=0.25)
+
+    assert state.status == "running"
+    assert state.current_chunk == 1
+    assert state.latest_step is step
+    assert state.elapsed_seconds == 0.25
+
+    with pytest.raises(ValueError, match="scope does not match"):
+        consume_live_step(
+            state,
+            replace(step, call_id="other-call"),
+            elapsed_seconds=0.5,
+        )
 
 
 def test_progress_percentage_eta_and_completed_state() -> None:

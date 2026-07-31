@@ -1,10 +1,12 @@
 """Professional synthetic and opt-in local-file coaching dashboard."""
 
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 from time import perf_counter
+from typing import cast
 
 import streamlit as st
 
@@ -14,15 +16,24 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.asr.faster_whisper_engine import FasterWhisperEngine  # noqa: E402
+from app.audio_ingress.local_microphone import (  # noqa: E402
+    LocalMicrophoneASRReadiness,
+    LocalMicrophoneIngressSession,
+    LocalMicrophoneStatus,
+    LocalMicrophoneTerminalReason,
+    create_local_mic_test_capability,
+    local_microphone_test_enabled,
+)
 from app.classification.runtime import RuntimeSetFitClassifier  # noqa: E402
 from app.classification.streaming import ProvisionalClassificationPolicy  # noqa: E402
-from app.events.models import CoachingSuggestionLifecycle  # noqa: E402
+from app.events.models import AudioChunkEvent, CoachingSuggestionLifecycle  # noqa: E402
 from app.streaming.pipeline import (  # noqa: E402
     StreamingASRPipeline,
     StreamingASRPlan,
     StreamingASRStep,
 )
 from app.streaming.window_transcriber import WindowTranscriber  # noqa: E402
+from app.tenancy.models import TenantASRConfig  # noqa: E402
 from live_dashboard.demo_data import scenario_for, tenant_demos  # noqa: E402
 from live_dashboard.runtime_wiring import (  # noqa: E402
     ArtifactAvailability,
@@ -55,6 +66,11 @@ from live_dashboard.presentation import (  # noqa: E402
     synchronize_ui_scope,
     ui_scope_identity,
 )
+from live_dashboard.local_microphone import (  # noqa: E402
+    LOCAL_MIC_WARNING_LINES,
+    local_microphone_connection_view,
+    microphone_webrtc_streamer,
+)
 from live_dashboard.uploaded_audio import (  # noqa: E402
     SUPPORTED_UPLOAD_SUFFIXES,
     SafeUploadMetadata,
@@ -76,6 +92,7 @@ from live_dashboard.view_models import (  # noqa: E402
     advance_runtime,
     create_local_execution,
     create_runtime,
+    consume_live_step,
     dashboard_tabs,
     execute_local_once,
     execution_snapshot,
@@ -100,7 +117,31 @@ _EXECUTION_RESOURCE_CAPACITY = 8
 _EXECUTION_RESOURCE_SESSION_KEY = "dashboard_execution_resource_key"
 _RAG_RUNTIME_STATUS_SESSION_KEY = "dashboard_rag_runtime_status"
 _RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
+_LOCAL_MIC_ASR_MODEL_NAME = "tiny"
+_LOCAL_MIC_ASR_COMPUTE_TYPE = "int8"
+_LOCAL_MIC_ASR_CPU_THREADS = 4
+_LOCAL_MIC_ASR_BEAM_SIZE = 1
+_LOCAL_MIC_ASR_ROLLING_WINDOW_SECONDS = 6.0
+_LOCAL_MIC_ASR_STABLE_REGION_SECONDS = 2.0
 _EXECUTION_STAGE_TEXT = {
+    DashboardExecutionStage.PREPARING_MODEL: (
+        "Konuşma modeli hazırlanıyor; henüz konuşmayın"
+    ),
+    DashboardExecutionStage.WARMING_UP: (
+        "Konuşma modeli hazırlanıyor; henüz konuşmayın"
+    ),
+    DashboardExecutionStage.READY_TO_CAPTURE: "Mikrofon hazır; konuşabilirsiniz",
+    DashboardExecutionStage.MODEL_PREPARATION_FAILED: (
+        "Konuşma modeli hazırlanamadı; mikrofon testi başlatılamadı"
+    ),
+    DashboardExecutionStage.PERMISSION_PENDING: "Mikrofon izni bekleniyor",
+    DashboardExecutionStage.MICROPHONE_READY: "Mikrofon hazır",
+    DashboardExecutionStage.LIVE_AUDIO: "Canlı ses işleniyor",
+    DashboardExecutionStage.TRANSCRIPT_UPDATING: "Konuşma metni güncelleniyor",
+    DashboardExecutionStage.COACHING_UPDATING: "Anlık öneri hazırlanıyor",
+    DashboardExecutionStage.STOP_REQUESTED: "Mikrofon durduruluyor",
+    DashboardExecutionStage.MICROPHONE_DISCONNECTED: ("Mikrofon bağlantısı kesildi"),
+    DashboardExecutionStage.MICROPHONE_OVERLOADED: ("Ses kuyruğu kapasitesi aşıldı"),
     DashboardExecutionStage.STARTING: "Analiz başlatılıyor",
     DashboardExecutionStage.FILE_PREPARING: "Ses dosyası hazırlanıyor",
     DashboardExecutionStage.ENGINE_RUNNING: "Analiz motoru çalışıyor",
@@ -112,6 +153,7 @@ _EXECUTION_STAGE_TEXT = {
 _EXECUTION_MODE_TEXT = {
     DashboardExecutionMode.FAST_ANALYSIS: "Hızlı analiz",
     DashboardExecutionMode.REALTIME_SIMULATION: "Gerçek zaman simülasyonu",
+    DashboardExecutionMode.LOCAL_MIC_TEST: "Tek konuşmacılı mikrofon testi",
 }
 
 
@@ -133,6 +175,38 @@ def _load_asr_model(
         vad_filter=vad_filter,
         condition_on_previous_text=condition_on_previous_text,
         initial_prompt=initial_prompt,
+    )
+
+
+def _local_microphone_asr_config(runtime: DashboardRuntime) -> TenantASRConfig:
+    """Return an explicit local-only CPU preset without mutating tenant config."""
+    source = runtime.tenant.config.asr.model_dump()
+    source.update(
+        {
+            "model_name": _LOCAL_MIC_ASR_MODEL_NAME,
+            "beam_size": _LOCAL_MIC_ASR_BEAM_SIZE,
+            "vad_filter": False,
+            "rolling_window_seconds": _LOCAL_MIC_ASR_ROLLING_WINDOW_SECONDS,
+            "chunk_duration_seconds": 2.0,
+            "stable_region_seconds": _LOCAL_MIC_ASR_STABLE_REGION_SECONDS,
+        }
+    )
+    return TenantASRConfig.model_validate(source)
+
+
+def _create_local_microphone_asr_engine(
+    config: TenantASRConfig,
+) -> FasterWhisperEngine:
+    return FasterWhisperEngine(
+        config.model_name,
+        device="cpu",
+        compute_type=_LOCAL_MIC_ASR_COMPUTE_TYPE,
+        language=config.language,
+        beam_size=config.beam_size,
+        cpu_threads=_LOCAL_MIC_ASR_CPU_THREADS,
+        vad_filter=config.vad_filter,
+        condition_on_previous_text=config.condition_on_previous_text,
+        initial_prompt=config.initial_prompt,
     )
 
 
@@ -231,6 +305,483 @@ def _make_pipeline(
         integration=execution_resource.integration,
         execution_resource=execution_resource,
     )
+
+
+def _local_microphone_resource(
+    runtime: DashboardRuntime,
+) -> DashboardExecutionResource:
+    identity = DashboardExecutionIdentity(
+        runtime.tenant.config.context.tenant_id,
+        runtime.call_id,
+    )
+    previous_key = st.session_state.get(_EXECUTION_RESOURCE_SESSION_KEY)
+    if previous_key is not None and previous_key != identity.opaque_key:
+        if not isinstance(previous_key, str):
+            raise ValueError("dashboard execution resource key is invalid")
+        _rag_runtime_controller(_EXECUTION_RESOURCE_CAPACITY).close_and_remove(
+            previous_key
+        )
+    registry = _execution_resource_registry(_EXECUTION_RESOURCE_CAPACITY)
+    resource = registry.find(
+        tenant_id=identity.tenant_id,
+        call_id=identity.call_id,
+    )
+    if resource is None:
+        resource = registry.acquire(
+            tenant_id=identity.tenant_id,
+            call_id=identity.call_id,
+            integration=None,
+        )
+    st.session_state[_EXECUTION_RESOURCE_SESSION_KEY] = resource.opaque_key
+    return resource
+
+
+def _local_microphone_session(
+    runtime: DashboardRuntime,
+    resource: DashboardExecutionResource,
+) -> LocalMicrophoneIngressSession:
+    existing = resource.microphone_session
+    if existing is not None:
+        return cast(LocalMicrophoneIngressSession, existing)
+    server_address = st.get_option("server.address")
+    capability = create_local_mic_test_capability(
+        tenant_id=runtime.call_state.tenant_id,
+        call_id=runtime.call_id,
+        resource=resource,
+        server_address=(server_address if isinstance(server_address, str) else None),
+    )
+    session = LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+    return session
+
+
+def _start_local_microphone_worker(
+    *,
+    local: LocalExecutionState,
+    resource: DashboardExecutionResource,
+    session: LocalMicrophoneIngressSession,
+    selection: DashboardServiceSelection,
+    availability: ArtifactAvailability,
+) -> bool:
+    if resource.worker_active or resource.latest_snapshot is not None:
+        return False
+    local.request_start()
+    local.start_requested = False
+    local.status = "running"
+    local.pipeline_calls += 1
+    local.stage = _EXECUTION_STAGE_TEXT[DashboardExecutionStage.PREPARING_MODEL]
+    initial = execution_snapshot(
+        local,
+        revision=0,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+        execution_stage=DashboardExecutionStage.PREPARING_MODEL,
+    )
+
+    def run_microphone(
+        cancellation: Event,
+        publish: Callable[[DashboardExecutionSnapshot], None],
+    ) -> DashboardExecutionSnapshot:
+        revision = 0
+        started_at = perf_counter()
+        try:
+            asr_config = _local_microphone_asr_config(local.runtime)
+            construction_started = perf_counter()
+            engine = _create_local_microphone_asr_engine(asr_config)
+            session.record_asr_preparation(
+                resource=resource,
+                engine_construction_seconds=max(
+                    perf_counter() - construction_started,
+                    0.0,
+                ),
+            )
+            model_loading_seconds = engine.load_model()
+            session.record_asr_preparation(
+                resource=resource,
+                model_loading_seconds=model_loading_seconds,
+            )
+            session.set_asr_readiness(
+                LocalMicrophoneASRReadiness.WARMING_UP,
+                resource=resource,
+            )
+            revision += 1
+            local.stage = _EXECUTION_STAGE_TEXT[DashboardExecutionStage.WARMING_UP]
+            publish(
+                execution_snapshot(
+                    local,
+                    revision=revision,
+                    lifecycle_status=DashboardExecutionStatus.RUNNING,
+                    execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+                    execution_stage=DashboardExecutionStage.WARMING_UP,
+                )
+            )
+            warmup_seconds = engine.warm_up()
+            session.record_asr_preparation(
+                resource=resource,
+                warmup_seconds=warmup_seconds,
+            )
+            pipeline = build_live_pipeline(
+                local.runtime,
+                WindowTranscriber(engine),
+                selection=selection,
+                availability=availability,
+                classifier_provider=_load_runtime_classifier,
+                integration=resource.integration,
+                execution_resource=resource,
+                asr_config=asr_config,
+            )
+            pipeline.configure_provisional_coaching(
+                ProvisionalClassificationPolicy(enabled=True)
+            )
+            session.set_asr_readiness(
+                LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+                resource=resource,
+            )
+            revision += 1
+            local.stage = _EXECUTION_STAGE_TEXT[
+                DashboardExecutionStage.READY_TO_CAPTURE
+            ]
+            publish(
+                execution_snapshot(
+                    local,
+                    revision=revision,
+                    lifecycle_status=DashboardExecutionStatus.RUNNING,
+                    execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+                    execution_stage=DashboardExecutionStage.READY_TO_CAPTURE,
+                )
+            )
+
+            def show_step(step: StreamingASRStep) -> None:
+                nonlocal revision
+                if cancellation.is_set():
+                    raise RuntimeError("dashboard_execution_cancelled")
+                consume_live_step(
+                    local,
+                    step,
+                    elapsed_seconds=perf_counter() - started_at,
+                )
+                session.record_asr_inference(
+                    resource=resource,
+                    audio_preparation_seconds=(step.audio_preparation_time_seconds),
+                    inference_seconds=step.transcription_time_seconds,
+                )
+                revision += 1
+                stage = (
+                    DashboardExecutionStage.COACHING_UPDATING
+                    if step.coaching_outcomes
+                    else DashboardExecutionStage.TRANSCRIPT_UPDATING
+                )
+                local.stage = _EXECUTION_STAGE_TEXT[stage]
+                publish(
+                    execution_snapshot(
+                        local,
+                        revision=revision,
+                        lifecycle_status=DashboardExecutionStatus.RUNNING,
+                        execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+                        execution_stage=stage,
+                    )
+                )
+
+            streaming_stage_published = False
+
+            def live_chunks() -> Iterable[AudioChunkEvent]:
+                nonlocal revision, streaming_stage_published
+                for chunk in session.iter_audio_chunks(cancellation=cancellation):
+                    if not streaming_stage_published:
+                        streaming_stage_published = True
+                        revision += 1
+                        local.stage = _EXECUTION_STAGE_TEXT[
+                            DashboardExecutionStage.LIVE_AUDIO
+                        ]
+                        publish(
+                            execution_snapshot(
+                                local,
+                                revision=revision,
+                                lifecycle_status=(DashboardExecutionStatus.RUNNING),
+                                execution_mode=(DashboardExecutionMode.LOCAL_MIC_TEST),
+                                execution_stage=(DashboardExecutionStage.LIVE_AUDIO),
+                            )
+                        )
+                    yield chunk
+
+            result = pipeline.run_live(
+                live_chunks(),
+                local.runtime.call_id,
+                capability=session.capability,
+                execution_resource=resource,
+                cancellation=cancellation,
+                step_callback=show_step,
+                retain_history=False,
+            )
+            local.processing_seconds = max(perf_counter() - started_at, 0.0)
+            local.audio_duration_seconds = result.audio_duration_seconds
+            session_status = session.diagnostics.status
+            if cancellation.is_set():
+                lifecycle_status = DashboardExecutionStatus.CANCELLED
+                execution_stage = DashboardExecutionStage.CANCELLED
+                local.status = "cancelled"
+                local.stage = "Mikrofon durduruldu"
+            elif session_status is LocalMicrophoneStatus.DISCONNECTED:
+                lifecycle_status = DashboardExecutionStatus.CANCELLED
+                execution_stage = DashboardExecutionStage.MICROPHONE_DISCONNECTED
+                local.status = "cancelled"
+                local.stage = _EXECUTION_STAGE_TEXT[execution_stage]
+            elif session_status is LocalMicrophoneStatus.OVERLOADED:
+                lifecycle_status = DashboardExecutionStatus.FAILED
+                execution_stage = DashboardExecutionStage.MICROPHONE_OVERLOADED
+                local.status = "error"
+                local.stage = _EXECUTION_STAGE_TEXT[execution_stage]
+            elif session_status is LocalMicrophoneStatus.FAILED:
+                lifecycle_status = DashboardExecutionStatus.FAILED
+                execution_stage = DashboardExecutionStage.FAILED
+                local.status = "error"
+                local.stage = "Mikrofon testi başarısız"
+            else:
+                lifecycle_status = DashboardExecutionStatus.COMPLETED
+                execution_stage = DashboardExecutionStage.COMPLETED
+                local.status = "completed"
+                local.stage = "Mikrofon durduruldu"
+            revision += 1
+            return execution_snapshot(
+                local,
+                revision=revision,
+                lifecycle_status=lifecycle_status,
+                execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+                execution_stage=execution_stage,
+            )
+        except Exception:
+            cancelled = cancellation.is_set()
+            preparation_failed = session.diagnostics.asr_readiness in {
+                LocalMicrophoneASRReadiness.PREPARING_MODEL,
+                LocalMicrophoneASRReadiness.WARMING_UP,
+            }
+            if cancelled:
+                session.close(LocalMicrophoneTerminalReason.RESOURCE_CLOSED)
+            else:
+                session.fail()
+            local.status = "cancelled" if cancelled else "error"
+            local.stage = (
+                "Mikrofon durduruldu"
+                if cancelled
+                else _EXECUTION_STAGE_TEXT[
+                    (
+                        DashboardExecutionStage.MODEL_PREPARATION_FAILED
+                        if preparation_failed
+                        else DashboardExecutionStage.FAILED
+                    )
+                ]
+            )
+            revision += 1
+            return execution_snapshot(
+                local,
+                revision=revision,
+                lifecycle_status=(
+                    DashboardExecutionStatus.CANCELLED
+                    if cancelled
+                    else DashboardExecutionStatus.FAILED
+                ),
+                execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+                execution_stage=(
+                    DashboardExecutionStage.CANCELLED
+                    if cancelled
+                    else (
+                        DashboardExecutionStage.MODEL_PREPARATION_FAILED
+                        if preparation_failed
+                        else DashboardExecutionStage.FAILED
+                    )
+                ),
+                failure_reason=None if cancelled else "processing_failed",
+            )
+
+    return resource.start_worker(initial, run_microphone)
+
+
+def _render_local_microphone_controls(
+    *,
+    local: LocalExecutionState,
+    selection: DashboardServiceSelection,
+    availability: ArtifactAvailability,
+) -> tuple[DashboardExecutionResource, LocalMicrophoneIngressSession] | None:
+    """Render the retained WebRTC component in the same fragment as polling."""
+    try:
+        resource = _local_microphone_resource(local.runtime)
+        session = _local_microphone_session(local.runtime, resource)
+        if resource.latest_snapshot is None:
+            _start_local_microphone_worker(
+                local=local,
+                resource=resource,
+                session=session,
+                selection=selection,
+                availability=availability,
+            )
+        diagnostics = session.diagnostics
+        if (
+            st.session_state.get("local_mic_reset_pending", False)
+            and not resource.worker_active
+        ):
+            _close_execution_resource()
+            st.session_state.pop("local_signature", None)
+            st.session_state.pop("local_mic_desired_playing", None)
+            st.session_state.pop("local_mic_reset_pending", None)
+            st.session_state.suggestion_feedback = {}
+            st.rerun(scope="fragment")
+            return
+        if diagnostics.asr_readiness not in {
+            LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+            LocalMicrophoneASRReadiness.STREAMING,
+        }:
+            if diagnostics.asr_readiness is LocalMicrophoneASRReadiness.FAILED:
+                st.error(
+                    _EXECUTION_STAGE_TEXT[
+                        DashboardExecutionStage.MODEL_PREPARATION_FAILED
+                    ]
+                )
+            else:
+                st.info(
+                    _EXECUTION_STAGE_TEXT[
+                        (
+                            DashboardExecutionStage.WARMING_UP
+                            if diagnostics.asr_readiness
+                            is LocalMicrophoneASRReadiness.WARMING_UP
+                            else DashboardExecutionStage.PREPARING_MODEL
+                        )
+                    ]
+                )
+            timings = diagnostics.asr_timings
+            preparation_cards = [
+                StatusCardViewModel(
+                    "Yerel mikrofon modeli",
+                    f"{_LOCAL_MIC_ASR_MODEL_NAME} · CPU {_LOCAL_MIC_ASR_COMPUTE_TYPE}",
+                )
+            ]
+            if timings.model_loading_seconds is not None:
+                preparation_cards.append(
+                    StatusCardViewModel(
+                        "Model yükleme",
+                        f"{timings.model_loading_seconds:.2f} sn",
+                    )
+                )
+            if timings.warmup_seconds is not None:
+                preparation_cards.append(
+                    StatusCardViewModel(
+                        "Model ısınma",
+                        f"{timings.warmup_seconds:.2f} sn",
+                    )
+                )
+            _metric_rows(tuple(preparation_cards))
+            if st.button(
+                "Mikrofon testini sıfırla",
+                use_container_width=True,
+            ):
+                session.close(LocalMicrophoneTerminalReason.RESET)
+                resource.cancel()
+                st.session_state.local_mic_reset_pending = True
+                st.rerun(scope="fragment")
+            return resource, session
+        context = microphone_webrtc_streamer(
+            session=session,
+            key=session.component_key,
+            desired_playing_state=st.session_state.get("local_mic_desired_playing"),
+        )
+        if (
+            st.session_state.get("local_mic_reset_pending", False)
+            and not context.state.playing
+            and not context.state.signalling
+        ):
+            _close_execution_resource()
+            st.session_state.pop("local_signature", None)
+            st.session_state.pop("local_mic_desired_playing", None)
+            st.session_state.pop("local_mic_reset_pending", None)
+            st.session_state.suggestion_feedback = {}
+            st.rerun(scope="fragment")
+            return
+        connection = local_microphone_connection_view(session)
+        st.info(connection.status_text)
+        diagnostic_cards: list[StatusCardViewModel] = [
+            StatusCardViewModel(
+                "Alınan ses parçası",
+                str(connection.received_chunk_count),
+            ),
+            StatusCardViewModel(
+                "İşlenen ses",
+                f"{connection.processed_audio_seconds:.2f} sn",
+            ),
+            StatusCardViewModel("Bağlantı", connection.status_text),
+        ]
+        if connection.estimated_latency_seconds is not None:
+            diagnostic_cards.append(
+                StatusCardViewModel(
+                    "Tahmini gecikme",
+                    f"{connection.estimated_latency_seconds * 1000:.0f} ms",
+                )
+            )
+        timings = diagnostics.asr_timings
+        for label, value in (
+            ("Model yükleme", timings.model_loading_seconds),
+            ("Model ısınma", timings.warmup_seconds),
+            ("İlk ses hazırlama", timings.first_audio_preparation_seconds),
+            ("İlk ASR çıkarımı", timings.first_inference_seconds),
+        ):
+            if value is not None:
+                diagnostic_cards.append(StatusCardViewModel(label, f"{value:.2f} sn"))
+        _metric_rows(tuple(diagnostic_cards))
+        if st.button(
+            "Mikrofonu durdur",
+            disabled=not context.state.playing,
+            use_container_width=True,
+        ):
+            session.request_stop()
+            st.session_state.local_mic_desired_playing = False
+            st.rerun(scope="fragment")
+        if st.button("Mikrofon testini sıfırla", use_container_width=True):
+            session.close(LocalMicrophoneTerminalReason.RESET)
+            resource.cancel()
+            st.session_state.local_mic_desired_playing = False
+            st.session_state.local_mic_reset_pending = True
+            st.rerun(scope="fragment")
+        return resource, session
+    except Exception:
+        local.status = "error"
+        local.stage = "Mikrofon testi başarısız"
+        local.error_message = "Mikrofon testi güvenli biçimde başlatılamadı."
+        st.error(local.error_message)
+        return None
+
+
+def _local_microphone_presentation_snapshot(
+    snapshot: DashboardExecutionSnapshot,
+    status: LocalMicrophoneStatus,
+) -> DashboardExecutionSnapshot:
+    """Project current terminal intent without mutating the worker mailbox."""
+    if snapshot.lifecycle_status is not DashboardExecutionStatus.RUNNING:
+        return snapshot
+    if status is LocalMicrophoneStatus.STOP_REQUESTED:
+        return replace(
+            snapshot,
+            execution_stage=DashboardExecutionStage.STOP_REQUESTED,
+        )
+    if status is LocalMicrophoneStatus.DISCONNECTED:
+        return replace(
+            snapshot,
+            lifecycle_status=DashboardExecutionStatus.CANCELLED,
+            execution_stage=DashboardExecutionStage.MICROPHONE_DISCONNECTED,
+        )
+    if status is LocalMicrophoneStatus.OVERLOADED:
+        return replace(
+            snapshot,
+            lifecycle_status=DashboardExecutionStatus.FAILED,
+            execution_stage=DashboardExecutionStage.MICROPHONE_OVERLOADED,
+        )
+    if status is LocalMicrophoneStatus.FAILED:
+        return replace(
+            snapshot,
+            lifecycle_status=DashboardExecutionStatus.FAILED,
+            execution_stage=DashboardExecutionStage.FAILED,
+        )
+    return snapshot
 
 
 def _synthetic_runtime() -> DashboardRuntime:
@@ -501,12 +1052,21 @@ def _render_technical(
         return
     technical = view.technical
     progress = technical.progress
+    chunk_progress = (
+        f"{progress.completed_chunks}/{progress.total_chunks}"
+        if progress.total_chunks
+        else f"{progress.completed_chunks} · Toplam bilinmiyor"
+    )
+    completion = (
+        f"%{progress.percentage:.0f}" if progress.total_chunks else "Hesaplanıyor"
+    )
+    remaining = progress.eta if progress.total_chunks else "Toplam süre bilinmiyor"
     metrics = (
-        ("Parça", f"{progress.completed_chunks}/{progress.total_chunks}"),
-        ("Tamamlanma", f"%{progress.percentage:.0f}"),
+        ("Parça", chunk_progress),
+        ("Tamamlanma", completion),
         ("Ses / pencere", progress.time_range),
         ("Geçen süre", progress.elapsed),
-        ("Tahmini kalan", progress.eta),
+        ("Tahmini kalan", remaining),
         ("Ortalama ASR", progress.average_asr),
         ("Son ASR", technical.last_asr),
         ("Toplam işlem", technical.total_processing),
@@ -748,6 +1308,37 @@ def _render_execution_status(snapshot: DashboardExecutionSnapshot) -> None:
             f"{snapshot.total_chunks} işleniyor"
         )
     mode_text = _EXECUTION_MODE_TEXT[snapshot.execution_mode]
+    microphone_mode = snapshot.execution_mode is DashboardExecutionMode.LOCAL_MIC_TEST
+    if (
+        microphone_mode
+        and snapshot.execution_stage is DashboardExecutionStage.MODEL_PREPARATION_FAILED
+    ):
+        stage_text = _EXECUTION_STAGE_TEXT[
+            DashboardExecutionStage.MODEL_PREPARATION_FAILED
+        ]
+    elif (
+        microphone_mode
+        and snapshot.execution_stage is DashboardExecutionStage.MICROPHONE_DISCONNECTED
+    ):
+        stage_text = _EXECUTION_STAGE_TEXT[
+            DashboardExecutionStage.MICROPHONE_DISCONNECTED
+        ]
+    elif (
+        microphone_mode
+        and snapshot.execution_stage is DashboardExecutionStage.MICROPHONE_OVERLOADED
+    ):
+        stage_text = _EXECUTION_STAGE_TEXT[
+            DashboardExecutionStage.MICROPHONE_OVERLOADED
+        ]
+    elif microphone_mode and snapshot.lifecycle_status in {
+        DashboardExecutionStatus.COMPLETED,
+        DashboardExecutionStatus.CANCELLED,
+    }:
+        stage_text = "Mikrofon durduruldu"
+    elif (
+        microphone_mode and snapshot.lifecycle_status is DashboardExecutionStatus.FAILED
+    ):
+        stage_text = "Mikrofon testi başarısız"
     message = f"{stage_text} · {mode_text}"
     if snapshot.lifecycle_status is DashboardExecutionStatus.COMPLETED:
         st.success(message)
@@ -766,6 +1357,8 @@ def _render_execution_status(snapshot: DashboardExecutionSnapshot) -> None:
         chunk_progress = (
             f"{snapshot.processed_chunks}/{snapshot.total_chunks} · %{percentage:.0f}"
         )
+    elif microphone_mode:
+        chunk_progress = f"{snapshot.processed_chunks} parça · Canlı oturum"
     else:
         chunk_progress = (
             f"{snapshot.processed_chunks} parça · Toplam henüz hesaplanıyor"
@@ -808,6 +1401,14 @@ upload_session = st.session_state.setdefault(
 )
 local_state_for_render: LocalExecutionState | None = None
 ui_scope: UIScopeIdentity | None = None
+configured_server_address = st.get_option("server.address")
+local_microphone_gate = local_microphone_test_enabled(
+    server_address=(
+        configured_server_address
+        if isinstance(configured_server_address, str)
+        else None
+    )
+)
 with st.sidebar:
     st.header("Kontroller")
     with st.expander("Görüşme", expanded=True):
@@ -839,15 +1440,21 @@ with st.sidebar:
             )
             st.slider("Oynatma hızı", 0.5, 2.0, 1.0, 0.5, key="playback_speed")
         else:
+            local_source_options = ["Dosya yükle", "Yerel yol"]
+            if local_microphone_gate:
+                local_source_options.append("Tek konuşmacılı mikrofon testi")
             source_mode = st.radio(
-                "Ses kaynağı", ("Dosya yükle", "Yerel yol"), horizontal=True
+                "Ses kaynağı", tuple(local_source_options), horizontal=True
             )
             ui_scope = ui_scope_identity(
                 tenant_id=tenant_id,
                 call_id=str(st.session_state.call_id),
                 source_mode=source_mode,
             )
-            synchronize_ui_scope(st.session_state, ui_scope)
+            if synchronize_ui_scope(st.session_state, ui_scope):
+                _close_execution_resource()
+                st.session_state.pop("local_mic_desired_playing", None)
+                st.session_state.pop("local_mic_reset_pending", None)
             if source_mode == "Dosya yükle":
                 uploaded = st.file_uploader(
                     "Ses dosyası",
@@ -872,14 +1479,18 @@ with st.sidebar:
                         f"Yüklenen ses · {metadata.format_name} · "
                         f"{metadata.size_bytes / 1024:.1f} KB"
                     )
-            else:
+            elif source_mode == "Yerel yol":
                 audio_path_text = st.text_input(
                     "Yerel ses dosyası yolu",
                     type="password",
                 )
-            playback_mode = st.radio(
-                "Oynatma", ("Hızlı analiz", "Gerçek zaman simülasyonu")
-            )
+            else:
+                for warning_line in LOCAL_MIC_WARNING_LINES:
+                    st.warning(warning_line)
+            if source_mode != "Tek konuşmacılı mikrofon testi":
+                playback_mode = st.radio(
+                    "Oynatma", ("Hızlı analiz", "Gerçek zaman simülasyonu")
+                )
     config = demos[tenant_id].config.asr
     service_defaults = default_service_selection(
         artifact_availability,
@@ -934,7 +1545,8 @@ with st.sidebar:
             else _local_state()
         )
         local_state_for_render = local
-        st.warning("CPU çıkarımı gerçek zamandan daha yavaş olabilir.")
+        if source_mode != "Tek konuşmacılı mikrofon testi":
+            st.warning("CPU çıkarımı gerçek zamandan daha yavaş olabilir.")
         retained_before_start = _retained_execution_resource(local.runtime)
         running_before_start = (
             retained_before_start is not None
@@ -942,7 +1554,7 @@ with st.sidebar:
             and retained_before_start.latest_snapshot.lifecycle_status
             is DashboardExecutionStatus.RUNNING
         )
-        if st.button(
+        if source_mode != "Tek konuşmacılı mikrofon testi" and st.button(
             "Başlat",
             type="primary",
             use_container_width=True,
@@ -1128,7 +1740,7 @@ with st.sidebar:
                     local.stage = "Başarısız"
                     local.error_message = "Ses işleme güvenli biçimde tamamlanamadı."
                     st.error(local.error_message)
-        if st.button(
+        if source_mode != "Tek konuşmacılı mikrofon testi" and st.button(
             "Durdur",
             disabled=not (local.stop_enabled or running_before_start),
             use_container_width=True,
@@ -1136,7 +1748,9 @@ with st.sidebar:
             retained = _retained_execution_resource(local.runtime)
             if retained is not None:
                 retained.cancel()
-        if st.button("Sıfırla", use_container_width=True):
+        if source_mode != "Tek konuşmacılı mikrofon testi" and st.button(
+            "Sıfırla", use_container_width=True
+        ):
             _close_execution_resource()
             if source_mode == "Dosya yükle":
                 upload_session.reset()
@@ -1177,17 +1791,34 @@ else:
     retained_snapshot = (
         None if retained_resource is None else retained_resource.latest_snapshot
     )
+    local_microphone_source = source_mode == "Tek konuşmacılı mikrofon testi"
     polling_interval = (
         0.5
-        if retained_snapshot is not None
-        and retained_snapshot.lifecycle_status is DashboardExecutionStatus.RUNNING
+        if local_microphone_source
+        or (
+            retained_snapshot is not None
+            and retained_snapshot.lifecycle_status is DashboardExecutionStatus.RUNNING
+        )
         else None
     )
 
     @st.fragment(run_every=polling_interval)
     def local_live_area() -> None:
+        local_microphone_state = None
+        if local_microphone_source:
+            with st.sidebar:
+                local_microphone_state = _render_local_microphone_controls(
+                    local=render_local_state,
+                    selection=service_selection,
+                    availability=artifact_availability,
+                )
         resource = _retained_execution_resource(render_local_state.runtime)
         snapshot = None if resource is None else resource.latest_snapshot
+        if local_microphone_state is not None and snapshot is not None:
+            snapshot = _local_microphone_presentation_snapshot(
+                snapshot,
+                local_microphone_state[1].diagnostics.status,
+            )
         rag_status = st.session_state.get(
             _RAG_RUNTIME_STATUS_SESSION_KEY,
             _RAG_RUNTIME_STATUS_NOT_AVAILABLE,

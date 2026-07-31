@@ -195,3 +195,29 @@ This log uses local chronological numbering and records only Fatih-owned work.
 - Tests: focused suites 197 passed; full suite 2121 passed and 13 opt-in tests
   skipped (1 existing dependency warning). Ruff and Pyright passed.
 - Next planned step: complete manual dashboard acceptance before committing.
+
+## F-022 — Local Browser Microphone Test
+
+- Added a default-off, loopback-only `LOCAL_MIC_TEST` capability with
+  exact tenant/call/resource scope, bounded mono PCM16LE 16 kHz normalization,
+  two-second ingress chunks and deterministic terminal revocation.
+- Added audio-only WebRTC capture with no ICE servers; its callback performs
+  only in-memory normalization and bounded enqueueing. Existing live ingress,
+  streaming ASR and provisional coaching publish snapshots before END.
+- Changed files: `pyproject.toml`, `uv.lock`, the Fatih-owned audio-ingress,
+  streaming and dashboard files, four focused test modules, and this progress
+  file.
+- Tests: focused microphone/dashboard tests 194 passed; PyAV media tests 52
+  passed; full suite 2218 passed and 15 opt-in tests skipped (1 existing
+  dependency warning). Ruff and Pyright passed.
+- Manual follow-up keeps the WebRTC component in the same polling fragment,
+  preserves a stable per-session component identity and drains a bounded final
+  chunk before disconnect END so the first processed snapshot is not lost.
+- Readiness follow-up blocks browser capture until the retained worker has
+  loaded and warmed one local-only `tiny` CPU/int8 ASR engine, and records
+  separate bounded load, warm-up, audio-preparation and inference timings.
+- Focused readiness/dashboard/pipeline tests: 232 passed; PyAV/media tests:
+  76 passed; full suite: 2231 passed and 15 opt-in tests skipped. Ruff,
+  formatting and Pyright passed.
+- Next planned step: run manual localhost microphone acceptance with the
+  explicit local gate before committing.

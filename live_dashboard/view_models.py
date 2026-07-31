@@ -123,9 +123,22 @@ class DashboardExecutionStatus(str, Enum):
 class DashboardExecutionMode(str, Enum):
     FAST_ANALYSIS = "FAST_ANALYSIS"
     REALTIME_SIMULATION = "REALTIME_SIMULATION"
+    LOCAL_MIC_TEST = "LOCAL_MIC_TEST"
 
 
 class DashboardExecutionStage(str, Enum):
+    PREPARING_MODEL = "PREPARING_MODEL"
+    WARMING_UP = "WARMING_UP"
+    READY_TO_CAPTURE = "READY_TO_CAPTURE"
+    MODEL_PREPARATION_FAILED = "MODEL_PREPARATION_FAILED"
+    PERMISSION_PENDING = "PERMISSION_PENDING"
+    MICROPHONE_READY = "MICROPHONE_READY"
+    LIVE_AUDIO = "LIVE_AUDIO"
+    TRANSCRIPT_UPDATING = "TRANSCRIPT_UPDATING"
+    COACHING_UPDATING = "COACHING_UPDATING"
+    STOP_REQUESTED = "STOP_REQUESTED"
+    MICROPHONE_DISCONNECTED = "MICROPHONE_DISCONNECTED"
+    MICROPHONE_OVERLOADED = "MICROPHONE_OVERLOADED"
     STARTING = "STARTING"
     FILE_PREPARING = "FILE_PREPARING"
     ENGINE_RUNNING = "ENGINE_RUNNING"
@@ -622,6 +635,28 @@ def execute_local_once(
     state.status = "completed"
     state.stage = "Tamamlandı"
     return True
+
+
+def consume_live_step(
+    state: LocalExecutionState,
+    step: StreamingASRStep,
+    *,
+    elapsed_seconds: float,
+) -> None:
+    """Apply one exact-scope live step without exposing or retaining audio."""
+    if (
+        step.tenant_id != state.runtime.call_state.tenant_id
+        or step.call_id != state.runtime.call_id
+    ):
+        raise ValueError("Pipeline step scope does not match dashboard")
+    if step.sequence_number < 0:
+        raise ValueError("Pipeline step sequence cannot be negative")
+    state.status = "running"
+    state.current_chunk += 1
+    state.latest_step = step
+    state.stage = "Konuşma metni güncelleniyor"
+    _consume_step(state, step)
+    state.elapsed_seconds = max(elapsed_seconds, 0.0)
 
 
 def reset_runtime(runtime: DashboardRuntime) -> DashboardRuntime:

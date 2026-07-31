@@ -3,9 +3,13 @@ from pathlib import Path
 from collections.abc import Callable, Iterator
 from typing import Any
 
+import numpy as np
 import pytest
 
-from app.asr.faster_whisper_engine import FasterWhisperEngine
+from app.asr.faster_whisper_engine import (
+    ASRModelPreparationTiming,
+    FasterWhisperEngine,
+)
 from app.asr.models import (
     ASRWordTimestamp,
     ASRWordTimestampError,
@@ -136,6 +140,47 @@ def test_model_is_loaded_lazily_and_reused(
     assert len(constructor_calls) == 1
     assert len(created_models) == 1
     assert len(created_models[0].transcribe_calls) == 2
+
+
+def test_explicit_model_preparation_loads_once_and_warms_up_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_models, constructor_calls = install_fake_model(monkeypatch)
+    clock_values = iter([1.0, 4.0, 10.0, 12.5])
+    engine = FasterWhisperEngine()
+
+    timing = engine.prepare(clock=lambda: next(clock_values))
+
+    assert timing == ASRModelPreparationTiming(
+        model_loading_seconds=3.0,
+        warmup_inference_seconds=2.5,
+    )
+    assert len(constructor_calls) == 1
+    assert len(created_models) == 1
+    assert len(created_models[0].transcribe_calls) == 1
+    waveform, settings = created_models[0].transcribe_calls[0]
+    assert not isinstance(waveform, str)
+    assert waveform.dtype == np.float32
+    assert waveform.shape == (4_000,)
+    assert settings["beam_size"] == 1
+
+
+def test_repeated_load_model_reuses_the_constructed_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, constructor_calls = install_fake_model(monkeypatch)
+    engine = FasterWhisperEngine()
+
+    assert engine.load_model(clock=iter([2.0, 5.0]).__next__) == 3.0
+    assert engine.load_model(clock=iter([8.0, 8.0]).__next__) == 0.0
+
+    assert len(constructor_calls) == 1
+
+
+@pytest.mark.parametrize("duration", [0.0, -1.0, float("nan")])
+def test_warm_up_rejects_invalid_duration(duration: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        FasterWhisperEngine().warm_up(duration_seconds=duration)
 
 
 def test_loader_exception_identity_is_preserved(
