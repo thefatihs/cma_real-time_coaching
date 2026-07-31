@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import math
 import os
@@ -17,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, TypeVar
 
 from scripts import run_vllm_loopback_smoke as smoke
 
@@ -29,6 +30,8 @@ BASELINE_COMMIT = "09dc12df0c06184435054e038988cb3ede596761"
 EXPECTED_HEAD_ENVIRONMENT_VARIABLE = "CALLMETRIC_VLLM_E2E_EXPECTED_HEAD"
 HANDOFF_ROOT_ENVIRONMENT_VARIABLE = "CALLMETRIC_VLLM_E2E_HANDOFF_ROOT"
 CACHE_ENVIRONMENT_VARIABLE = smoke.CACHE_ENVIRONMENT_VARIABLE
+HF_OFFLINE_ENVIRONMENT_VARIABLE = "CALLMETRIC_VLLM_HF_HUB_OFFLINE"
+TRANSFORMERS_OFFLINE_ENVIRONMENT_VARIABLE = "CALLMETRIC_VLLM_TRANSFORMERS_OFFLINE"
 COMMIT_PATTERN = smoke.COMMIT_PATTERN
 
 IMAGE_TAG = smoke.IMAGE_TAG
@@ -51,6 +54,14 @@ MAX_SEQUENCES = 2
 MAX_OUTPUT_TOKENS = 256
 MINIMUM_TTL_SECONDS = 300
 MAXIMUM_TTL_SECONDS = 7_200
+COLD_MINIMUM_FREE_BYTES = smoke.MINIMUM_FREE_BYTES
+WARM_RUNTIME_OVERHEAD_BYTES = 2 * 1024**3
+WARM_MINIMUM_FREE_BYTES = (
+    smoke.RESERVE_BYTES + smoke.MARGIN_BYTES + WARM_RUNTIME_OVERHEAD_BYTES
+)
+MODEL_SNAPSHOT_RELATIVE_PATH = (
+    Path("hub") / f"models--{MODEL.replace('/', '--')}" / "snapshots" / MODEL_REVISION
+)
 SUBPROCESS_TIMEOUT_SECONDS = 30.0
 PULL_TIMEOUT_SECONDS = smoke.PULL_TIMEOUT_SECONDS
 START_TIMEOUT_SECONDS = smoke.START_TIMEOUT_SECONDS
@@ -71,8 +82,55 @@ _FIXED_FAILURE = "PR54 vLLM service failed"
 _READY_MESSAGE = "PR54 vLLM READY; TTL remaining: {seconds} seconds"
 
 
+E_REPOSITORY = "E_REPOSITORY"
+E_RUNTIME_CONTRACT = "E_RUNTIME_CONTRACT"
+E_GPU = "E_GPU"
+E_DISK_CAPACITY = "E_DISK_CAPACITY"
+E_CACHE_METADATA = "E_CACHE_METADATA"
+E_MODEL_METADATA = "E_MODEL_METADATA"
+E_IMAGE_METADATA = "E_IMAGE_METADATA"
+E_TLS = "E_TLS"
+E_STARTUP = "E_STARTUP"
+E_READINESS = "E_READINESS"
+E_CLEANUP = "E_CLEANUP"
+E_PROTECTED_CONTAINERS = "E_PROTECTED_CONTAINERS"
+PHASE_CODES = frozenset(
+    {
+        E_REPOSITORY,
+        E_RUNTIME_CONTRACT,
+        E_GPU,
+        E_DISK_CAPACITY,
+        E_CACHE_METADATA,
+        E_MODEL_METADATA,
+        E_IMAGE_METADATA,
+        E_TLS,
+        E_STARTUP,
+        E_READINESS,
+        E_CLEANUP,
+        E_PROTECTED_CONTAINERS,
+    }
+)
+T = TypeVar("T")
+
+
 class VLLME2EServiceError(RuntimeError):
     """A fixed, secret-safe service lifecycle failure."""
+
+    def __init__(
+        self,
+        _message: str = _FIXED_FAILURE,
+        *,
+        phase: str = E_RUNTIME_CONTRACT,
+    ) -> None:
+        self.phase = phase if phase in PHASE_CODES else E_RUNTIME_CONTRACT
+        super().__init__(_FIXED_FAILURE)
+
+
+def _phase_call(phase: str, operation: Callable[[], T]) -> T:
+    try:
+        return operation()
+    except Exception as error:
+        raise VLLME2EServiceError(phase=phase) from error
 
 
 def _run(
@@ -182,6 +240,8 @@ def _validate_runtime_contract() -> None:
         MODEL_REVISION,
         SERVED_MODEL,
         "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        'HF_HUB_OFFLINE: "${CALLMETRIC_VLLM_HF_HUB_OFFLINE:-0}"',
+        'TRANSFORMERS_OFFLINE: "${CALLMETRIC_VLLM_TRANSFORMERS_OFFLINE:-0}"',
     )
     combined = compose + Path(smoke.__file__).read_text(encoding="utf-8")
     if any(value not in combined for value in required):
@@ -189,6 +249,62 @@ def _validate_runtime_contract() -> None:
     forbidden = ("0.0.0.0:8001", "[::]", "container_name")
     if any(value in compose for value in forbidden):
         raise VLLME2EServiceError(_FIXED_FAILURE)
+
+
+def _exact_local_image_available() -> bool:
+    try:
+        metadata = _output(
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}|{{.Architecture}}|{{.Os}}",
+                IMAGE,
+            ]
+        )
+    except VLLME2EServiceError:
+        return False
+    return metadata == f"{IMAGE_AMD64_DIGEST}|amd64|linux"
+
+
+def _exact_model_snapshot_available(cache: Path) -> bool:
+    snapshot = cache / MODEL_SNAPSHOT_RELATIVE_PATH
+    try:
+        resolved = snapshot.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return (
+        not snapshot.is_symlink()
+        and resolved == snapshot
+        and resolved.is_dir()
+        and cache in resolved.parents
+    )
+
+
+def _validate_free_disk(required_bytes: int) -> None:
+    if required_bytes <= 0 or smoke._free_disk_bytes() < required_bytes:
+        raise VLLME2EServiceError(_FIXED_FAILURE)
+
+
+def _validated_cache_and_disk() -> tuple[Path, bool]:
+    raw_cache = os.environ.get(CACHE_ENVIRONMENT_VARIABLE)
+    try:
+        cache = smoke._validate_cache_directory(raw_cache)
+    except Exception as error:
+        _phase_call(
+            E_DISK_CAPACITY,
+            lambda: _validate_free_disk(COLD_MINIMUM_FREE_BYTES),
+        )
+        raise VLLME2EServiceError(phase=E_CACHE_METADATA) from error
+
+    warm = _exact_local_image_available() and _exact_model_snapshot_available(cache)
+    required_bytes = WARM_MINIMUM_FREE_BYTES if warm else COLD_MINIMUM_FREE_BYTES
+    _phase_call(
+        E_DISK_CAPACITY,
+        lambda: _validate_free_disk(required_bytes),
+    )
+    return cache, warm
 
 
 def _validate_private_directory(raw_path: str | None) -> Path:
@@ -281,6 +397,8 @@ def _environment(cache: Path, tls_directory: Path, token: str) -> dict[str, str]
             CACHE_ENVIRONMENT_VARIABLE: str(cache),
             "CALLMETRIC_VLLM_SMOKE_TLS_DIR": str(tls_directory),
             "CALLMETRIC_VLLM_SMOKE_API_KEY": token,
+            HF_OFFLINE_ENVIRONMENT_VARIABLE: "1",
+            TRANSFORMERS_OFFLINE_ENVIRONMENT_VARIABLE: "1",
         }
     )
     return environment
@@ -346,72 +464,107 @@ def _validate_gpu_idle() -> None:
 
 def run(ttl: int) -> None:
     if not MINIMUM_TTL_SECONDS <= ttl <= MAXIMUM_TTL_SECONDS:
-        raise VLLME2EServiceError(_FIXED_FAILURE)
-    _validate_repository()
-    _validate_runtime_contract()
-    smoke._validate_tools()
-    smoke._validate_gpu()
-    _validate_gpu_idle()
-    smoke._validate_disk()
-    smoke._validate_port_free()
-    cache = smoke._validate_cache_directory(os.environ.get(CACHE_ENVIRONMENT_VARIABLE))
-    handoff_root = _validate_private_directory(
-        os.environ.get(HANDOFF_ROOT_ENVIRONMENT_VARIABLE)
+        raise VLLME2EServiceError(phase=E_RUNTIME_CONTRACT)
+    _phase_call(E_REPOSITORY, _validate_repository)
+    _phase_call(E_RUNTIME_CONTRACT, _validate_runtime_contract)
+    _phase_call(E_RUNTIME_CONTRACT, smoke._validate_tools)
+    _phase_call(E_GPU, smoke._validate_gpu)
+    _phase_call(E_GPU, _validate_gpu_idle)
+    cache, _warm = _validated_cache_and_disk()
+    _phase_call(E_RUNTIME_CONTRACT, smoke._validate_port_free)
+    handoff_root = _phase_call(
+        E_TLS,
+        lambda: _validate_private_directory(
+            os.environ.get(HANDOFF_ROOT_ENVIRONMENT_VARIABLE)
+        ),
     )
-    protected_before = smoke._protected_container_snapshot()
-    smoke._validate_image_metadata()
-    smoke._validate_model_metadata()
+    protected_before = _phase_call(
+        E_PROTECTED_CONTAINERS,
+        smoke._protected_container_snapshot,
+    )
+    _phase_call(E_IMAGE_METADATA, smoke._validate_image_metadata)
+    _phase_call(E_MODEL_METADATA, smoke._validate_model_metadata)
 
     project = f"callmetric-vllm-e2e-{os.getpid()}-{secrets.token_hex(6)}"
     token = secrets.token_urlsafe(48)
     if not PROJECT_PATTERN.fullmatch(project) or len(token) < 48:
-        raise VLLME2EServiceError(_FIXED_FAILURE)
+        raise VLLME2EServiceError(phase=E_RUNTIME_CONTRACT)
 
     environment: dict[str, str] | None = None
     handoff: Path | None = None
     with tempfile.TemporaryDirectory(prefix="callmetric-vllm-e2e-tls-") as raw_tls:
         tls_directory = Path(raw_tls)
         try:
-            smoke._generate_certificates(tls_directory)
-            handoff = _create_handoff(handoff_root, tls_directory, token, ttl)
+            _phase_call(E_TLS, lambda: smoke._generate_certificates(tls_directory))
+            handoff = _phase_call(
+                E_TLS,
+                lambda: _create_handoff(handoff_root, tls_directory, token, ttl),
+            )
             environment = _environment(cache, tls_directory, token)
-            _run(
-                _compose_arguments(project, "config", "--quiet"),
-                environment=environment,
+            _phase_call(
+                E_RUNTIME_CONTRACT,
+                lambda: _run(
+                    _compose_arguments(project, "config", "--quiet"),
+                    environment=environment,
+                ),
             )
-            _run(
-                _compose_arguments(project, "pull", SERVICE),
-                environment=environment,
-                timeout=PULL_TIMEOUT_SECONDS,
+            _phase_call(
+                E_IMAGE_METADATA,
+                lambda: _run(
+                    _compose_arguments(project, "pull", SERVICE),
+                    environment=environment,
+                    timeout=PULL_TIMEOUT_SECONDS,
+                ),
             )
-            _run(
-                _compose_arguments(project, "up", "--detach", SERVICE),
-                environment=environment,
-                timeout=START_TIMEOUT_SECONDS,
+            _phase_call(
+                E_STARTUP,
+                lambda: _run(
+                    _compose_arguments(project, "up", "--detach", SERVICE),
+                    environment=environment,
+                    timeout=START_TIMEOUT_SECONDS,
+                ),
             )
-            context = ssl.create_default_context(cafile=str(tls_directory / "ca.crt"))
-            _wait_for_ready(context, token)
-            _wait_foreground(ttl, threading.Event())
+            context = _phase_call(
+                E_TLS,
+                lambda: ssl.create_default_context(
+                    cafile=str(tls_directory / "ca.crt")
+                ),
+            )
+            _phase_call(E_READINESS, lambda: _wait_for_ready(context, token))
+            _phase_call(
+                E_RUNTIME_CONTRACT,
+                lambda: _wait_foreground(ttl, threading.Event()),
+            )
         finally:
             try:
                 if environment is not None:
-                    _cleanup(project, environment)
+                    _phase_call(E_CLEANUP, lambda: _cleanup(project, environment))
             finally:
                 try:
-                    _remove_handoff(handoff, handoff_root)
+                    _phase_call(
+                        E_CLEANUP,
+                        lambda: _remove_handoff(handoff, handoff_root),
+                    )
                 finally:
-                    if smoke._protected_container_snapshot() != protected_before:
-                        raise VLLME2EServiceError(_FIXED_FAILURE)
-    smoke._validate_port_free()
-    _validate_repository()
+                    protected_after = _phase_call(
+                        E_PROTECTED_CONTAINERS,
+                        smoke._protected_container_snapshot,
+                    )
+                    if protected_after != protected_before:
+                        raise VLLME2EServiceError(phase=E_PROTECTED_CONTAINERS)
+    _phase_call(E_RUNTIME_CONTRACT, smoke._validate_port_free)
+    _phase_call(E_REPOSITORY, _validate_repository)
 
 
 def main(arguments: list[str] | None = None) -> int:
     try:
         ttl = _parse_ttl(sys.argv[1:] if arguments is None else arguments)
         run(ttl)
+    except VLLME2EServiceError as error:
+        print(f"{error.phase} {_FIXED_FAILURE}", file=sys.stderr)
+        return 1
     except Exception:
-        print(_FIXED_FAILURE, file=sys.stderr)
+        print(f"{E_RUNTIME_CONTRACT} {_FIXED_FAILURE}", file=sys.stderr)
         return 1
     return 0
 

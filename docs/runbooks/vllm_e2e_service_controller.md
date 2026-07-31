@@ -64,6 +64,37 @@ Compose always performs `pull vllm`, including when the pinned image layers
 already exist locally. Cached layers remain reusable, but the pull still
 performs a registry check. The persistent model cache is reused and preserved.
 
+## Cold and verified-warm disk guards
+
+The unchanged cold-install guard requires exactly 60,726,534,621 bytes
+(56.556 GiB): the conservative image/model transient allowance, 15 GiB final
+reserve, and 2 GiB margin.
+
+The lower verified-warm guard is selected only when all of these checks pass:
+
+- the local image ID is exactly the pinned Linux/amd64 manifest digest;
+- the cache root passes the existing canonical-path, ownership, symlink, and
+  group/world-write checks;
+- the metadata-only expected snapshot directory exists at the exact approved
+  model revision;
+- the Compose contract exposes controlled offline inputs and the PR54
+  controller forces both `HF_HUB_OFFLINE=1` and
+  `TRANSFORMERS_OFFLINE=1`. Their Compose defaults remain `0`, so the
+  verified PR53 smoke behavior is unchanged.
+
+The controller derives the expected snapshot path directly and does not list,
+read, or log cache contents. Verified-warm mode requires exactly
+20,401,094,656 bytes (19 GiB): the unchanged 15 GiB reserve, unchanged 2 GiB
+margin, and a 2 GiB bounded allowance for container writable-layer, logs, and
+runtime temporary overhead. If any proof is missing or wrong, the controller
+uses the unchanged cold guard. An incomplete snapshot that has the expected
+directory still fails closed during offline startup/readiness; Hugging Face or
+Transformers cannot fall back to a model download.
+
+The exact-image Compose pull and registry verification remain enabled and may
+contact the image registry. Offline mode applies to model resolution and never
+permits a different image digest.
+
 ## Readiness, lifetime, and cleanup
 
 The controller declares READY only after trusted HTTPS `/health` succeeds and
@@ -72,6 +103,14 @@ authenticated `/v1/models` returns exactly
 expiry, SIGINT, or SIGTERM. Status and failures are fixed and secret-free;
 requests, prompts, responses, tokens, certificate material, environment
 values, cache contents, and private paths are never logged.
+
+Failures emit exactly one fixed phase code followed by
+`PR54 vLLM service failed`. Codes include `E_REPOSITORY`,
+`E_RUNTIME_CONTRACT`, `E_GPU`, `E_DISK_CAPACITY`,
+`E_CACHE_METADATA`, `E_IMAGE_METADATA`, `E_MODEL_METADATA`, `E_TLS`,
+`E_STARTUP`, `E_READINESS`, `E_CLEANUP`, and
+`E_PROTECTED_CONTAINERS`. Exception text and sensitive values are never
+emitted.
 
 Bounded operation uses these exact timeouts:
 

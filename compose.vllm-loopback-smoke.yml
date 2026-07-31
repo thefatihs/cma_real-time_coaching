@@ -8,6 +8,8 @@ services:
     environment:
       VLLM_API_KEY: "${CALLMETRIC_VLLM_SMOKE_API_KEY:?required}"
       HF_HUB_DISABLE_TELEMETRY: "1"
+      HF_HUB_OFFLINE: "${CALLMETRIC_VLLM_HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${CALLMETRIC_VLLM_TRANSFORMERS_OFFLINE:-0}"
     volumes:
       - "${CALLMETRIC_VLLM_SMOKE_CACHE_DIR:?required}:/root/.cache/huggingface"
       - "${CALLMETRIC_VLLM_SMOKE_TLS_DIR:?required}:/run/vllm-tls:ro"

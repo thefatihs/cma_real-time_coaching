@@ -39,6 +39,247 @@ def test_exact_pins_runtime_limits_and_gpu_are_reused() -> None:
     ) == ("0", 8192, 0.80, 2, 256)
 
 
+def _create_exact_snapshot(cache: Path) -> Path:
+    snapshot = cache / subject.MODEL_SNAPSHOT_RELATIVE_PATH
+    snapshot.mkdir(parents=True)
+    return snapshot
+
+
+def test_cold_and_warm_disk_thresholds_are_exact() -> None:
+    assert subject.COLD_MINIMUM_FREE_BYTES == subject.smoke.MINIMUM_FREE_BYTES
+    assert subject.COLD_MINIMUM_FREE_BYTES == 60_726_534_621
+    assert subject.WARM_RUNTIME_OVERHEAD_BYTES == 2 * 1024**3
+    assert subject.WARM_MINIMUM_FREE_BYTES == 19 * 1024**3
+    assert subject.WARM_MINIMUM_FREE_BYTES == (
+        subject.smoke.RESERVE_BYTES
+        + subject.smoke.MARGIN_BYTES
+        + subject.WARM_RUNTIME_OVERHEAD_BYTES
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        (
+            (f"{subject.IMAGE_AMD64_DIGEST}|amd64|linux"),
+            True,
+        ),
+        ("sha256:" + "0" * 64 + "|amd64|linux", False),
+        (f"{subject.IMAGE_AMD64_DIGEST}|arm64|linux", False),
+        (f"{subject.IMAGE_AMD64_DIGEST}|amd64|windows", False),
+    ],
+)
+def test_warm_image_requires_exact_local_amd64_digest(
+    metadata: str,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject, "_output", lambda *_args, **_kwargs: metadata)
+    assert subject._exact_local_image_available() is expected
+
+
+def test_warm_path_requires_exact_revision_snapshot(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    wrong = (
+        cache
+        / "hub"
+        / f"models--{subject.MODEL.replace('/', '--')}"
+        / "snapshots"
+        / ("0" * 40)
+    )
+    wrong.mkdir(parents=True)
+
+    assert not subject._exact_model_snapshot_available(cache)
+    _create_exact_snapshot(cache)
+    assert subject._exact_model_snapshot_available(cache)
+
+
+def test_verified_warm_path_enforces_reserve_margin_and_runtime_overhead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir(mode=0o700)
+    _create_exact_snapshot(cache)
+    monkeypatch.setattr(
+        subject.smoke,
+        "_validate_cache_directory",
+        lambda _raw: cache.resolve(),
+    )
+    monkeypatch.setattr(subject, "_exact_local_image_available", lambda: True)
+    monkeypatch.setattr(
+        subject.smoke,
+        "_free_disk_bytes",
+        lambda: subject.WARM_MINIMUM_FREE_BYTES,
+    )
+
+    validated_cache, warm = subject._validated_cache_and_disk()
+
+    assert validated_cache == cache.resolve()
+    assert warm is True
+
+    monkeypatch.setattr(
+        subject.smoke,
+        "_free_disk_bytes",
+        lambda: subject.WARM_MINIMUM_FREE_BYTES - 1,
+    )
+    with pytest.raises(subject.VLLME2EServiceError) as captured:
+        subject._validated_cache_and_disk()
+    assert captured.value.phase == subject.E_DISK_CAPACITY
+
+
+@pytest.mark.parametrize("missing_proof", ["image", "snapshot"])
+def test_missing_warm_proof_uses_unchanged_cold_guard(
+    missing_proof: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir(mode=0o700)
+    if missing_proof != "snapshot":
+        _create_exact_snapshot(cache)
+    monkeypatch.setattr(
+        subject.smoke,
+        "_validate_cache_directory",
+        lambda _raw: cache.resolve(),
+    )
+    monkeypatch.setattr(
+        subject,
+        "_exact_local_image_available",
+        lambda: missing_proof != "image",
+    )
+    monkeypatch.setattr(
+        subject.smoke,
+        "_free_disk_bytes",
+        lambda: subject.COLD_MINIMUM_FREE_BYTES - 1,
+    )
+
+    with pytest.raises(subject.VLLME2EServiceError) as captured:
+        subject._validated_cache_and_disk()
+
+    assert captured.value.phase == subject.E_DISK_CAPACITY
+
+
+def test_invalid_cache_metadata_falls_back_to_cold_then_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subject.smoke,
+        "_validate_cache_directory",
+        lambda _raw: (_ for _ in ()).throw(RuntimeError("sensitive path")),
+    )
+    monkeypatch.setattr(
+        subject.smoke,
+        "_free_disk_bytes",
+        lambda: subject.COLD_MINIMUM_FREE_BYTES,
+    )
+
+    with pytest.raises(subject.VLLME2EServiceError) as captured:
+        subject._validated_cache_and_disk()
+
+    assert captured.value.phase == subject.E_CACHE_METADATA
+    assert "sensitive" not in str(captured.value)
+
+
+def test_incomplete_exact_snapshot_is_forced_offline_and_cannot_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir(mode=0o700)
+    _create_exact_snapshot(cache)
+    monkeypatch.setattr(
+        subject.smoke,
+        "_validate_cache_directory",
+        lambda _raw: cache.resolve(),
+    )
+    monkeypatch.setattr(subject, "_exact_local_image_available", lambda: True)
+    monkeypatch.setattr(
+        subject.smoke,
+        "_free_disk_bytes",
+        lambda: subject.WARM_MINIMUM_FREE_BYTES,
+    )
+
+    _cache, warm = subject._validated_cache_and_disk()
+    environment = subject._environment(cache, tmp_path, "synthetic-token")
+
+    assert warm is True
+    assert environment[subject.HF_OFFLINE_ENVIRONMENT_VARIABLE] == "1"
+    assert environment[subject.TRANSFORMERS_OFFLINE_ENVIRONMENT_VARIABLE] == "1"
+
+
+def test_offline_mode_is_mandatory_and_has_no_download_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compose = subject.COMPOSE_FILE.read_text(encoding="utf-8")
+    assert 'HF_HUB_OFFLINE: "${CALLMETRIC_VLLM_HF_HUB_OFFLINE:-0}"' in compose
+    assert (
+        'TRANSFORMERS_OFFLINE: "${CALLMETRIC_VLLM_TRANSFORMERS_OFFLINE:-0}"' in compose
+    )
+    monkeypatch.setenv(subject.HF_OFFLINE_ENVIRONMENT_VARIABLE, "0")
+    monkeypatch.setenv(subject.TRANSFORMERS_OFFLINE_ENVIRONMENT_VARIABLE, "0")
+    environment = subject._environment(
+        tmp_path,
+        tmp_path,
+        "synthetic-token",
+    )
+    assert environment[subject.HF_OFFLINE_ENVIRONMENT_VARIABLE] == "1"
+    assert environment[subject.TRANSFORMERS_OFFLINE_ENVIRONMENT_VARIABLE] == "1"
+
+    unsafe = tmp_path / "compose.yml"
+    unsafe.write_text(
+        compose.replace("CALLMETRIC_VLLM_HF_HUB_OFFLINE", "WRONG_OFFLINE_VARIABLE"),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(subject, "COMPOSE_FILE", unsafe)
+    with pytest.raises(subject.VLLME2EServiceError):
+        subject._validate_runtime_contract()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        subject.E_REPOSITORY,
+        subject.E_RUNTIME_CONTRACT,
+        subject.E_GPU,
+        subject.E_DISK_CAPACITY,
+        subject.E_CACHE_METADATA,
+        subject.E_IMAGE_METADATA,
+        subject.E_MODEL_METADATA,
+        subject.E_TLS,
+        subject.E_STARTUP,
+        subject.E_READINESS,
+        subject.E_CLEANUP,
+        subject.E_PROTECTED_CONTAINERS,
+    ],
+)
+def test_main_emits_only_fixed_phase_code_and_message(
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        subject,
+        "run",
+        lambda _ttl: (_ for _ in ()).throw(
+            subject.VLLME2EServiceError(
+                "sensitive token /private/path",
+                phase=phase,
+            )
+        ),
+    )
+
+    assert subject.main(["--ttl-seconds", "300"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{phase} PR54 vLLM service failed\n"
+    assert "sensitive" not in captured.err
+
+
 def test_runtime_contract_is_loopback_only() -> None:
     subject._validate_runtime_contract()
     assert (subject.LOOPBACK_HOST, subject.TLS_HOST, subject.PORT) == (
@@ -225,6 +466,11 @@ def _stub_lifecycle(
         subject.smoke, "_validate_cache_directory", lambda _raw: cache.resolve()
     )
     monkeypatch.setattr(
+        subject,
+        "_validated_cache_and_disk",
+        lambda: (cache.resolve(), False),
+    )
+    monkeypatch.setattr(
         subject, "_validate_private_directory", lambda _raw: handoff_root.resolve()
     )
     monkeypatch.setattr(
@@ -355,7 +601,7 @@ def test_canonical_module_entrypoint_imports_without_running_lifecycle() -> None
 
     assert result.returncode == 1
     assert result.stdout == ""
-    assert result.stderr == "PR54 vLLM service failed\n"
+    assert result.stderr == "E_RUNTIME_CONTRACT PR54 vLLM service failed\n"
     assert "ModuleNotFoundError" not in result.stderr
 
 
@@ -385,5 +631,5 @@ def test_main_emits_only_fixed_secret_free_error(
     assert subject.main(["--ttl-seconds", "300"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "PR54 vLLM service failed\n"
+    assert captured.err == "E_RUNTIME_CONTRACT PR54 vLLM service failed\n"
     assert "sensitive" not in captured.err
