@@ -3,6 +3,10 @@
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
+from app.coaching.llm_result_gate import (
+    LLMCoachingGateStatus,
+    LLMCoachingResultGate,
+)
 from app.events.models import (
     CoachingAction,
     CoachingSuggestionEvent,
@@ -40,6 +44,7 @@ class DeterministicLLMCoachingSuggestionFactory:
         self._expires_after_seconds = expires_after_seconds
         self._suggestion_id_factory = suggestion_id_factory
         self._utc_datetime_factory = utc_datetime_factory
+        self._result_gate = LLMCoachingResultGate()
 
     def create(
         self,
@@ -55,6 +60,22 @@ class DeterministicLLMCoachingSuggestionFactory:
             or orchestration_result.call_id != event.call_id
             or orchestration_result.transcript_revision != event.revision
             or not orchestration_result.generated_text.strip()
+        ):
+            return None
+
+        gate_result = self._result_gate.evaluate(
+            tenant_id=event.tenant_id,
+            call_id=event.call_id,
+            revision=event.revision,
+            raw_output=orchestration_result.generated_text,
+            allowed_citations={
+                (citation.document_id, citation.chunk_id)
+                for citation in orchestration_result.citations
+            },
+        )
+        if (
+            gate_result.status is not LLMCoachingGateStatus.VALID_SUGGESTION
+            or gate_result.suggestion is None
         ):
             return None
 
@@ -84,7 +105,7 @@ class DeterministicLLMCoachingSuggestionFactory:
             source=CoachingSuggestionSource.LLM,
             label_id=self._label_id,
             title=self._title,
-            suggestion=orchestration_result.generated_text,
+            suggestion=gate_result.suggestion.suggestion,
             evidence_ids=[],
             expires_after_seconds=self._expires_after_seconds,
             created_at_utc=created_at_utc,

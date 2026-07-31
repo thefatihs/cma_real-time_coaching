@@ -160,6 +160,7 @@ def test_scope_and_retrieval_arguments_are_propagated() -> None:
     ]
     assert prompt_builder.requests[0].tenant_id == "tenant_alpha"
     assert prompt_builder.requests[0].call_id == "call_001"
+    assert prompt_builder.requests[0].transcript_revision == 7
     assert llm_gateway.requests[0].tenant_id == "tenant_alpha"
     assert llm_gateway.requests[0].call_id == "call_001"
     assert result.tenant_id == "tenant_alpha"

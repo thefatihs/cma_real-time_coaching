@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import inspect
+import json
 
 import pytest
 
@@ -124,7 +125,20 @@ def orchestration_result(
         "tenant_id": event.tenant_id,
         "call_id": event.call_id,
         "transcript_revision": event.revision,
-        "generated_text": "Synthetic generated coaching.",
+        "generated_text": json.dumps(
+            {
+                "decision": "suggestion",
+                "tenant_id": event.tenant_id,
+                "call_id": event.call_id,
+                "revision": event.revision,
+                "action": "RAG_ACTION",
+                "title": "Synthetic model title",
+                "suggestion": "Synthetic generated coaching.",
+                "priority": "HIGH",
+                "citations": [{"document_id": "document_1", "chunk_id": "chunk_1"}],
+                "source": "llm",
+            }
+        ),
         "citations": (
             OrchestrationCitationReference(
                 document_id="document_1",
