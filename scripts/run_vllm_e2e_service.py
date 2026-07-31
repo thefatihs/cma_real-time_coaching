@@ -68,6 +68,8 @@ START_TIMEOUT_SECONDS = smoke.START_TIMEOUT_SECONDS
 HEALTH_TIMEOUT_SECONDS = smoke.HEALTH_TIMEOUT_SECONDS
 HTTP_TIMEOUT_SECONDS = smoke.HTTP_TIMEOUT_SECONDS
 SHUTDOWN_TIMEOUT_SECONDS = 120.0
+GPU_IDLE_TIMEOUT_SECONDS = 30.0
+GPU_IDLE_POLL_SECONDS = 0.5
 PROJECT_PATTERN = re.compile(r"^callmetric-vllm-e2e-[0-9]+-[a-f0-9]{12}$")
 HANDOFF_DIRECTORY_PATTERN = re.compile(r"^callmetric-vllm-e2e-[a-z0-9_]{8}$")
 AUTHORIZED_DEVELOPMENT_ARTIFACTS = frozenset(
@@ -85,6 +87,8 @@ _READY_MESSAGE = "PR54 vLLM READY; TTL remaining: {seconds} seconds"
 E_REPOSITORY = "E_REPOSITORY"
 E_RUNTIME_CONTRACT = "E_RUNTIME_CONTRACT"
 E_GPU = "E_GPU"
+E_GPU_ACTIVITY = "E_GPU_ACTIVITY"
+E_GPU_CLEANUP = "E_GPU_CLEANUP"
 E_DISK_CAPACITY = "E_DISK_CAPACITY"
 E_CACHE_METADATA = "E_CACHE_METADATA"
 E_MODEL_METADATA = "E_MODEL_METADATA"
@@ -99,6 +103,8 @@ PHASE_CODES = frozenset(
         E_REPOSITORY,
         E_RUNTIME_CONTRACT,
         E_GPU,
+        E_GPU_ACTIVITY,
+        E_GPU_CLEANUP,
         E_DISK_CAPACITY,
         E_CACHE_METADATA,
         E_MODEL_METADATA,
@@ -462,6 +468,32 @@ def _validate_gpu_idle() -> None:
         raise VLLME2EServiceError(_FIXED_FAILURE)
 
 
+def _validate_gpu_active() -> None:
+    if smoke._gpu_memory_used() <= 0:
+        raise VLLME2EServiceError(_FIXED_FAILURE)
+
+
+def _wait_for_gpu_idle() -> None:
+    deadline = time.monotonic() + GPU_IDLE_TIMEOUT_SECONDS
+    while smoke._gpu_memory_used() != 0:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise VLLME2EServiceError(_FIXED_FAILURE)
+        time.sleep(min(GPU_IDLE_POLL_SECONDS, remaining))
+
+
+def _capture_failure(
+    current: BaseException | None,
+    phase: str,
+    operation: Callable[[], object],
+) -> BaseException | None:
+    try:
+        _phase_call(phase, operation)
+    except BaseException as error:
+        return current if current is not None else error
+    return current
+
+
 def run(ttl: int) -> None:
     if not MINIMUM_TTL_SECONDS <= ttl <= MAXIMUM_TTL_SECONDS:
         raise VLLME2EServiceError(phase=E_RUNTIME_CONTRACT)
@@ -492,66 +524,94 @@ def run(ttl: int) -> None:
 
     environment: dict[str, str] | None = None
     handoff: Path | None = None
-    with tempfile.TemporaryDirectory(prefix="callmetric-vllm-e2e-tls-") as raw_tls:
-        tls_directory = Path(raw_tls)
-        try:
-            _phase_call(E_TLS, lambda: smoke._generate_certificates(tls_directory))
-            handoff = _phase_call(
-                E_TLS,
-                lambda: _create_handoff(handoff_root, tls_directory, token, ttl),
-            )
-            environment = _environment(cache, tls_directory, token)
-            _phase_call(
-                E_RUNTIME_CONTRACT,
-                lambda: _run(
-                    _compose_arguments(project, "config", "--quiet"),
-                    environment=environment,
-                ),
-            )
-            _phase_call(
-                E_IMAGE_METADATA,
-                lambda: _run(
-                    _compose_arguments(project, "pull", SERVICE),
-                    environment=environment,
-                    timeout=PULL_TIMEOUT_SECONDS,
-                ),
-            )
-            _phase_call(
-                E_STARTUP,
-                lambda: _run(
-                    _compose_arguments(project, "up", "--detach", SERVICE),
-                    environment=environment,
-                    timeout=START_TIMEOUT_SECONDS,
-                ),
-            )
-            context = _phase_call(
-                E_TLS,
-                lambda: ssl.create_default_context(
-                    cafile=str(tls_directory / "ca.crt")
-                ),
-            )
-            _phase_call(E_READINESS, lambda: _wait_for_ready(context, token))
-            _phase_call(
-                E_RUNTIME_CONTRACT,
-                lambda: _wait_foreground(ttl, threading.Event()),
-            )
-        finally:
+    startup_attempted = False
+    primary_failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="callmetric-vllm-e2e-tls-") as raw_tls:
+            tls_directory = Path(raw_tls)
             try:
-                if environment is not None:
-                    _phase_call(E_CLEANUP, lambda: _cleanup(project, environment))
+                _phase_call(E_TLS, lambda: smoke._generate_certificates(tls_directory))
+                handoff = _phase_call(
+                    E_TLS,
+                    lambda: _create_handoff(handoff_root, tls_directory, token, ttl),
+                )
+                environment = _environment(cache, tls_directory, token)
+                _phase_call(
+                    E_RUNTIME_CONTRACT,
+                    lambda: _run(
+                        _compose_arguments(project, "config", "--quiet"),
+                        environment=environment,
+                    ),
+                )
+                _phase_call(
+                    E_IMAGE_METADATA,
+                    lambda: _run(
+                        _compose_arguments(project, "pull", SERVICE),
+                        environment=environment,
+                        timeout=PULL_TIMEOUT_SECONDS,
+                    ),
+                )
+                startup_attempted = True
+                _phase_call(
+                    E_STARTUP,
+                    lambda: _run(
+                        _compose_arguments(project, "up", "--detach", SERVICE),
+                        environment=environment,
+                        timeout=START_TIMEOUT_SECONDS,
+                    ),
+                )
+                context = _phase_call(
+                    E_TLS,
+                    lambda: ssl.create_default_context(
+                        cafile=str(tls_directory / "ca.crt")
+                    ),
+                )
+                _phase_call(E_READINESS, lambda: _wait_for_ready(context, token))
+                _phase_call(E_GPU_ACTIVITY, _validate_gpu_active)
+                _phase_call(
+                    E_RUNTIME_CONTRACT,
+                    lambda: _wait_foreground(ttl, threading.Event()),
+                )
+            except BaseException as error:
+                primary_failure = error
             finally:
-                try:
-                    _phase_call(
+                if startup_attempted and environment is not None:
+                    cleanup_failure = _capture_failure(
+                        cleanup_failure,
                         E_CLEANUP,
-                        lambda: _remove_handoff(handoff, handoff_root),
+                        lambda: _cleanup(project, environment),
                     )
-                finally:
-                    protected_after = _phase_call(
-                        E_PROTECTED_CONTAINERS,
-                        smoke._protected_container_snapshot,
+                    cleanup_failure = _capture_failure(
+                        cleanup_failure,
+                        E_GPU_CLEANUP,
+                        _wait_for_gpu_idle,
                     )
-                    if protected_after != protected_before:
-                        raise VLLME2EServiceError(phase=E_PROTECTED_CONTAINERS)
+                cleanup_failure = _capture_failure(
+                    cleanup_failure,
+                    E_CLEANUP,
+                    lambda: _remove_handoff(handoff, handoff_root),
+                )
+    except BaseException:
+        cleanup_failure = cleanup_failure or VLLME2EServiceError(phase=E_CLEANUP)
+
+    protected_failure: BaseException | None = None
+    try:
+        protected_after = _phase_call(
+            E_PROTECTED_CONTAINERS,
+            smoke._protected_container_snapshot,
+        )
+        if protected_after != protected_before:
+            raise VLLME2EServiceError(phase=E_PROTECTED_CONTAINERS)
+    except BaseException as error:
+        protected_failure = error
+
+    if primary_failure is not None:
+        raise primary_failure
+    if cleanup_failure is not None:
+        raise cleanup_failure
+    if protected_failure is not None:
+        raise protected_failure
     _phase_call(E_RUNTIME_CONTRACT, smoke._validate_port_free)
     _phase_call(E_REPOSITORY, _validate_repository)
 

@@ -104,9 +104,15 @@ expiry, SIGINT, or SIGTERM. Status and failures are fixed and secret-free;
 requests, prompts, responses, tokens, certificate material, environment
 values, cache contents, and private paths are never logged.
 
+GPU 0 must be idle before startup. After readiness, any positive GPU-memory
+use is accepted as bounded service activity; no exact MiB value is required.
+After exact-project shutdown, GPU idleness is polled for at most 30 seconds.
+Persistent activity fails closed without inspecting or stopping GPU processes.
+
 Failures emit exactly one fixed phase code followed by
 `PR54 vLLM service failed`. Codes include `E_REPOSITORY`,
-`E_RUNTIME_CONTRACT`, `E_GPU`, `E_DISK_CAPACITY`,
+`E_RUNTIME_CONTRACT`, `E_GPU`, `E_GPU_ACTIVITY`, `E_GPU_CLEANUP`,
+`E_DISK_CAPACITY`,
 `E_CACHE_METADATA`, `E_IMAGE_METADATA`, `E_MODEL_METADATA`, `E_TLS`,
 `E_STARTUP`, `E_READINESS`, `E_CLEANUP`, and
 `E_PROTECTED_CONTAINERS`. Exception text and sensitive values are never
@@ -120,6 +126,7 @@ Bounded operation uses these exact timeouts:
 - Trusted HTTPS readiness: 900 seconds
 - Each HTTPS request: 30 seconds
 - Shutdown: 120 seconds
+- Post-cleanup GPU-idle wait: 30 seconds
 
 Normal completion, TTL expiry, SIGINT, SIGTERM, and handled failures run
 `docker compose down` only for that randomized PR54 project, then remove only
@@ -127,7 +134,10 @@ its ephemeral TLS/token/handoff material. Cleanup does not remove the pinned
 image or persistent model cache and never uses volumes cleanup, prune, broad
 stop/remove, or wildcard resource selection. The four protected containers are
 checked before and after the lifecycle; any identity or status change fails
-safely.
+safely. Cleanup ordering is exact-project shutdown, bounded GPU-idle polling,
+handoff and ephemeral TLS removal, then protected-container validation. A
+cleanup failure is reported as `E_CLEANUP` only when no earlier lifecycle phase
+already failed; cleanup cannot replace the original failure phase.
 
 SIGKILL, host failure, or process-runtime failure can prevent Python `finally`
 cleanup. After such an interruption, first use `docker compose ls` to identify

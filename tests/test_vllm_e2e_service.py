@@ -246,6 +246,8 @@ def test_offline_mode_is_mandatory_and_has_no_download_fallback(
         subject.E_REPOSITORY,
         subject.E_RUNTIME_CONTRACT,
         subject.E_GPU,
+        subject.E_GPU_ACTIVITY,
+        subject.E_GPU_CLEANUP,
         subject.E_DISK_CAPACITY,
         subject.E_CACHE_METADATA,
         subject.E_IMAGE_METADATA,
@@ -388,6 +390,52 @@ def test_gpu_must_be_idle(monkeypatch: pytest.MonkeyPatch) -> None:
         subject._validate_gpu_idle()
 
 
+def test_gpu_activity_requires_only_bounded_positive_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(subject.smoke, "_gpu_memory_used", lambda: 6008)
+    subject._validate_gpu_active()
+    monkeypatch.setattr(subject.smoke, "_gpu_memory_used", lambda: 0)
+    with pytest.raises(
+        subject.VLLME2EServiceError,
+        match="^PR54 vLLM service failed$",
+    ):
+        subject._validate_gpu_active()
+
+
+def test_post_cleanup_gpu_idle_polling_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter([0.0, 0.0, 0.5, subject.GPU_IDLE_TIMEOUT_SECONDS])
+    sleeps: list[float] = []
+    monkeypatch.setattr(subject.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(subject.time, "sleep", sleeps.append)
+    monkeypatch.setattr(subject.smoke, "_gpu_memory_used", lambda: 1)
+
+    with pytest.raises(
+        subject.VLLME2EServiceError,
+        match="^PR54 vLLM service failed$",
+    ):
+        subject._wait_for_gpu_idle()
+
+    assert sleeps == [subject.GPU_IDLE_POLL_SECONDS] * 2
+
+
+def test_post_cleanup_gpu_idle_polling_accepts_delayed_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = iter([6008, 1, 0])
+    clock = iter([0.0, 0.0, 0.5])
+    sleeps: list[float] = []
+    monkeypatch.setattr(subject.smoke, "_gpu_memory_used", lambda: next(memory))
+    monkeypatch.setattr(subject.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(subject.time, "sleep", sleeps.append)
+
+    subject._wait_for_gpu_idle()
+
+    assert sleeps == [subject.GPU_IDLE_POLL_SECONDS] * 2
+
+
 def test_readiness_requires_health_and_exact_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -460,6 +508,8 @@ def _stub_lifecycle(
     monkeypatch.setattr(subject.smoke, "_validate_tools", lambda: None)
     monkeypatch.setattr(subject.smoke, "_validate_gpu", lambda: None)
     monkeypatch.setattr(subject, "_validate_gpu_idle", lambda: None)
+    monkeypatch.setattr(subject, "_validate_gpu_active", lambda: None)
+    monkeypatch.setattr(subject, "_wait_for_gpu_idle", lambda: None)
     monkeypatch.setattr(subject.smoke, "_validate_disk", lambda: None)
     monkeypatch.setattr(subject.smoke, "_validate_port_free", lambda: None)
     monkeypatch.setattr(
@@ -514,6 +564,260 @@ def test_run_uses_unique_project_and_isolated_cleanup_without_real_execution(
     assert (tmp_path / "cache").is_dir()
 
 
+def test_nonzero_prestart_gpu_fails_before_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    validate_gpu_idle = subject._validate_gpu_idle
+    calls, _ = _stub_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.setattr(subject, "_validate_gpu_idle", validate_gpu_idle)
+    monkeypatch.setattr(subject.smoke, "_gpu_memory_used", lambda: 1)
+
+    with pytest.raises(subject.VLLME2EServiceError) as raised:
+        subject.run(300)
+
+    assert raised.value.phase == subject.E_GPU
+    assert not calls
+
+
+def test_lifecycle_gpu_and_cleanup_order_is_exact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls, _ = _stub_lifecycle(monkeypatch, tmp_path)
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        subject, "_validate_gpu_idle", lambda: events.append("pre-idle")
+    )
+    monkeypatch.setattr(
+        subject, "_validate_gpu_active", lambda: events.append("post-active")
+    )
+    monkeypatch.setattr(
+        subject, "_wait_for_gpu_idle", lambda: events.append("post-idle")
+    )
+    monkeypatch.setattr(
+        subject, "_wait_for_ready", lambda *_args: events.append("readiness")
+    )
+    monkeypatch.setattr(
+        subject, "_wait_foreground", lambda *_args: events.append("foreground")
+    )
+
+    def ordered_run(arguments: list[str], **_kwargs: object) -> object:
+        calls.append(arguments)
+        if "up" in arguments:
+            events.append("up")
+        if "down" in arguments:
+            events.append("down")
+        return _completed(arguments)
+
+    monkeypatch.setattr(subject, "_run", ordered_run)
+
+    subject.run(300)
+
+    assert events == [
+        "pre-idle",
+        "up",
+        "readiness",
+        "post-active",
+        "foreground",
+        "down",
+        "post-idle",
+    ]
+
+
+def test_zero_post_readiness_gpu_activity_fails_and_runs_exact_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    validate_gpu_active = subject._validate_gpu_active
+    calls, _ = _stub_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.setattr(subject, "_validate_gpu_active", validate_gpu_active)
+    monkeypatch.setattr(subject.smoke, "_gpu_memory_used", lambda: 0)
+
+    with pytest.raises(subject.VLLME2EServiceError) as raised:
+        subject.run(300)
+
+    assert raised.value.phase == subject.E_GPU_ACTIVITY
+    up = [call for call in calls if "up" in call]
+    down = [call for call in calls if "down" in call]
+    assert len(up) == len(down) == 1
+    assert (
+        up[0][up[0].index("--project-name") + 1]
+        == down[0][down[0].index("--project-name") + 1]
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_phase"),
+    [
+        ("startup", subject.E_STARTUP),
+        ("readiness", subject.E_READINESS),
+        ("foreground", subject.E_RUNTIME_CONTRACT),
+    ],
+)
+def test_failures_from_startup_onward_attempt_exact_down_once(
+    failure: str,
+    expected_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls, _ = _stub_lifecycle(monkeypatch, tmp_path)
+
+    def selective_run(arguments: list[str], **_kwargs: object) -> object:
+        calls.append(arguments)
+        if failure == "startup" and "up" in arguments:
+            raise RuntimeError("synthetic startup failure")
+        return _completed(arguments)
+
+    monkeypatch.setattr(subject, "_run", selective_run)
+    if failure == "readiness":
+        monkeypatch.setattr(
+            subject,
+            "_wait_for_ready",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic")),
+        )
+    if failure == "foreground":
+        monkeypatch.setattr(
+            subject,
+            "_wait_foreground",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic")),
+        )
+
+    with pytest.raises(subject.VLLME2EServiceError) as raised:
+        subject.run(300)
+
+    assert raised.value.phase == expected_phase
+    up = [call for call in calls if "up" in call]
+    down = [call for call in calls if "down" in call]
+    assert len(up) == len(down) == 1
+    assert (
+        up[0][up[0].index("--project-name") + 1]
+        == down[0][down[0].index("--project-name") + 1]
+    )
+
+
+def test_cleanup_failure_does_not_mask_primary_and_later_checks_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls, handoff_root = _stub_lifecycle(monkeypatch, tmp_path)
+    protected_calls = 0
+
+    def protected_snapshot() -> dict[str, tuple[str, str]]:
+        nonlocal protected_calls
+        protected_calls += 1
+        return {"protected": ("id", "running")}
+
+    cleanup_calls = 0
+
+    def failing_cleanup(_project: str, _environment: dict[str, str]) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        raise RuntimeError("synthetic cleanup failure")
+
+    monkeypatch.setattr(
+        subject.smoke, "_protected_container_snapshot", protected_snapshot
+    )
+    monkeypatch.setattr(subject, "_cleanup", failing_cleanup)
+    monkeypatch.setattr(
+        subject,
+        "_wait_for_ready",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic readiness")),
+    )
+
+    with pytest.raises(subject.VLLME2EServiceError) as raised:
+        subject.run(300)
+
+    assert raised.value.phase == subject.E_READINESS
+    assert cleanup_calls == 1
+    assert protected_calls == 2
+    assert not tuple(handoff_root.iterdir())
+    assert (tmp_path / "cache").is_dir()
+    assert not any("down" in call for call in calls)
+
+
+def test_cleanup_failure_without_primary_reports_cleanup_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _calls, handoff_root = _stub_lifecycle(monkeypatch, tmp_path)
+    protected_calls = 0
+
+    def protected_snapshot() -> dict[str, tuple[str, str]]:
+        nonlocal protected_calls
+        protected_calls += 1
+        return {"protected": ("id", "running")}
+
+    monkeypatch.setattr(
+        subject.smoke, "_protected_container_snapshot", protected_snapshot
+    )
+    monkeypatch.setattr(
+        subject,
+        "_cleanup",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic cleanup")),
+    )
+
+    with pytest.raises(subject.VLLME2EServiceError) as raised:
+        subject.run(300)
+
+    assert raised.value.phase == subject.E_CLEANUP
+    assert protected_calls == 2
+    assert not tuple(handoff_root.iterdir())
+    assert (tmp_path / "cache").is_dir()
+
+
+@pytest.mark.parametrize("secondary_failure", ["handoff", "protected"])
+def test_secondary_failures_do_not_mask_primary_phase(
+    secondary_failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _calls, _handoff_root = _stub_lifecycle(monkeypatch, tmp_path)
+    protected_calls = 0
+
+    def protected_snapshot() -> dict[str, tuple[str, str]]:
+        nonlocal protected_calls
+        protected_calls += 1
+        if secondary_failure == "protected" and protected_calls == 2:
+            raise RuntimeError("synthetic protected failure")
+        return {"protected": ("id", "running")}
+
+    monkeypatch.setattr(
+        subject.smoke, "_protected_container_snapshot", protected_snapshot
+    )
+    if secondary_failure == "handoff":
+        monkeypatch.setattr(
+            subject,
+            "_remove_handoff",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic handoff")),
+        )
+    monkeypatch.setattr(
+        subject,
+        "_wait_for_ready",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic readiness")),
+    )
+
+    with pytest.raises(subject.VLLME2EServiceError) as raised:
+        subject.run(300)
+
+    assert raised.value.phase == subject.E_READINESS
+    assert protected_calls == 2
+    assert (tmp_path / "cache").is_dir()
+
+
+def test_persistent_post_cleanup_gpu_use_has_fixed_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    wait_for_gpu_idle = subject._wait_for_gpu_idle
+    _stub_lifecycle(monkeypatch, tmp_path)
+    clock = iter([0.0, 0.0, subject.GPU_IDLE_TIMEOUT_SECONDS])
+    monkeypatch.setattr(subject.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(subject.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(subject.smoke, "_gpu_memory_used", lambda: 1)
+    monkeypatch.setattr(subject, "_wait_for_gpu_idle", wait_for_gpu_idle)
+
+    with pytest.raises(subject.VLLME2EServiceError) as raised:
+        subject.run(300)
+
+    assert raised.value.phase == subject.E_GPU_CLEANUP
+
+
 def test_protected_container_change_fails_after_isolated_cleanup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -559,6 +863,8 @@ def test_source_preserves_cache_and_rejects_unsafe_docker_or_binding() -> None:
     assert "rmtree(cache" not in source
     assert "glob(" not in source
     assert "shell=False" in source
+    assert "--query-compute-apps" not in source
+    assert "docker kill" not in source
 
 
 def test_worktree_accepts_clean_or_exact_development_artifacts() -> None:
