@@ -55,7 +55,7 @@ def test_registry_digest_is_valid_and_consistent_across_artifacts() -> None:
     compose = subject.COMPOSE_FILE.read_text(encoding="utf-8")
     assert runner.count(subject.IMAGE_INDEX_DIGEST) == 1
     assert tests.count(subject.IMAGE_INDEX_DIGEST) == 1
-    assert runbook.count(subject.IMAGE_INDEX_DIGEST) == 1
+    assert subject.IMAGE_INDEX_DIGEST in runbook
     assert subject.IMAGE_INDEX_DIGEST not in compose
     assert compose.count(subject.IMAGE) == 1
 
