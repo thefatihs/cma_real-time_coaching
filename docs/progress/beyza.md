@@ -647,3 +647,31 @@ Tarih: 30 Temmuz 2026
   sifirdir.
 - Sonraki planli adim: PR53 external HTTPS vLLM service on the approved Linux
   GPU VM.
+
+## PR53 - Loopback-only vLLM GPU Smoke
+
+Tarih: 31 Temmuz 2026
+
+- Gercek GPU smoke tam bir kez 6m20s icinde basariyla tamamlandi: immutable
+  image pull yaklasik 3m, model hazirligi/startup/dogrulama yaklasik 3m20s.
+- `vllm/vllm-openai:v0.26.0-ubuntu2404` index
+  `sha256:ef7bfc14df9233e3e5d41e733e3be0afa6abbe5ae5f14ee0758110030f6cd53e`
+  ve Linux/amd64
+  `sha256:1161da8a5edbdff239ab1812784d7fe5d28775c675809a8420e8a0a05d0e56d1`
+  manifestlerine sabitlendi.
+- `Qwen/Qwen2.5-7B-Instruct-AWQ` revision
+  `b25037543e9394b818fdfca67ab2a00ecc7dd641` ile servis edildi.
+- Trusted TLS; missing-CA/hostname-mismatch; missing/incorrect bearer token;
+  exact `/v1/models`; sentetik, non-empty ve 256-token bounded
+  `/v1/completions`; GPU aktivitesi dogrulamalari passed. GPU kullanimi 6,057
+  MiB olarak gozlenip cleanup sonrasi 0 MiB'a dondu.
+- PR53 container/network ve ephemeral TLS/token materyali kaldirildi; image ve
+  persistent model cache korundu. Port 8001 free, kalan disk yaklasik 34.13 GiB
+  ve dort protected container running/unchanged olarak dogrulandi.
+- Runner testleri 42 passed; lightweight LLM testleri 87 passed; Ruff ve
+  focused Pyright passed. Full Pyright, bilerek kurulmayan ilgisiz optional
+  ML/runtime dependency'leri nedeniyle authoritative kabul edilmedi.
+- Degisen dokumanlar: `docs/runbooks/vllm_loopback_smoke.md` ve
+  `docs/progress/beyza.md`.
+- PR53 loopback-only kalir; Windows dashboard connectivity ve trust tasarimi
+  ayri PR54 kapsamindadir.

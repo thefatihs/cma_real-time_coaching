@@ -1,0 +1,50 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.26.0-ubuntu2404@sha256:1161da8a5edbdff239ab1812784d7fe5d28775c675809a8420e8a0a05d0e56d1
+    restart: "no"
+    ports:
+      - "127.0.0.1:8001:8001"
+    shm_size: "4gb"
+    environment:
+      VLLM_API_KEY: "${CALLMETRIC_VLLM_SMOKE_API_KEY:?required}"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    volumes:
+      - "${CALLMETRIC_VLLM_SMOKE_CACHE_DIR:?required}:/root/.cache/huggingface"
+      - "${CALLMETRIC_VLLM_SMOKE_TLS_DIR:?required}:/run/vllm-tls:ro"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: ["gpu"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8001"
+      - "--model"
+      - "Qwen/Qwen2.5-7B-Instruct-AWQ"
+      - "--revision"
+      - "b25037543e9394b818fdfca67ab2a00ecc7dd641"
+      - "--served-model-name"
+      - "callmetric-qwen25-7b-awq"
+      - "--quantization"
+      - "awq"
+      - "--max-model-len"
+      - "8192"
+      - "--gpu-memory-utilization"
+      - "0.80"
+      - "--max-num-seqs"
+      - "2"
+      - "--no-trust-remote-code"
+      - "--no-enable-log-requests"
+      - "--ssl-keyfile"
+      - "/run/vllm-tls/server.key"
+      - "--ssl-certfile"
+      - "/run/vllm-tls/server.crt"
