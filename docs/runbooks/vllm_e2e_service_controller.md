@@ -38,7 +38,7 @@ Invoke the controller only after separate approval, with an explicit TTL from
 300 through 7200 seconds:
 
 ```text
-uv run python scripts/run_vllm_e2e_service.py --ttl-seconds <300-7200>
+uv run python -m scripts.run_vllm_e2e_service --ttl-seconds <300-7200>
 ```
 
 Do not place the bearer token or private paths in command arguments or command

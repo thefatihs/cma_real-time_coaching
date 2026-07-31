@@ -5,6 +5,7 @@ import signal
 import ssl
 import subprocess
 from pathlib import Path
+import sys
 from typing import Any
 
 import pytest
@@ -334,6 +335,40 @@ def test_worktree_accepts_clean_or_exact_development_artifacts() -> None:
 def test_worktree_rejects_non_exact_development_state(status: str) -> None:
     with pytest.raises(subject.VLLME2EServiceError):
         subject._validate_worktree_status(status)
+
+
+def test_canonical_module_entrypoint_imports_without_running_lifecycle() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.run_vllm_e2e_service",
+            "--ttl-seconds",
+            "0",
+        ],
+        cwd=subject.REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "PR54 vLLM service failed\n"
+    assert "ModuleNotFoundError" not in result.stderr
+
+
+def test_runbook_uses_only_canonical_module_invocation() -> None:
+    runbook = (
+        subject.REPOSITORY_ROOT / "docs" / "runbooks" / "vllm_e2e_service_controller.md"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        "uv run python -m scripts.run_vllm_e2e_service --ttl-seconds <300-7200>"
+        in runbook
+    )
+    assert "uv run python scripts/run_vllm_e2e_service.py" not in runbook
 
 
 def test_main_emits_only_fixed_secret_free_error(
