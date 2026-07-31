@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
@@ -44,6 +45,7 @@ def _settings(**updates: object) -> VLLMOpenAICompatibleSettings:
         "base_url": "https://vllm.invalid/v1",
         "model_id": "synthetic/model-v1",
         "api_token": SecretStr(_TOKEN),
+        "ca_certificate_path": None,
         "connect_timeout_seconds": 7.5,
         "read_timeout_seconds": 90,
         "max_output_tokens": 512,
@@ -99,6 +101,7 @@ def test_settings_load_exact_environment_are_frozen_and_use_no_dotenv(
     assert settings.model_id == "synthetic/model-v1"
     assert settings.api_token is not None
     assert settings.api_token.get_secret_value() == _TOKEN
+    assert settings.ca_certificate_path is None
     assert settings.connect_timeout_seconds == 7.5
     assert settings.read_timeout_seconds == 90.0
     assert settings.max_output_tokens == 512
@@ -234,8 +237,141 @@ def test_max_output_tokens_are_strict_and_bounded(value: object) -> None:
 
 @pytest.mark.parametrize("value", [False, 0, 1, "false", "True"])
 def test_tls_verification_cannot_be_disabled_or_coerced(value: object) -> None:
-    with pytest.raises(ValidationError, match="exactly true"):
+    with pytest.raises(ValidationError, match="vLLM TLS configuration is invalid"):
         _settings(verify_tls=value)
+
+
+def test_custom_ca_environment_setting_is_secret_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name, value in _ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+    path = tmp_path / "synthetic-ca.pem"
+    monkeypatch.setenv("CALLMETRIC_VLLM_CA_CERTIFICATE_PATH", str(path))
+
+    settings_factory = cast(
+        Callable[[], VLLMOpenAICompatibleSettings], VLLMOpenAICompatibleSettings
+    )
+    settings = settings_factory()
+
+    assert settings.ca_certificate_path is not None
+    assert settings.ca_certificate_path.get_secret_value() == str(path)
+    assert str(path) not in repr(settings)
+
+
+def test_custom_ca_builds_strict_hostname_verifying_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "synthetic-ca.pem"
+    path.write_text("SSL library input only", encoding="utf-8")
+    calls: list[str | None] = []
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+
+    def create_context(*, cafile: str | None = None) -> ssl.SSLContext:
+        calls.append(cafile)
+        return context
+
+    monkeypatch.setattr(provider.ssl, "create_default_context", create_context)
+    client_kwargs: list[dict[str, object]] = []
+    original_client = httpx.Client
+
+    def client_factory(**kwargs: object) -> httpx.Client:
+        client_kwargs.append(kwargs)
+        return cast(Any, original_client)(**kwargs)
+
+    monkeypatch.setattr(provider.httpx, "Client", client_factory)
+    settings = _settings(ca_certificate_path=SecretStr(str(path)))
+
+    VLLMOpenAICompatibleGateway(
+        settings,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, json={"choices": [{"text": "Synthetic"}]}
+            )
+        ),
+    ).generate(_request())
+
+    assert calls == [str(path)]
+    assert client_kwargs[0]["verify"] is context
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+
+
+@pytest.mark.parametrize("kind", ["missing", "directory"])
+def test_custom_ca_rejects_missing_or_non_regular_path(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    path = tmp_path / kind
+    if kind == "directory":
+        path.mkdir()
+    gateway = VLLMOpenAICompatibleGateway(
+        _settings(ca_certificate_path=SecretStr(str(path))),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+    )
+
+    with pytest.raises(ValueError, match="^vLLM TLS configuration is invalid$"):
+        gateway.generate(_request())
+
+
+def test_custom_ca_rejects_symlink_as_non_regular_path(tmp_path: Path) -> None:
+    target = tmp_path / "target.pem"
+    target.write_text("not certificate material", encoding="utf-8")
+    path = tmp_path / "linked.pem"
+    try:
+        path.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    gateway = VLLMOpenAICompatibleGateway(
+        _settings(ca_certificate_path=SecretStr(str(path))),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+    )
+
+    with pytest.raises(ValueError) as raised:
+        gateway.generate(_request())
+
+    assert str(raised.value) == "vLLM TLS configuration is invalid"
+    assert str(path) not in str(raised.value)
+
+
+def test_custom_ca_rejects_invalid_material_without_leaking_details(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "private-invalid-ca.pem"
+    content = "synthetic invalid CA content"
+    path.write_text(content, encoding="utf-8")
+    gateway = VLLMOpenAICompatibleGateway(
+        _settings(ca_certificate_path=SecretStr(str(path))),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+    )
+
+    with pytest.raises(ValueError) as raised:
+        gateway.generate(_request())
+
+    assert str(raised.value) == "vLLM TLS configuration is invalid"
+    assert str(path) not in str(raised.value)
+    assert content not in str(raised.value)
+    assert _TOKEN not in str(raised.value)
+    assert "vllm.invalid" not in str(raised.value)
+
+
+def test_custom_ca_with_disabled_tls_is_rejected_without_path_leakage(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "private-ca.pem"
+    values = _settings(ca_certificate_path=SecretStr(str(path))).model_dump()
+    values["verify_tls"] = False
+    settings = VLLMOpenAICompatibleSettings.model_construct(**values)
+
+    with pytest.raises(ValueError) as raised:
+        provider._tls_verification(settings)
+
+    assert str(raised.value) == "vLLM TLS configuration is invalid"
+    assert str(path) not in str(raised.value)
 
 
 def test_api_token_is_optional_canonical_and_secret_safe() -> None:

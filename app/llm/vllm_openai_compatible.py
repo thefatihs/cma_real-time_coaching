@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import re
+import ssl
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -17,6 +19,7 @@ _MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _NUMERIC_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 _INTEGER_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _INVALID_RESPONSE = "vLLM response is invalid"
+_INVALID_TLS_CONFIGURATION = "vLLM TLS configuration is invalid"
 
 
 class VLLMOpenAICompatibleSettings(BaseSettings):
@@ -32,6 +35,7 @@ class VLLMOpenAICompatibleSettings(BaseSettings):
     base_url: str
     model_id: str
     api_token: SecretStr | None = None
+    ca_certificate_path: SecretStr | None = None
     connect_timeout_seconds: float
     read_timeout_seconds: float
     max_output_tokens: int
@@ -122,7 +126,7 @@ class VLLMOpenAICompatibleSettings(BaseSettings):
         if value == "true":
             value = True
         if type(value) is not bool or value is not True:
-            raise ValueError("verify_tls must be exactly true")
+            raise ValueError(_INVALID_TLS_CONFIGURATION)
         return value
 
 
@@ -156,7 +160,7 @@ class VLLMOpenAICompatibleGateway:
         if settings.api_token is not None:
             headers["Authorization"] = f"Bearer {settings.api_token.get_secret_value()}"
         with httpx.Client(
-            verify=settings.verify_tls,
+            verify=_tls_verification(settings),
             timeout=timeout,
             transport=self._transport,
             headers=headers,
@@ -195,6 +199,31 @@ def _strict_numeric(value: object) -> float:
     if not math.isfinite(numeric):
         raise ValueError("numeric setting must be finite")
     return numeric
+
+
+def _tls_verification(
+    settings: VLLMOpenAICompatibleSettings,
+) -> bool | ssl.SSLContext:
+    if settings.verify_tls is not True:
+        raise ValueError(_INVALID_TLS_CONFIGURATION)
+    configured_path = settings.ca_certificate_path
+    if configured_path is None:
+        return True
+    raw_path = configured_path.get_secret_value()
+    try:
+        path = Path(raw_path)
+        if (
+            not raw_path
+            or raw_path != raw_path.strip()
+            or "\0" in raw_path
+            or not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+        ):
+            raise ValueError(_INVALID_TLS_CONFIGURATION)
+        return ssl.create_default_context(cafile=str(path))
+    except (OSError, ValueError):
+        raise ValueError(_INVALID_TLS_CONFIGURATION) from None
 
 
 def _response_text(payload: object) -> str:
