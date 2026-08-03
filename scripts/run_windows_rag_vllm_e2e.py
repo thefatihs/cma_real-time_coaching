@@ -43,6 +43,7 @@ from app.integration.llm_suggestion_factory import (
 from app.integration.policy import RAGCoachingIntegrationPolicy
 from app.llm.vllm_openai_compatible import VLLMOpenAICompatibleSettings
 from app.orchestration.models import OrchestrationRequest, OrchestrationResult
+from app.vector_store.models import VectorBatchWriteResult
 
 TENANT_ID = "tenant_alpha"
 KNOWLEDGE_BASE_ID = "kb_smoke"
@@ -399,6 +400,28 @@ def _check_deadline(deadline: float, clock: Callable[[], float]) -> None:
         raise WindowsRAGVLLME2EError("E_DEADLINE")
 
 
+def _database_phase(code: str, operation: Callable[[], Any]) -> Any:
+    try:
+        return operation()
+    except PsycopgError:
+        raise WindowsRAGVLLME2EError(code) from None
+
+
+def _require_exact_ingestion(result: object) -> None:
+    if not isinstance(result, VectorBatchWriteResult):
+        raise WindowsRAGVLLME2EError("E_INGESTION")
+    identities = tuple(
+        (identity.document_id, identity.chunk_id)
+        for identity in (*result.inserted_identities, *result.unchanged_identities)
+    )
+    if (
+        result.tenant_id != TENANT_ID
+        or result.knowledge_base_id != KNOWLEDGE_BASE_ID
+        or identities != ((DOCUMENT_ID, CHUNK_ID),)
+    ):
+        raise WindowsRAGVLLME2EError("E_INGESTION")
+
+
 def run(
     *,
     preflight_only: bool,
@@ -418,12 +441,18 @@ def run(
     primary: BaseException | None = None
     cleanup_error: BaseException | None = None
     try:
-        _cleanup_synthetic_scope(settings.postgres, connect)
+        _database_phase(
+            "E_INITIAL_CLEANUP",
+            lambda: _cleanup_synthetic_scope(settings.postgres, connect),
+        )
         _check_deadline(deadline, clock)
-        profile = provision_profile_bound_postgres_rag(
-            postgres_settings=settings.postgres,
-            knowledge_base_settings=artifacts.provider,
-            psycopg_connect=connect,
+        profile = _database_phase(
+            "E_PROVISIONING",
+            lambda: provision_profile_bound_postgres_rag(
+                postgres_settings=settings.postgres,
+                knowledge_base_settings=artifacts.provider,
+                psycopg_connect=connect,
+            ),
         )
         if (
             profile.tenant_id != TENANT_ID
@@ -433,24 +462,31 @@ def run(
         ):
             raise WindowsRAGVLLME2EError("E_PROFILE")
         _check_deadline(deadline, clock)
-        ingest_profile_bound_postgres_rag(
-            postgres_settings=settings.postgres,
-            knowledge_base_settings=artifacts.provider,
-            request=artifacts.document,
-            psycopg_connect=connect,
-        )
-        _check_deadline(deadline, clock)
-        result = orchestrate_profile_bound_postgres_rag(
-            postgres_settings=settings.postgres,
-            knowledge_base_settings=artifacts.provider,
-            vllm_settings=settings.vllm,
-            request=_orchestration_request(event),
-            limits=PostgreSQLRAGOrchestrationLimits(
-                max_top_k=1,
-                max_user_input_characters=512,
-                max_prompt_characters=8_192,
+        ingestion = _database_phase(
+            "E_INGESTION",
+            lambda: ingest_profile_bound_postgres_rag(
+                postgres_settings=settings.postgres,
+                knowledge_base_settings=artifacts.provider,
+                request=artifacts.document,
+                psycopg_connect=connect,
             ),
-            psycopg_connect=connect,
+        )
+        _require_exact_ingestion(ingestion)
+        _check_deadline(deadline, clock)
+        result = _database_phase(
+            "E_RETRIEVAL_UNAVAILABLE",
+            lambda: orchestrate_profile_bound_postgres_rag(
+                postgres_settings=settings.postgres,
+                knowledge_base_settings=artifacts.provider,
+                vllm_settings=settings.vllm,
+                request=_orchestration_request(event),
+                limits=PostgreSQLRAGOrchestrationLimits(
+                    max_top_k=1,
+                    max_user_input_characters=512,
+                    max_prompt_characters=8_192,
+                ),
+                psycopg_connect=connect,
+            ),
         )
         if result is None:
             raise WindowsRAGVLLME2EError("E_RETRIEVAL_UNAVAILABLE")
@@ -469,8 +505,6 @@ def run(
             raise primary
         if isinstance(primary, httpx.HTTPError):
             raise WindowsRAGVLLME2EError("E_VLLM_UNAVAILABLE") from None
-        if isinstance(primary, PsycopgError):
-            raise WindowsRAGVLLME2EError("E_RETRIEVAL_UNAVAILABLE") from None
         raise WindowsRAGVLLME2EError("E_E2E") from None
     if cleanup_error is not None:
         raise WindowsRAGVLLME2EError("E_CLEANUP") from None

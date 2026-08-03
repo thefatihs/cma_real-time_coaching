@@ -58,6 +58,13 @@ TTL expiry, SIGINT, SIGTERM, and SIGHUP where Windows exposes it remove the
 handoff, exact randomized Compose project container/network/ephemeral volume,
 and TLS directory. The controller never prunes or selects resources broadly;
 it compares all pre-existing container, network, and volume IDs afterward.
+The signal handlers remain installed through one cleanup lifecycle. Cleanup
+first attempts bounded exact-project Compose down. If down fails, times out, or
+leaves residue, the fallback enumerates only the exact project label, validates
+the expected Compose service/container, default network, and named volume, then
+removes those validated references in container/network/volume order. Any
+unexpected name, label, or count fails closed. Residue verification completes
+before the owner-only handoff and ephemeral TLS directory are deleted.
 Forced process termination, `Stop-Process -Force`, host shutdown, power loss,
 or a Python/Docker host crash can prevent signal/finally cleanup from running;
 use exact-project resource verification before any manual recovery.

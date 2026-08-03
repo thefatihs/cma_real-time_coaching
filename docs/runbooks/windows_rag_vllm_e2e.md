@@ -45,7 +45,8 @@ ready, run without `--preflight-only`. The controller:
 
 1. clears only the fixed synthetic tenant/KB scope;
 2. verifies schema readiness and provisions the exact embedding profile;
-3. re-verifies readiness/profile identity and ingests one synthetic document;
+3. re-verifies readiness/profile identity, ingests one synthetic document, and
+   requires its exact expected document/chunk identity;
 4. executes the existing retrieval, cited prompt, and HTTPS `/v1/completions`
    orchestration with bounded component timeouts and a 300-second total
    deadline;
@@ -57,7 +58,10 @@ The only stdout success values are `PREFLIGHT_OK` and `E2E_OK`. Failures use a
 fixed phase code. No transcript, document, prompt, completion, token, DSN,
 certificate value/path, or private path is printed. Missing retrieval and vLLM
 connectivity fail deterministically as `E_RETRIEVAL_UNAVAILABLE` and
-`E_VLLM_UNAVAILABLE`; they do not fabricate a suggestion.
+`E_VLLM_UNAVAILABLE`; they do not fabricate a suggestion. PostgreSQL failures
+are separated into `E_INITIAL_CLEANUP`, `E_PROVISIONING`, `E_INGESTION`, and
+`E_RETRIEVAL_UNAVAILABLE`, without exposing database exception details. Final
+exact-scope cleanup always runs and cannot replace an existing primary phase.
 
 The cleanup does not remove PostgreSQL volumes, embedding/model caches,
 certificates, tunnels, containers, networks, or unrelated tenant data. If the

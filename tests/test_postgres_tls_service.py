@@ -407,7 +407,9 @@ def test_cleanup_timeout_is_reported_when_it_is_the_only_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _stub_bounded_lifecycle(
-        monkeypatch, tmp_path, failures=frozenset({"down --volumes"})
+        monkeypatch,
+        tmp_path,
+        failures=frozenset({"down --volumes", "container ls"}),
     )
     with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
         subject.run(300)
@@ -432,3 +434,188 @@ def test_timeout_output_never_exposes_secret_details(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "E_PREFLIGHT PR54 PostgreSQL TLS service failed\n"
+
+
+def test_compose_down_timeout_uses_only_validated_exact_project_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = "callmetric-pgvector-tls-123-abcdef123456"
+    resources = {
+        "container": ("container123",),
+        "network": ("network123",),
+        "volume": ("volume123",),
+    }
+    removals: list[list[str]] = []
+    residue_checks = 0
+
+    monkeypatch.setattr(
+        subject,
+        "_project_resource_references",
+        lambda _docker, _project: resources,
+    )
+
+    def inspect(_docker: str, resource: str, _reference: str, template: str) -> str:
+        if template == "{{.Name}}":
+            return {
+                "container": f"/{project}-{subject.smoke.SERVICE}-1",
+                "network": f"{project}_default",
+                "volume": f"{project}_{subject.VOLUME_KEY}",
+            }[resource]
+        if subject.COMPOSE_PROJECT_LABEL in template:
+            return project
+        if subject.COMPOSE_SERVICE_LABEL in template:
+            return subject.smoke.SERVICE
+        if subject.COMPOSE_NETWORK_LABEL in template:
+            return "default"
+        if subject.COMPOSE_VOLUME_LABEL in template:
+            return subject.VOLUME_KEY
+        pytest.fail("unexpected inspect template")
+
+    monkeypatch.setattr(subject, "_inspect_field", inspect)
+
+    def run_command(arguments: list[str], **_kwargs: object) -> object:
+        removals.append(arguments)
+        return object()
+
+    monkeypatch.setattr(subject, "_run_command", run_command)
+
+    def down(*_args: object) -> None:
+        raise subprocess.TimeoutExpired(["docker", "compose", "down"], 120)
+
+    def residue(*_args: object) -> None:
+        nonlocal residue_checks
+        residue_checks += 1
+
+    monkeypatch.setattr(subject.smoke, "_cleanup", down)
+    monkeypatch.setattr(subject.smoke, "_require_no_project_resources", residue)
+
+    subject._cleanup_project("docker", project, {})
+
+    assert removals == [
+        ["docker", "container", "rm", "--force", "container123"],
+        ["docker", "network", "rm", "network123"],
+        ["docker", "volume", "rm", "volume123"],
+    ]
+    assert residue_checks == 1
+    rendered = " ".join(" ".join(arguments) for arguments in removals)
+    assert "prune" not in rendered
+    assert "cache" not in rendered
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        {
+            "container": ("one", "two", "three"),
+            "network": (),
+            "volume": (),
+        },
+        {"container": (), "network": ("one", "two"), "volume": ()},
+        {"container": (), "network": (), "volume": ("one", "two")},
+    ],
+)
+def test_unexpected_exact_project_resource_counts_fail_closed(
+    resources: dict[str, tuple[str, ...]],
+) -> None:
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject._validate_exact_project_resources(
+            "docker",
+            "callmetric-pgvector-tls-123-abcdef123456",
+            resources,
+        )
+    assert captured.value.phase == subject.E_CLEANUP
+
+
+def test_unexpected_project_resource_name_or_label_fails_before_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = "callmetric-pgvector-tls-123-abcdef123456"
+    resources = {"container": ("container123",), "network": (), "volume": ()}
+
+    def inspect(_docker: str, _resource: str, _reference: str, template: str) -> str:
+        if template == "{{.Name}}":
+            return "/unrelated-container"
+        if subject.COMPOSE_PROJECT_LABEL in template:
+            return project
+        return subject.smoke.SERVICE
+
+    monkeypatch.setattr(subject, "_inspect_field", inspect)
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject._validate_exact_project_resources("docker", project, resources)
+    assert captured.value.phase == subject.E_CLEANUP
+
+
+@pytest.mark.parametrize(
+    "signal_timing",
+    ["before_ready", "foreground", "after_ttl", "during_cleanup"],
+)
+def test_controlled_interrupt_timings_share_one_ordered_cleanup_lifecycle(
+    signal_timing: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_bounded_lifecycle(monkeypatch, tmp_path)
+    events: list[str] = []
+    stop = threading.Event()
+
+    def install(candidate: threading.Event) -> dict[signal.Signals, object]:
+        nonlocal stop
+        stop = candidate
+        events.append("install")
+        return {}
+
+    def request_stop() -> None:
+        stop.set()
+        events.append("signal")
+
+    def certificates(*_args: object) -> None:
+        events.append("certificates")
+        if signal_timing == "before_ready":
+            request_stop()
+
+    def wait(*_args: object) -> None:
+        events.append("wait")
+        if signal_timing == "foreground":
+            request_stop()
+        events.append("ttl-return")
+
+    cleanup_calls = 0
+
+    def cleanup(*_args: object) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        events.append("docker-cleanup-start")
+        if signal_timing == "after_ttl":
+            request_stop()
+        events.append("docker-down-fallback-residue")
+        if signal_timing == "during_cleanup":
+            request_stop()
+        events.append("docker-cleanup-end")
+
+    snapshots = 0
+
+    def snapshot(_docker: str) -> dict[str, frozenset[str]]:
+        nonlocal snapshots
+        snapshots += 1
+        events.append(f"protected-{snapshots}")
+        return {"container": frozenset(), "network": frozenset(), "volume": frozenset()}
+
+    monkeypatch.setattr(subject, "_install_handlers", install)
+    monkeypatch.setattr(
+        subject, "_restore_handlers", lambda _value: events.append("restore")
+    )
+    monkeypatch.setattr(subject.smoke, "_generate_certificates", certificates)
+    monkeypatch.setattr(subject, "_wait", wait)
+    monkeypatch.setattr(subject, "_cleanup_project", cleanup)
+    monkeypatch.setattr(
+        subject, "_remove_handoff", lambda *_args: events.append("handoff")
+    )
+    monkeypatch.setattr(subject, "_resource_snapshot", snapshot)
+
+    subject.run(300)
+
+    assert cleanup_calls == 1
+    assert stop.is_set()
+    assert events.index("docker-cleanup-end") < events.index("handoff")
+    assert events.index("handoff") < events.index("protected-2")
+    assert events.index("protected-2") < events.index("restore")

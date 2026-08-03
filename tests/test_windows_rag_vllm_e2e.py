@@ -6,12 +6,14 @@ from typing import Any
 
 import httpx
 import pytest
+from psycopg import OperationalError
 
 from app.events.models import CoachingSuggestionSource
 from app.orchestration.models import (
     OrchestrationCitationReference,
     OrchestrationResult,
 )
+from app.vector_store.models import VectorBatchWriteResult, VectorRecordIdentity
 from scripts import run_windows_rag_vllm_e2e as subject
 
 
@@ -107,6 +109,22 @@ def valid_result(**changes: object) -> OrchestrationResult:
     return OrchestrationResult.model_validate(values)
 
 
+def valid_ingestion_result(
+    *, document_id: str | None = None, chunk_id: str | None = None
+) -> VectorBatchWriteResult:
+    return VectorBatchWriteResult(
+        tenant_id=subject.TENANT_ID,
+        knowledge_base_id=subject.KNOWLEDGE_BASE_ID,
+        inserted_identities=(
+            VectorRecordIdentity(
+                document_id=document_id or subject.DOCUMENT_ID,
+                chunk_id=chunk_id or subject.CHUNK_ID,
+            ),
+        ),
+        unchanged_identities=(),
+    )
+
+
 @pytest.fixture
 def mocked_flow(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     calls: list[str] = []
@@ -123,8 +141,9 @@ def mocked_flow(monkeypatch: pytest.MonkeyPatch) -> list[str]:
             vector_dimension=subject.VECTOR_DIMENSION,
         )
 
-    def ingest(**_kwargs: object) -> None:
+    def ingest(**_kwargs: object) -> VectorBatchWriteResult:
         calls.append("ingest")
+        return valid_ingestion_result()
 
     def orchestrate(**_kwargs: object) -> OrchestrationResult:
         calls.append("orchestrate")
@@ -325,6 +344,69 @@ def test_retrieval_unavailable_has_deterministic_fallback_and_cleanup(
     assert mocked_flow[-1] == "cleanup"
 
 
+@pytest.mark.parametrize(
+    ("stage", "expected_phase"),
+    [
+        ("cleanup", "E_INITIAL_CLEANUP"),
+        ("provision", "E_PROVISIONING"),
+        ("ingest", "E_INGESTION"),
+        ("orchestrate", "E_RETRIEVAL_UNAVAILABLE"),
+    ],
+)
+def test_psycopg_failures_have_distinct_fixed_phases_and_final_cleanup(
+    stage: str,
+    expected_phase: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocked_flow: list[str],
+) -> None:
+    if stage == "cleanup":
+        cleanup_calls = 0
+
+        def cleanup(*_args: object, **_kwargs: object) -> None:
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            mocked_flow.append("cleanup")
+            if cleanup_calls == 1:
+                raise OperationalError("synthetic private database detail")
+
+        monkeypatch.setattr(subject, "_cleanup_synthetic_scope", cleanup)
+    else:
+        collaborator = {
+            "provision": "provision_profile_bound_postgres_rag",
+            "ingest": "ingest_profile_bound_postgres_rag",
+            "orchestrate": "orchestrate_profile_bound_postgres_rag",
+        }[stage]
+
+        def unavailable(**_kwargs: object) -> None:
+            raise OperationalError("synthetic private database detail")
+
+        monkeypatch.setattr(subject, collaborator, unavailable)
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError, match=expected_phase):
+        subject.run(preflight_only=False, environment=environment(tmp_path))
+
+    assert mocked_flow[-1] == "cleanup"
+
+
+def test_ingestion_must_report_exact_synthetic_identity_before_retrieval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocked_flow: list[str],
+) -> None:
+    monkeypatch.setattr(
+        subject,
+        "ingest_profile_bound_postgres_rag",
+        lambda **_kwargs: valid_ingestion_result(document_id="unexpected_document"),
+    )
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError, match="E_INGESTION"):
+        subject.run(preflight_only=False, environment=environment(tmp_path))
+
+    assert "orchestrate" not in mocked_flow
+    assert mocked_flow[-1] == "cleanup"
+
+
 def test_vllm_unavailable_has_deterministic_fallback_and_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -418,6 +500,34 @@ def test_cli_output_never_leaks_secrets_or_private_paths(
     assert "synthetic-private-dsn" not in combined
     assert str(tmp_path) not in combined
     assert subject.SYNTHETIC_TRANSCRIPT not in combined
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "E_INITIAL_CLEANUP",
+        "E_PROVISIONING",
+        "E_INGESTION",
+        "E_RETRIEVAL_UNAVAILABLE",
+    ],
+)
+def test_database_phase_cli_output_is_fixed_and_secret_free(
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail(*, preflight_only: bool) -> str:
+        del preflight_only
+        try:
+            raise OperationalError("postgresql://secret private/path document text")
+        except OperationalError as error:
+            raise subject.WindowsRAGVLLME2EError(phase) from error
+
+    monkeypatch.setattr(subject, "run", fail)
+    assert subject.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"{phase}\n"
 
 
 def test_controller_owns_no_docker_aws_ssh_or_model_lifecycle() -> None:

@@ -43,6 +43,13 @@ CLEANUP_TIMEOUT_SECONDS = 120.0
 PROJECT_PATTERN = smoke.PROJECT_NAME_PATTERN
 HANDOFF_PATTERN = re.compile(r"^callmetric-postgres-tls-[a-z0-9_]{8}$")
 HANDOFF_FILES = frozenset({"application.dsn", "ca.crt", "connection.json"})
+RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+CERTIFICATE_CONTAINER_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]+$")
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
+COMPOSE_NETWORK_LABEL = "com.docker.compose.network"
+COMPOSE_VOLUME_LABEL = "com.docker.compose.volume"
+VOLUME_KEY = "postgres-tls-smoke-data"
 AUTHORIZED_ARTIFACTS = frozenset(
     {
         "docs/runbooks/postgres_tls_service_controller.md",
@@ -225,6 +232,179 @@ def _resource_snapshot(docker: str) -> dict[str, frozenset[str]]:
     }
 
 
+def _inspect_field(
+    docker: str,
+    resource: str,
+    reference: str,
+    template: str,
+) -> str:
+    if not RESOURCE_ID_PATTERN.fullmatch(reference):
+        raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+    return _output(
+        [docker, resource, "inspect", "--format", template, reference],
+        timeout=CLEANUP_TIMEOUT_SECONDS,
+    )
+
+
+def _project_resource_references(
+    docker: str,
+    project: str,
+) -> dict[str, tuple[str, ...]]:
+    if not PROJECT_PATTERN.fullmatch(project):
+        raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+    commands = {
+        "container": [docker, "container", "ls", "-aq"],
+        "network": [docker, "network", "ls", "-q"],
+        "volume": [docker, "volume", "ls", "-q"],
+    }
+    observed: dict[str, tuple[str, ...]] = {}
+    for resource, command in commands.items():
+        output = _output(
+            [
+                *command,
+                "--filter",
+                f"label={COMPOSE_PROJECT_LABEL}={project}",
+            ],
+            timeout=CLEANUP_TIMEOUT_SECONDS,
+        )
+        references = tuple(line for line in output.splitlines() if line)
+        if len(references) != len(set(references)) or any(
+            not RESOURCE_ID_PATTERN.fullmatch(reference) for reference in references
+        ):
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+        observed[resource] = references
+    return observed
+
+
+def _validate_exact_project_resources(
+    docker: str,
+    project: str,
+    resources: dict[str, tuple[str, ...]],
+) -> None:
+    containers = resources.get("container", ())
+    networks = resources.get("network", ())
+    volumes = resources.get("volume", ())
+    if set(resources) != {"container", "network", "volume"}:
+        raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+    if len(containers) > 2 or len(networks) > 1 or len(volumes) > 1:
+        raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+
+    observed_services: set[str] = set()
+    for reference in containers:
+        name = _inspect_field(docker, "container", reference, "{{.Name}}").removeprefix(
+            "/"
+        )
+        labeled_project = _inspect_field(
+            docker,
+            "container",
+            reference,
+            f'{{{{index .Config.Labels "{COMPOSE_PROJECT_LABEL}"}}}}',
+        )
+        service = _inspect_field(
+            docker,
+            "container",
+            reference,
+            f'{{{{index .Config.Labels "{COMPOSE_SERVICE_LABEL}"}}}}',
+        )
+        if labeled_project != project or service in observed_services:
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+        observed_services.add(service)
+        if service == smoke.SERVICE:
+            if name != f"{project}-{smoke.SERVICE}-1":
+                raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+        elif service == "certificate-init":
+            prefix = f"{project}-certificate-init-run-"
+            suffix = name.removeprefix(prefix)
+            if name == suffix or not CERTIFICATE_CONTAINER_SUFFIX_PATTERN.fullmatch(
+                suffix
+            ):
+                raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+        else:
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+
+    for resource, references, expected_name, label_name, expected_label in (
+        (
+            "network",
+            networks,
+            f"{project}_default",
+            COMPOSE_NETWORK_LABEL,
+            "default",
+        ),
+        (
+            "volume",
+            volumes,
+            f"{project}_{VOLUME_KEY}",
+            COMPOSE_VOLUME_LABEL,
+            VOLUME_KEY,
+        ),
+    ):
+        for reference in references:
+            if (
+                _inspect_field(docker, resource, reference, "{{.Name}}")
+                != expected_name
+                or _inspect_field(
+                    docker,
+                    resource,
+                    reference,
+                    f'{{{{index .Labels "{COMPOSE_PROJECT_LABEL}"}}}}',
+                )
+                != project
+                or _inspect_field(
+                    docker,
+                    resource,
+                    reference,
+                    f'{{{{index .Labels "{label_name}"}}}}',
+                )
+                != expected_label
+            ):
+                raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+
+
+def _exact_project_fallback(docker: str, project: str) -> None:
+    resources = _project_resource_references(docker, project)
+    _validate_exact_project_resources(docker, project, resources)
+    for resource, remove_arguments in (
+        ("container", ("container", "rm", "--force")),
+        ("network", ("network", "rm")),
+        ("volume", ("volume", "rm")),
+    ):
+        for reference in resources[resource]:
+            _run_command(
+                [docker, *remove_arguments, reference],
+                capture_output=True,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
+
+
+def _cleanup_project(
+    docker: str,
+    project: str,
+    environment: dict[str, str],
+) -> None:
+    down_failed = False
+    try:
+        _bounded_smoke_call(
+            CLEANUP_TIMEOUT_SECONDS,
+            lambda: smoke._cleanup(docker, project, environment),
+        )
+    except BaseException:
+        down_failed = True
+    if not down_failed:
+        try:
+            _bounded_smoke_call(
+                CLEANUP_TIMEOUT_SECONDS,
+                lambda: smoke._require_no_project_resources(docker, project),
+            )
+            return
+        except BaseException:
+            pass
+    _exact_project_fallback(docker, project)
+    _bounded_smoke_call(
+        CLEANUP_TIMEOUT_SECONDS,
+        lambda: smoke._require_no_project_resources(docker, project),
+    )
+
+
 def _private_root(raw: str | None) -> Path:
     if not raw:
         raise PostgreSQLTLSServiceError(phase=E_HANDOFF)
@@ -405,7 +585,7 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
     primary: BaseException | None = None
     cleanup: BaseException | None = None
     environment: dict[str, str] | None = None
-    started = False
+    resource_creation_attempted = False
     try:
         with tempfile.TemporaryDirectory(
             prefix="callmetric-postgres-tls-service-"
@@ -424,6 +604,7 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
                         timeout=COMPOSE_CONFIG_TIMEOUT_SECONDS,
                     ),
                 )
+                resource_creation_attempted = True
                 _phase(
                     E_TLS,
                     lambda: _bounded_smoke_call(
@@ -440,7 +621,6 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
                         lambda: smoke._validate_certificates(docker, tls),
                     ),
                 )
-                started = True
                 _phase(
                     E_STARTUP,
                     lambda: _run_command(
@@ -504,28 +684,15 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
             except BaseException as error:
                 primary = error
             finally:
+                if resource_creation_attempted and environment is not None:
+                    cleanup = _capture(
+                        cleanup,
+                        E_CLEANUP,
+                        lambda: _cleanup_project(docker, project, environment),
+                    )
                 cleanup = _capture(
                     cleanup, E_CLEANUP, lambda: _remove_handoff(handoff, root)
                 )
-                if started and environment is not None:
-                    cleanup = _capture(
-                        cleanup,
-                        E_CLEANUP,
-                        lambda: _bounded_smoke_call(
-                            CLEANUP_TIMEOUT_SECONDS,
-                            lambda: smoke._cleanup(docker, project, environment),
-                        ),
-                    )
-                    cleanup = _capture(
-                        cleanup,
-                        E_CLEANUP,
-                        lambda: _bounded_smoke_call(
-                            CLEANUP_TIMEOUT_SECONDS,
-                            lambda: smoke._require_no_project_resources(
-                                docker, project
-                            ),
-                        ),
-                    )
     except BaseException as error:
         primary = primary or error
 
