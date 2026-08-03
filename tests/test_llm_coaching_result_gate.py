@@ -78,6 +78,7 @@ def test_coaching_wire_schema_is_flattened_exact_and_fresh() -> None:
     assert "$ref" not in serialized
     assert "$defs" not in serialized
     assert "guided_json" not in serialized
+    assert "uniqueItems" not in serialized
     branches = first["oneOf"]
     assert isinstance(branches, list)
     assert len(branches) == 2
@@ -85,6 +86,25 @@ def test_coaching_wire_schema_is_flattened_exact_and_fresh() -> None:
         isinstance(branch, dict) and branch.get("additionalProperties") is False
         for branch in branches
     )
+    suggestion = branches[0]
+    assert isinstance(suggestion, dict)
+    properties = suggestion["properties"]
+    assert isinstance(properties, dict)
+    citations = properties["citations"]
+    assert citations == {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string", "minLength": 1},
+                "chunk_id": {"type": "string", "minLength": 1},
+            },
+            "required": ["document_id", "chunk_id"],
+            "additionalProperties": False,
+        },
+        "minItems": 1,
+        "maxItems": 20,
+    }
 
 
 @pytest.mark.parametrize(

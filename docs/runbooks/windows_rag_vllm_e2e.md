@@ -64,6 +64,12 @@ validate those values. Generic gateway callers remain unconstrained by default.
 The removed `guided_json` alias is not used, and an HTTP schema rejection is
 never retried without the constraint.
 
+The generation schema intentionally omits JSON Schema `uniqueItems` because the
+pinned vLLM 0.26 structured-output backend rejects that keyword. Citation count,
+shape, and length constraints remain in the schema; citation uniqueness remains
+mandatory and is enforced semantically by `LLMCoachingResultGate`. A generated
+duplicate therefore still fails closed as `E_ADMISSION_DUPLICATE_CITATION`.
+
 The ephemeral TLS `application.dsn` role is provisioned with `DELETE` only on
 `callmetric_vector.vector_records` and `callmetric_vector.embedding_profiles`.
 That narrow privilege is required for steps 1 and 6; both deletes remain

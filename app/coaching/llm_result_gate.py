@@ -64,7 +64,6 @@ def coaching_wire_json_schema() -> dict[str, object]:
                 "items": citation,
                 "minItems": 1,
                 "maxItems": MAX_CITATIONS,
-                "uniqueItems": True,
             },
             "source": {"type": "string", "enum": ["llm"]},
         },

@@ -448,6 +448,27 @@ def test_invalid_completion_shapes_do_not_leak_content(private_output: str) -> N
     assert private_output not in str(raised.value)
 
 
+def test_duplicate_generated_citation_has_secret_free_gate_phase() -> None:
+    artifacts = subject._load_artifacts()
+    result = valid_result()
+    payload = json.loads(result.generated_text)
+    assert isinstance(payload, dict)
+    citations = payload["citations"]
+    assert isinstance(citations, list)
+    payload["citations"] = [*citations, *citations]
+    private_output = json.dumps(payload)
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError) as raised:
+        subject._admit_result(
+            policy=artifacts.policy,
+            event=subject._transcript_event(),
+            result=valid_result(generated_text=private_output),
+        )
+
+    assert str(raised.value) == "E_ADMISSION_DUPLICATE_CITATION"
+    assert private_output not in str(raised.value)
+
+
 def test_final_suggestion_mismatch_has_distinct_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
