@@ -435,24 +435,43 @@ def _wait_for_ready(context: ssl.SSLContext, token: str) -> None:
     raise VLLME2EServiceError(_FIXED_FAILURE)
 
 
-def _wait_foreground(ttl: int, stop_event: threading.Event) -> None:
-    deadline = time.monotonic() + ttl
+def _controlled_signals() -> tuple[signal.Signals, ...]:
+    selected = [signal.SIGINT, signal.SIGTERM]
+    hangup = getattr(signal, "SIGHUP", None)
+    if isinstance(hangup, signal.Signals):
+        selected.append(hangup)
+    return tuple(selected)
+
+
+def _install_controlled_signal_handlers(
+    stop_event: threading.Event,
+) -> dict[signal.Signals, Any]:
     previous_handlers: dict[signal.Signals, Any] = {}
 
     def request_stop(_signal_number: int, _frame: FrameType | None) -> None:
         stop_event.set()
 
     try:
-        for selected_signal in (signal.SIGINT, signal.SIGTERM):
+        for selected_signal in _controlled_signals():
             previous_handlers[selected_signal] = signal.signal(
                 selected_signal, request_stop
             )
-        remaining = max(0, math.ceil(deadline - time.monotonic()))
-        print(_READY_MESSAGE.format(seconds=remaining), flush=True)
-        stop_event.wait(timeout=max(0.0, deadline - time.monotonic()))
-    finally:
-        for selected_signal, previous in previous_handlers.items():
-            signal.signal(selected_signal, previous)
+    except BaseException:
+        _restore_signal_handlers(previous_handlers)
+        raise
+    return previous_handlers
+
+
+def _restore_signal_handlers(previous_handlers: dict[signal.Signals, Any]) -> None:
+    for selected_signal, previous in previous_handlers.items():
+        signal.signal(selected_signal, previous)
+
+
+def _wait_foreground(ttl: int, stop_event: threading.Event) -> None:
+    deadline = time.monotonic() + ttl
+    remaining = max(0, math.ceil(deadline - time.monotonic()))
+    print(_READY_MESSAGE.format(seconds=remaining), flush=True)
+    stop_event.wait(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def _cleanup(project: str, environment: dict[str, str]) -> None:
@@ -527,6 +546,11 @@ def run(ttl: int) -> None:
     startup_attempted = False
     primary_failure: BaseException | None = None
     cleanup_failure: BaseException | None = None
+    stop_event = threading.Event()
+    previous_handlers = _phase_call(
+        E_RUNTIME_CONTRACT,
+        lambda: _install_controlled_signal_handlers(stop_event),
+    )
     try:
         with tempfile.TemporaryDirectory(prefix="callmetric-vllm-e2e-tls-") as raw_tls:
             tls_directory = Path(raw_tls)
@@ -571,7 +595,7 @@ def run(ttl: int) -> None:
                 _phase_call(E_GPU_ACTIVITY, _validate_gpu_active)
                 _phase_call(
                     E_RUNTIME_CONTRACT,
-                    lambda: _wait_foreground(ttl, threading.Event()),
+                    lambda: _wait_foreground(ttl, stop_event),
                 )
             except BaseException as error:
                 primary_failure = error
@@ -606,12 +630,20 @@ def run(ttl: int) -> None:
     except BaseException as error:
         protected_failure = error
 
+    signal_failure = _capture_failure(
+        None,
+        E_CLEANUP,
+        lambda: _restore_signal_handlers(previous_handlers),
+    )
+
     if primary_failure is not None:
         raise primary_failure
     if cleanup_failure is not None:
         raise cleanup_failure
     if protected_failure is not None:
         raise protected_failure
+    if signal_failure is not None:
+        raise signal_failure
     _phase_call(E_RUNTIME_CONTRACT, smoke._validate_port_free)
     _phase_call(E_REPOSITORY, _validate_repository)
 

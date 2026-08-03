@@ -452,36 +452,52 @@ def test_readiness_requires_health_and_exact_model(
     subject._wait_for_ready(ssl.create_default_context(), "synthetic-token")
 
 
-def test_foreground_wait_is_bounded_and_restores_signal_handlers(
+def test_foreground_wait_is_bounded(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    installed: list[tuple[signal.Signals, Any]] = []
     waits: list[float | None] = []
     clock = iter([100.0, 100.0, 100.0])
 
     class FakeEvent:
-        def set(self) -> None:
-            return None
-
         def wait(self, timeout: float | None = None) -> bool:
             waits.append(timeout)
             return False
 
-    def fake_signal(selected: signal.Signals, handler: Any) -> Any:
-        installed.append((selected, handler))
-        return f"previous-{selected}"
-
-    monkeypatch.setattr(subject.signal, "signal", fake_signal)
     monkeypatch.setattr(subject.time, "monotonic", lambda: next(clock))
     subject._wait_foreground(300, FakeEvent())  # type: ignore[arg-type]
 
     assert waits == [300.0]
-    assert [selected for selected, _handler in installed[:2]] == [
-        signal.SIGINT,
-        signal.SIGTERM,
-    ]
-    assert len(installed) == 4
     assert capsys.readouterr().out == "PR54 vLLM READY; TTL remaining: 300 seconds\n"
+
+
+def test_controlled_signal_handlers_are_idempotent_and_restore_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed: dict[signal.Signals, Any] = {}
+    restored: list[tuple[signal.Signals, Any]] = []
+    installing = True
+
+    def fake_signal(selected: signal.Signals, handler: Any) -> Any:
+        nonlocal installing
+        if installing:
+            installed[selected] = handler
+            return f"previous-{selected}"
+        restored.append((selected, handler))
+        return None
+
+    monkeypatch.setattr(subject.signal, "signal", fake_signal)
+    stop_event = subject.threading.Event()
+    previous = subject._install_controlled_signal_handlers(stop_event)
+    installing = False
+
+    assert set(installed) == set(subject._controlled_signals())
+    for selected, handler in installed.items():
+        handler(selected, None)
+        handler(selected, None)
+    assert stop_event.is_set()
+
+    subject._restore_signal_handlers(previous)
+    assert restored == list(previous.items())
 
 
 def _stub_lifecycle(
@@ -539,11 +555,129 @@ def _stub_lifecycle(
     monkeypatch.setattr(subject, "_wait_for_ready", lambda *_args: None)
     monkeypatch.setattr(subject, "_wait_foreground", lambda *_args: None)
     monkeypatch.setattr(
+        subject, "_install_controlled_signal_handlers", lambda _event: {}
+    )
+    monkeypatch.setattr(subject, "_restore_signal_handlers", lambda _handlers: None)
+    monkeypatch.setattr(
         subject,
         "_run",
         lambda arguments, **_kwargs: calls.append(arguments) or _completed(arguments),
     )
     return calls, handoff_root
+
+
+def _signal_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+) -> dict[signal.Signals, Any]:
+    installed: dict[signal.Signals, Any] = {}
+
+    def install(stop_event: subject.threading.Event) -> dict[signal.Signals, Any]:
+        events.append("install")
+
+        def request_stop(_signal_number: int, _frame: Any) -> None:
+            stop_event.set()
+
+        for selected in subject._controlled_signals():
+            installed[selected] = request_stop
+        return {selected: f"previous-{selected}" for selected in installed}
+
+    def restore(_previous: dict[signal.Signals, Any]) -> None:
+        events.append("restore")
+
+    monkeypatch.setattr(subject, "_install_controlled_signal_handlers", install)
+    monkeypatch.setattr(subject, "_restore_signal_handlers", restore)
+    return installed
+
+
+@pytest.mark.parametrize(
+    "selected_signal",
+    [
+        signal.SIGINT,
+        pytest.param(
+            getattr(signal, "SIGHUP", None),
+            marks=pytest.mark.skipif(
+                not hasattr(signal, "SIGHUP"), reason="SIGHUP is unavailable"
+            ),
+        ),
+    ],
+)
+def test_signal_before_foreground_runs_all_cleanup_before_restore(
+    selected_signal: signal.Signals,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls, handoff_root = _stub_lifecycle(monkeypatch, tmp_path)
+    events: list[str] = []
+    installed = _signal_harness(monkeypatch, events)
+    protected_calls = 0
+
+    def protected_snapshot() -> dict[str, tuple[str, str]]:
+        nonlocal protected_calls
+        protected_calls += 1
+        events.append(f"protected-{protected_calls}")
+        return {"protected": ("id", "running")}
+
+    monkeypatch.setattr(
+        subject.smoke, "_protected_container_snapshot", protected_snapshot
+    )
+    monkeypatch.setattr(
+        subject,
+        "_wait_for_ready",
+        lambda *_args: installed[selected_signal](selected_signal, None),
+    )
+    monkeypatch.setattr(
+        subject, "_wait_for_gpu_idle", lambda: events.append("post-idle")
+    )
+
+    subject.run(300)
+
+    assert sum("down" in call for call in calls) == 1
+    assert not tuple(handoff_root.iterdir())
+    assert events[-2:] == ["protected-2", "restore"]
+    assert "post-idle" in events
+
+
+def test_sigterm_after_ttl_return_runs_exact_cleanup_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls, handoff_root = _stub_lifecycle(monkeypatch, tmp_path)
+    events: list[str] = []
+    installed = _signal_harness(monkeypatch, events)
+    cleanup = subject._cleanup
+
+    def signal_then_cleanup(project: str, environment: dict[str, str]) -> None:
+        installed[signal.SIGTERM](signal.SIGTERM, None)
+        cleanup(project, environment)
+
+    monkeypatch.setattr(subject, "_cleanup", signal_then_cleanup)
+
+    subject.run(300)
+
+    assert sum("down" in call for call in calls) == 1
+    assert not tuple(handoff_root.iterdir())
+    assert events[-1] == "restore"
+
+
+def test_repeated_signals_during_cleanup_are_idempotent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls, _ = _stub_lifecycle(monkeypatch, tmp_path)
+    events: list[str] = []
+    installed = _signal_harness(monkeypatch, events)
+
+    def signal_during_gpu_cleanup() -> None:
+        for _ in range(3):
+            installed[signal.SIGINT](signal.SIGINT, None)
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+        events.append("post-idle")
+
+    monkeypatch.setattr(subject, "_wait_for_gpu_idle", signal_during_gpu_cleanup)
+
+    subject.run(300)
+
+    assert sum("down" in call for call in calls) == 1
+    assert events[-2:] == ["post-idle", "restore"]
 
 
 def test_run_uses_unique_project_and_isolated_cleanup_without_real_execution(
@@ -762,7 +896,7 @@ def test_cleanup_failure_without_primary_reports_cleanup_phase(
     assert (tmp_path / "cache").is_dir()
 
 
-@pytest.mark.parametrize("secondary_failure", ["handoff", "protected"])
+@pytest.mark.parametrize("secondary_failure", ["handoff", "protected", "signal"])
 def test_secondary_failures_do_not_mask_primary_phase(
     secondary_failure: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -786,6 +920,12 @@ def test_secondary_failures_do_not_mask_primary_phase(
             subject,
             "_remove_handoff",
             lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic handoff")),
+        )
+    if secondary_failure == "signal":
+        monkeypatch.setattr(
+            subject,
+            "_restore_signal_handlers",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("synthetic signal")),
         )
     monkeypatch.setattr(
         subject,

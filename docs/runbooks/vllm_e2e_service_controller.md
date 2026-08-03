@@ -100,7 +100,8 @@ permits a different image digest.
 The controller declares READY only after trusted HTTPS `/health` succeeds and
 authenticated `/v1/models` returns exactly
 `callmetric-qwen25-7b-awq`. It then remains in the foreground until TTL
-expiry, SIGINT, or SIGTERM. Status and failures are fixed and secret-free;
+expiry, SIGINT, SIGTERM, or SIGHUP where supported. Status and failures are
+fixed and secret-free;
 requests, prompts, responses, tokens, certificate material, environment
 values, cache contents, and private paths are never logged.
 
@@ -128,8 +129,9 @@ Bounded operation uses these exact timeouts:
 - Shutdown: 120 seconds
 - Post-cleanup GPU-idle wait: 30 seconds
 
-Normal completion, TTL expiry, SIGINT, SIGTERM, and handled failures run
-`docker compose down` only for that randomized PR54 project, then remove only
+Normal completion, TTL expiry, SIGINT, SIGTERM, supported SIGHUP, and handled
+failures run `docker compose down` only for that randomized PR54 project, then
+remove only
 its ephemeral TLS/token/handoff material. Cleanup does not remove the pinned
 image or persistent model cache and never uses volumes cleanup, prune, broad
 stop/remove, or wildcard resource selection. The four protected containers are
@@ -137,10 +139,13 @@ checked before and after the lifecycle; any identity or status change fails
 safely. Cleanup ordering is exact-project shutdown, bounded GPU-idle polling,
 handoff and ephemeral TLS removal, then protected-container validation. A
 cleanup failure is reported as `E_CLEANUP` only when no earlier lifecycle phase
-already failed; cleanup cannot replace the original failure phase.
+already failed; cleanup cannot replace the original failure phase. Controlled
+signal handlers are installed before startup and restored only after protected
+resource validation, so repeated signals request shutdown without duplicating
+project cleanup.
 
-SIGKILL, host failure, or process-runtime failure can prevent Python `finally`
-cleanup. After such an interruption, first use `docker compose ls` to identify
+SIGKILL, host failure, or interpreter-runtime failure can prevent Python
+`finally` cleanup. After such an interruption, first use `docker compose ls` to identify
 the exact `callmetric-vllm-e2e-<pid>-<suffix>` project name. Verify only that
 exact project with:
 
