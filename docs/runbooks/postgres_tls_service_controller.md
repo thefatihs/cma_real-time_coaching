@@ -15,6 +15,7 @@ Run read-only preflight first (it checks the checkout, Docker/Compose/server,
 `desktop-linux` context, pinned image contract, and snapshots resources):
 
 ```powershell
+$env:CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD = (git rev-parse HEAD).Trim()
 uv run python -m scripts.run_postgres_tls_service --ttl-seconds 600 --preflight-only
 ```
 
@@ -22,8 +23,13 @@ After approval, start the foreground controller with a TTL from 300 through
 7200 seconds:
 
 ```powershell
-uv run python -m scripts.run_postgres_tls_service --ttl-seconds 600
+$env:CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD = (git rev-parse HEAD).Trim()
+uv run python -m scripts.run_postgres_tls_service --ttl-seconds 7200
 ```
+
+The supplied expected HEAD must be the exact lowercase 40-character commit.
+The controller fails closed unless it matches both the current checkout and
+`origin/feat/rag-coaching-integration`; it never prints the supplied value.
 
 It generates fresh passwords and one-day TLS material, binds only a random
 `127.0.0.1` port, validates the certificate, waits for container health, then
@@ -32,10 +38,29 @@ checks its idempotence and schema readiness, and performs synthetic tenant-safe
 pgvector operations. `READY` is emitted only after all of those checks and the
 owner-only handoff succeed.
 
+## Bounded command timeouts
+
+| Phase | Bound |
+| --- | ---: |
+| Repository, Docker validation, identity, ACL and ordinary resource queries | 30 seconds per command |
+| Compose configuration validation | 30 seconds |
+| Certificate generation and each certificate validation command | 60 seconds per command |
+| Compose PostgreSQL startup | 120 seconds |
+| PostgreSQL health window | 60 seconds, with 30 seconds per Docker query |
+| Migration, provisioning and synthetic pgvector proof | 180 seconds |
+| Exact-project Compose down and each residue query | 120 seconds per command |
+
+A command timeout reports only its fixed lifecycle phase. Cleanup is still
+attempted after startup or migration failure; a cleanup timeout cannot replace
+that primary phase, but is `E_CLEANUP` when no earlier phase failed.
+
 TTL expiry, SIGINT, SIGTERM, and SIGHUP where Windows exposes it remove the
 handoff, exact randomized Compose project container/network/ephemeral volume,
 and TLS directory. The controller never prunes or selects resources broadly;
 it compares all pre-existing container, network, and volume IDs afterward.
+Forced process termination, `Stop-Process -Force`, host shutdown, power loss,
+or a Python/Docker host crash can prevent signal/finally cleanup from running;
+use exact-project resource verification before any manual recovery.
 
 Failures expose only one fixed phase code and `PR54 PostgreSQL TLS service
 failed`. Do not troubleshoot by printing DSNs, passwords, certificate paths, or

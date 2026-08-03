@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 import csv
 import io
 import json
@@ -25,10 +26,20 @@ from scripts import run_postgres_tls_smoke as smoke
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_BRANCH = "feat/rag-coaching-integration"
-EXPECTED_HEAD = "bb8d3a4c8ae76c0231fa6ee4df66f648d2772e56"
+EXPECTED_HEAD_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HANDOFF_ROOT_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_HANDOFF_ROOT"
 MINIMUM_TTL_SECONDS = 300
 MAXIMUM_TTL_SECONDS = 7_200
+VALIDATION_TIMEOUT_SECONDS = 30.0
+IDENTITY_ACL_TIMEOUT_SECONDS = 30.0
+CERTIFICATE_TIMEOUT_SECONDS = 60.0
+COMPOSE_CONFIG_TIMEOUT_SECONDS = 30.0
+COMPOSE_STARTUP_TIMEOUT_SECONDS = 120.0
+READINESS_COMMAND_TIMEOUT_SECONDS = 30.0
+POSTGRES_READINESS_TIMEOUT_SECONDS = smoke.HEALTH_TIMEOUT_SECONDS
+MIGRATION_PROOF_TIMEOUT_SECONDS = 180.0
+CLEANUP_TIMEOUT_SECONDS = 120.0
 PROJECT_PATTERN = smoke.PROJECT_NAME_PATTERN
 HANDOFF_PATTERN = re.compile(r"^callmetric-postgres-tls-[a-z0-9_]{8}$")
 HANDOFF_FILES = frozenset({"application.dsn", "ca.crt", "connection.json"})
@@ -82,13 +93,69 @@ def _phase(phase: str, operation: Callable[[], T]) -> T:
         raise PostgreSQLTLSServiceError(phase=phase) from error
 
 
-def _output(arguments: list[str], *, environment: dict[str, str] | None = None) -> str:
+def _run_command(
+    arguments: list[str],
+    *,
+    environment: dict[str, str] | None = None,
+    capture_output: bool = True,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        arguments,
+        check=True,
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=capture_output,
+        shell=False,
+        timeout=timeout,
+    )
+
+
+def _output(
+    arguments: list[str],
+    *,
+    environment: dict[str, str] | None = None,
+    timeout: float = VALIDATION_TIMEOUT_SECONDS,
+) -> str:
     try:
-        return smoke._run(
-            arguments, environment=environment, capture_output=True
+        return _run_command(
+            arguments,
+            environment=environment,
+            capture_output=True,
+            timeout=timeout,
         ).stdout.strip()
     except (OSError, subprocess.SubprocessError) as error:
         raise PostgreSQLTLSServiceError() from error
+
+
+@contextmanager
+def _bounded_smoke_runner(timeout: float) -> Iterator[None]:
+    original = smoke._run
+
+    def bounded_run(
+        arguments: list[str],
+        *,
+        environment: dict[str, str] | None = None,
+        capture_output: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        return _run_command(
+            arguments,
+            environment=environment,
+            capture_output=capture_output,
+            timeout=timeout,
+        )
+
+    smoke._run = bounded_run
+    try:
+        yield
+    finally:
+        smoke._run = original
+
+
+def _bounded_smoke_call(timeout: float, operation: Callable[[], T]) -> T:
+    with _bounded_smoke_runner(timeout):
+        return operation()
 
 
 def _parse_arguments(arguments: list[str]) -> tuple[int, bool]:
@@ -111,11 +178,16 @@ def _parse_arguments(arguments: list[str]) -> tuple[int, bool]:
 
 
 def _validate_repository() -> None:
+    expected_head = os.environ.get(EXPECTED_HEAD_VARIABLE)
+    if expected_head is None or not COMMIT_PATTERN.fullmatch(expected_head):
+        raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
     if Path.cwd().resolve() != REPOSITORY_ROOT:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
     if _output(["git", "branch", "--show-current"]) != EXPECTED_BRANCH:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
-    if _output(["git", "rev-parse", "HEAD"]) != EXPECTED_HEAD:
+    if _output(["git", "rev-parse", "HEAD"]) != expected_head:
+        raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
+    if _output(["git", "rev-parse", f"origin/{EXPECTED_BRANCH}"]) != expected_head:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
     raw = _output(["git", "status", "--porcelain", "-z", "--untracked-files=all"])
     records = [record for record in raw.split("\0") if record]
@@ -194,6 +266,7 @@ def _restrict_owner(path: Path, *, directory: bool) -> None:
             text=True,
             capture_output=True,
             shell=False,
+            timeout=IDENTITY_ACL_TIMEOUT_SECONDS,
         ).stdout
         row = next(csv.reader(io.StringIO(identity)))
         if len(row) != 2 or not row[1].startswith("S-"):
@@ -211,6 +284,7 @@ def _restrict_owner(path: Path, *, directory: bool) -> None:
             text=True,
             capture_output=True,
             shell=False,
+            timeout=IDENTITY_ACL_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise PostgreSQLTLSServiceError(phase=E_HANDOFF) from error
@@ -343,35 +417,54 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
             try:
                 _phase(
                     E_PREFLIGHT,
-                    lambda: smoke._run(
+                    lambda: _run_command(
                         smoke._compose_arguments(docker, project, "config", "--quiet"),
                         environment=environment,
                         capture_output=True,
+                        timeout=COMPOSE_CONFIG_TIMEOUT_SECONDS,
                     ),
                 )
                 _phase(
                     E_TLS,
-                    lambda: smoke._generate_certificates(docker, project, environment),
+                    lambda: _bounded_smoke_call(
+                        CERTIFICATE_TIMEOUT_SECONDS,
+                        lambda: smoke._generate_certificates(
+                            docker, project, environment
+                        ),
+                    ),
                 )
-                _phase(E_TLS, lambda: smoke._validate_certificates(docker, tls))
+                _phase(
+                    E_TLS,
+                    lambda: _bounded_smoke_call(
+                        CERTIFICATE_TIMEOUT_SECONDS,
+                        lambda: smoke._validate_certificates(docker, tls),
+                    ),
+                )
                 started = True
                 _phase(
                     E_STARTUP,
-                    lambda: smoke._run(
+                    lambda: _run_command(
                         smoke._compose_arguments(
                             docker, project, "up", "-d", smoke.SERVICE
                         ),
                         environment=environment,
                         capture_output=True,
+                        timeout=COMPOSE_STARTUP_TIMEOUT_SECONDS,
                     ),
                 )
                 _phase(
                     E_READINESS,
-                    lambda: smoke._wait_until_healthy(docker, project, environment),
+                    lambda: _bounded_smoke_call(
+                        READINESS_COMMAND_TIMEOUT_SECONDS,
+                        lambda: smoke._wait_until_healthy(docker, project, environment),
+                    ),
                 )
                 port = _phase(
                     E_READINESS,
-                    lambda: smoke._published_port(docker, project, environment),
+                    lambda: _bounded_smoke_call(
+                        READINESS_COMMAND_TIMEOUT_SECONDS,
+                        lambda: smoke._published_port(docker, project, environment),
+                    ),
                 )
                 test_environment = smoke._pytest_environment(
                     port=port,
@@ -381,7 +474,7 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
                 )
                 _phase(
                     E_MIGRATION,
-                    lambda: smoke._run(
+                    lambda: _run_command(
                         [
                             sys.executable,
                             "-m",
@@ -392,6 +485,7 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
                         ],
                         environment=test_environment,
                         capture_output=True,
+                        timeout=MIGRATION_PROOF_TIMEOUT_SECONDS,
                     ),
                 )
                 dsn = (
@@ -417,12 +511,20 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
                     cleanup = _capture(
                         cleanup,
                         E_CLEANUP,
-                        lambda: smoke._cleanup(docker, project, environment),
+                        lambda: _bounded_smoke_call(
+                            CLEANUP_TIMEOUT_SECONDS,
+                            lambda: smoke._cleanup(docker, project, environment),
+                        ),
                     )
                     cleanup = _capture(
                         cleanup,
                         E_CLEANUP,
-                        lambda: smoke._require_no_project_resources(docker, project),
+                        lambda: _bounded_smoke_call(
+                            CLEANUP_TIMEOUT_SECONDS,
+                            lambda: smoke._require_no_project_resources(
+                                docker, project
+                            ),
+                        ),
                     )
     except BaseException as error:
         primary = primary or error

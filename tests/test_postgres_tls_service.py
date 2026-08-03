@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import signal
+import subprocess
 import threading
 from pathlib import Path
 
 import pytest
 
 from scripts import run_postgres_tls_service as subject
+
+CURRENT_COMMIT = "cf3932dcb43911b2a5f5ff139f6ce07c88caf389"
 
 
 @pytest.mark.parametrize("ttl", [300, 600, 7200])
@@ -71,6 +75,99 @@ def test_preflight_stops_before_secrets_signals_or_runtime(
     subject.run(300, preflight_only=True)
 
 
+def _mock_clean_repository(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    current: str = CURRENT_COMMIT,
+    remote: str = CURRENT_COMMIT,
+) -> None:
+    monkeypatch.setenv(subject.EXPECTED_HEAD_VARIABLE, CURRENT_COMMIT)
+    monkeypatch.setattr(subject.Path, "cwd", lambda: subject.REPOSITORY_ROOT)
+
+    def output(arguments: list[str], **_kwargs: object) -> str:
+        command = tuple(arguments)
+        responses = {
+            ("git", "branch", "--show-current"): subject.EXPECTED_BRANCH,
+            ("git", "rev-parse", "HEAD"): current,
+            (
+                "git",
+                "rev-parse",
+                f"origin/{subject.EXPECTED_BRANCH}",
+            ): remote,
+            (
+                "git",
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+            ): "",
+        }
+        return responses[command]
+
+    monkeypatch.setattr(subject, "_output", output)
+
+
+def test_exact_configured_current_and_remote_head_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_clean_repository(monkeypatch)
+    subject._validate_repository()
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        None,
+        "",
+        "cf3932d",
+        "CF3932DCB43911B2A5F5FF139F6CE07C88CAF389",
+        "g" * 40,
+        f"{CURRENT_COMMIT}0",
+        "0" * 40,
+    ],
+)
+def test_missing_malformed_uppercase_abbreviated_or_stale_head_fails_closed(
+    configured: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _mock_clean_repository(monkeypatch)
+    if configured is None:
+        monkeypatch.delenv(subject.EXPECTED_HEAD_VARIABLE, raising=False)
+    else:
+        monkeypatch.setenv(subject.EXPECTED_HEAD_VARIABLE, configured)
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject._validate_repository()
+    assert captured.value.phase == subject.E_REPOSITORY
+
+
+@pytest.mark.parametrize("mismatch", ["current", "remote"])
+def test_current_or_remote_mismatch_fails_repository_phase(
+    mismatch: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = "0" * 40
+    _mock_clean_repository(
+        monkeypatch,
+        current=stale if mismatch == "current" else CURRENT_COMMIT,
+        remote=stale if mismatch == "remote" else CURRENT_COMMIT,
+    )
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject._validate_repository()
+    assert captured.value.phase == subject.E_REPOSITORY
+
+
+def test_controller_contains_no_fixed_repository_commit_and_accepts_future_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path(subject.__file__).read_text(encoding="utf-8")
+    assert CURRENT_COMMIT not in source
+    assert "EXPECTED_HEAD =" not in source
+    future = "1" * 40
+    _mock_clean_repository(monkeypatch, current=future, remote=future)
+    monkeypatch.setenv(subject.EXPECTED_HEAD_VARIABLE, future)
+    subject._validate_repository()
+
+
 def test_ready_is_emitted_only_from_foreground_wait(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -127,3 +224,211 @@ def test_controller_reuses_pr52_without_modifying_it() -> None:
     assert "127.0.0.1" not in source
     assert "sslmode=verify-full" in source
     assert "docker system prune" not in source
+
+
+def test_every_direct_subprocess_call_has_an_explicit_timeout() -> None:
+    source = Path(subject.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    subprocess_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+        and node.func.attr == "run"
+    ]
+    assert subprocess_calls
+    assert all(
+        any(keyword.arg == "timeout" for keyword in call.keywords)
+        for call in subprocess_calls
+    )
+    timeout_values = [
+        ast.unparse(
+            next(keyword.value for keyword in call.keywords if keyword.arg == "timeout")
+        )
+        for call in subprocess_calls
+    ]
+    assert timeout_values.count("timeout") == 1
+    assert timeout_values.count("IDENTITY_ACL_TIMEOUT_SECONDS") == 2
+
+
+def _stub_bounded_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    failures: frozenset[str] = frozenset(),
+) -> list[tuple[str, float]]:
+    calls: list[tuple[str, float]] = []
+    root = tmp_path / "handoff-root"
+    root.mkdir()
+    handoff = root / "callmetric-postgres-tls-abcdefgh"
+
+    monkeypatch.setattr(subject, "_validate_repository", lambda: None)
+    monkeypatch.setattr(subject, "_docker_preflight", lambda: "docker")
+    monkeypatch.setattr(subject, "_resource_snapshot", lambda _docker: {})
+    monkeypatch.setattr(subject, "_private_root", lambda _raw: root)
+    monkeypatch.setattr(subject, "_install_handlers", lambda _stop: {})
+    monkeypatch.setattr(subject, "_restore_handlers", lambda _previous: None)
+    monkeypatch.setattr(subject, "_create_handoff", lambda *_args: handoff)
+    monkeypatch.setattr(subject, "_remove_handoff", lambda *_args: None)
+    monkeypatch.setattr(subject, "_wait", lambda *_args: None)
+    monkeypatch.setattr(subject.os, "getpid", lambda: 123)
+    monkeypatch.setattr(subject.secrets, "token_hex", lambda _size: "abcdef123456")
+    monkeypatch.setattr(
+        subject.secrets, "token_urlsafe", lambda size: f"synthetic-{size}"
+    )
+    monkeypatch.setattr(subject.smoke, "_smoke_environment", lambda **_kwargs: {})
+    monkeypatch.setattr(subject.smoke, "_pytest_environment", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        subject.smoke,
+        "_generate_certificates",
+        lambda *_args: subject.smoke._run(
+            ["certificate-generation"], capture_output=True
+        ),
+    )
+    monkeypatch.setattr(
+        subject.smoke,
+        "_validate_certificates",
+        lambda *_args: subject.smoke._run(
+            ["certificate-validation"], capture_output=True
+        ),
+    )
+    monkeypatch.setattr(
+        subject.smoke,
+        "_wait_until_healthy",
+        lambda *_args: subject.smoke._run(["readiness-inspect"], capture_output=True),
+    )
+
+    def published_port(*_args: object) -> int:
+        subject.smoke._run(["published-port"], capture_output=True)
+        return 54321
+
+    monkeypatch.setattr(subject.smoke, "_published_port", published_port)
+
+    def run_command(
+        arguments: list[str],
+        *,
+        environment: dict[str, str] | None = None,
+        capture_output: bool = True,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del environment, capture_output
+        rendered = " ".join(arguments)
+        calls.append((rendered, timeout))
+        if any(marker in rendered for marker in failures):
+            raise subprocess.TimeoutExpired(
+                arguments,
+                timeout,
+                output="synthetic-secret-output",
+                stderr="postgresql://synthetic-secret",
+            )
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subject, "_run_command", run_command)
+    return calls
+
+
+def _timeout_for(calls: list[tuple[str, float]], marker: str) -> float:
+    return next(timeout for rendered, timeout in calls if marker in rendered)
+
+
+def test_phase_specific_subprocess_timeout_mapping(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _stub_bounded_lifecycle(monkeypatch, tmp_path)
+    subject.run(300)
+    assert (
+        _timeout_for(calls, "config --quiet") == subject.COMPOSE_CONFIG_TIMEOUT_SECONDS
+    )
+    assert (
+        _timeout_for(calls, "certificate-generation")
+        == subject.CERTIFICATE_TIMEOUT_SECONDS
+    )
+    assert (
+        _timeout_for(calls, "certificate-validation")
+        == subject.CERTIFICATE_TIMEOUT_SECONDS
+    )
+    assert _timeout_for(calls, "up -d") == subject.COMPOSE_STARTUP_TIMEOUT_SECONDS
+    assert (
+        _timeout_for(calls, "readiness-inspect")
+        == subject.READINESS_COMMAND_TIMEOUT_SECONDS
+    )
+    assert (
+        _timeout_for(calls, "published-port")
+        == subject.READINESS_COMMAND_TIMEOUT_SECONDS
+    )
+    assert _timeout_for(calls, "pytest") == subject.MIGRATION_PROOF_TIMEOUT_SECONDS
+    assert _timeout_for(calls, "down --volumes") == subject.CLEANUP_TIMEOUT_SECONDS
+    assert _timeout_for(calls, "container ls") == subject.CLEANUP_TIMEOUT_SECONDS
+    assert _timeout_for(calls, "network ls") == subject.CLEANUP_TIMEOUT_SECONDS
+    assert _timeout_for(calls, "volume ls") == subject.CLEANUP_TIMEOUT_SECONDS
+    assert (
+        subject.POSTGRES_READINESS_TIMEOUT_SECONDS
+        == subject.smoke.HEALTH_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_phase"),
+    [("up -d", subject.E_STARTUP), ("pytest", subject.E_MIGRATION)],
+)
+def test_primary_timeout_triggers_exact_cleanup(
+    failure: str,
+    expected_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = _stub_bounded_lifecycle(
+        monkeypatch, tmp_path, failures=frozenset({failure})
+    )
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject.run(300)
+    assert captured.value.phase == expected_phase
+    downs = [rendered for rendered, _timeout in calls if "down --volumes" in rendered]
+    assert len(downs) == 1
+    assert "--project-name callmetric-pgvector-tls-123-abcdef123456" in downs[0]
+
+
+def test_cleanup_timeout_does_not_mask_primary_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _stub_bounded_lifecycle(
+        monkeypatch,
+        tmp_path,
+        failures=frozenset({"up -d", "down --volumes"}),
+    )
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject.run(300)
+    assert captured.value.phase == subject.E_STARTUP
+
+
+def test_cleanup_timeout_is_reported_when_it_is_the_only_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _stub_bounded_lifecycle(
+        monkeypatch, tmp_path, failures=frozenset({"down --volumes"})
+    )
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject.run(300)
+    assert captured.value.phase == subject.E_CLEANUP
+
+
+def test_timeout_output_never_exposes_secret_details(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def timeout(_ttl: int, *, preflight_only: bool = False) -> None:
+        del preflight_only
+        raise subprocess.TimeoutExpired(
+            ["secret-command", "postgresql://secret"],
+            30,
+            output="secret-output",
+            stderr="private-key-path",
+        )
+
+    monkeypatch.setattr(subject, "run", timeout)
+    assert subject.main(["--ttl-seconds", "300"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "E_PREFLIGHT PR54 PostgreSQL TLS service failed\n"
