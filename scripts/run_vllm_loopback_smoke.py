@@ -75,6 +75,15 @@ HTTP_TIMEOUT_SECONDS = 30.0
 EXPECTED_CERTIFICATE_FILES = frozenset(
     {"ca.crt", "ca.key", "ca.srl", "server.crt", "server.csr", "server.key"}
 )
+_SERVER_CERTIFICATE_EXTENSIONS = """\
+[server_certificate]
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid:always
+subjectAltName=DNS:localhost,IP:127.0.0.1
+"""
 PROTECTED_CONTAINERS = {
     "rag-redis": "ce50a0ac3175c2643d8cdbe47eb8dbafc2da26370837ea59138f750a3f52d107",
     "rag-postgres": "872307591cfc873c544ebb5db4075dec848161ee2225ed38c542ebe198e1defc",
@@ -366,6 +375,14 @@ def _generate_certificates(directory: Path) -> None:
             "1",
             "-subj",
             "/CN=CallMetric PR53 Ephemeral CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE,pathlen:0",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+            "-addext",
+            "subjectKeyIdentifier=hash",
+            "-addext",
+            "authorityKeyIdentifier=keyid:always",
             "-keyout",
             "ca.key",
             "-out",
@@ -385,8 +402,6 @@ def _generate_certificates(directory: Path) -> None:
             "-nodes",
             "-subj",
             "/CN=localhost",
-            "-addext",
-            "subjectAltName=DNS:localhost,IP:127.0.0.1",
             "-keyout",
             "server.key",
             "-out",
@@ -395,29 +410,37 @@ def _generate_certificates(directory: Path) -> None:
         environment=environment,
         cwd=directory,
     )
-    _run(
-        [
-            "openssl",
-            "x509",
-            "-req",
-            "-sha256",
-            "-days",
-            "1",
-            "-in",
-            "server.csr",
-            "-CA",
-            "ca.crt",
-            "-CAkey",
-            "ca.key",
-            "-CAcreateserial",
-            "-copy_extensions",
-            "copy",
-            "-out",
-            "server.crt",
-        ],
-        environment=environment,
-        cwd=directory,
-    )
+    extension_file = directory / "server.ext"
+    extension_file.write_text(_SERVER_CERTIFICATE_EXTENSIONS, encoding="ascii")
+    extension_file.chmod(0o600)
+    try:
+        _run(
+            [
+                "openssl",
+                "x509",
+                "-req",
+                "-sha256",
+                "-days",
+                "1",
+                "-in",
+                "server.csr",
+                "-CA",
+                "ca.crt",
+                "-CAkey",
+                "ca.key",
+                "-CAcreateserial",
+                "-extfile",
+                "server.ext",
+                "-extensions",
+                "server_certificate",
+                "-out",
+                "server.crt",
+            ],
+            environment=environment,
+            cwd=directory,
+        )
+    finally:
+        extension_file.unlink(missing_ok=True)
     for name in ("ca.key", "server.key"):
         (directory / name).chmod(0o600)
     observed = frozenset(path.name for path in directory.iterdir())

@@ -43,8 +43,10 @@ uv run python -m scripts.run_vllm_e2e_service --ttl-seconds <300-7200>
 
 Do not place the bearer token or private paths in command arguments or command
 history. Each invocation creates a unique PR54 Compose project, a fresh
-ephemeral CA and localhost server certificate, and a random bearer token. The
-certificate SAN is exactly `DNS:localhost,IP:127.0.0.1`.
+ephemeral CA and localhost server certificate, and a random bearer token. It
+reuses the strict PR53 CA/server profile with critical constraints and usages,
+SKI/AKI linkage, server-only EKU, and SAN exactly
+`DNS:localhost,IP:127.0.0.1`.
 
 A run-specific owner-only handoff directory contains exactly `ca.crt`,
 `token`, and `connection.json`. Transfer the CA and token through an

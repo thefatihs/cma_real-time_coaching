@@ -26,10 +26,11 @@ not apply the model's chat template.
 ## Security boundaries
 
 vLLM terminates TLS itself. Each invocation generates a private ephemeral CA
-and server certificate outside the repository. The server certificate SAN is
-exactly `DNS:localhost,IP:127.0.0.1`; the smoke verifies the private CA,
-hostname matching, missing-CA rejection, and deliberate hostname-mismatch
-rejection. A new random bearer token is passed through process environment and
+and server certificate outside the repository. The self-signed CA and issued server certificate carry critical basic
+constraints and key usages, SKI/AKI linkage, and server-only EKU. The server
+certificate SAN is exactly `DNS:localhost,IP:127.0.0.1`; strict chain and
+hostname verification, missing-CA rejection, and deliberate hostname-mismatch
+rejection remain mandatory. A new random bearer token is passed through process environment and
 is never printed or placed in command arguments.
 
 Requests, prompts, responses, tokens, keys, certificates, cache contents, and
