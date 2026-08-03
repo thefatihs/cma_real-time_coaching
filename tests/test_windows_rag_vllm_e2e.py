@@ -8,6 +8,11 @@ import httpx
 import pytest
 from psycopg import OperationalError
 
+from app.coaching.llm_result_gate import (
+    LLMCoachingGateResult,
+    LLMCoachingGateStatus,
+    LLMCoachingRejectionReason,
+)
 from app.events.models import CoachingSuggestionSource
 from app.orchestration.models import (
     OrchestrationCitationReference,
@@ -306,27 +311,186 @@ def test_exact_citation_scope_is_admitted_with_llm_source(
     [
         valid_result(tenant_id="tenant_other"),
         valid_result(call_id="call_other"),
-        valid_result(
-            citations=(
-                OrchestrationCitationReference(
-                    document_id="wrong_document", chunk_id=subject.CHUNK_ID
-                ),
-            )
-        ),
-        valid_result(generated_text="not-json"),
+        valid_result(transcript_revision=2),
     ],
 )
-def test_invalid_json_scope_or_citation_is_rejected(
-    result: OrchestrationResult,
-) -> None:
+def test_outer_scope_mismatch_has_distinct_phase(result: OrchestrationResult) -> None:
     artifacts = subject._load_artifacts()
 
-    with pytest.raises(subject.WindowsRAGVLLME2EError, match="E_ADMISSION"):
+    with pytest.raises(subject.WindowsRAGVLLME2EError, match="E_ADMISSION_SCOPE"):
         subject._admit_result(
             policy=artifacts.policy,
             event=subject._transcript_event(),
             result=result,
         )
+
+
+def test_outer_citation_mismatch_has_distinct_phase() -> None:
+    artifacts = subject._load_artifacts()
+    result = valid_result(
+        citations=(
+            OrchestrationCitationReference(
+                document_id="wrong_document", chunk_id=subject.CHUNK_ID
+            ),
+        )
+    )
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError, match="E_ADMISSION_CITATION"):
+        subject._admit_result(
+            policy=artifacts.policy,
+            event=subject._transcript_event(),
+            result=result,
+        )
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_phase"),
+    list(subject.GATE_REJECTION_PHASES.items()),
+)
+def test_every_gate_rejection_reason_has_exact_allowlisted_phase(
+    reason: LLMCoachingRejectionReason,
+    expected_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = subject._load_artifacts()
+
+    def reject(_self: object, **_kwargs: object) -> LLMCoachingGateResult:
+        return LLMCoachingGateResult(
+            status=LLMCoachingGateStatus.REJECTED,
+            tenant_id=subject.TENANT_ID,
+            call_id=subject.CALL_ID,
+            revision=subject.TRANSCRIPT_REVISION,
+            rejection_reason=reason,
+        )
+
+    monkeypatch.setattr(subject.LLMCoachingResultGate, "evaluate", reject)
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError, match=expected_phase):
+        subject._admit_result(
+            policy=artifacts.policy,
+            event=subject._transcript_event(),
+            result=valid_result(),
+        )
+
+    assert set(subject.GATE_REJECTION_PHASES) == set(LLMCoachingRejectionReason)
+
+
+def test_rejected_gate_without_reason_uses_defensive_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = subject._load_artifacts()
+
+    def reject_without_reason(_self: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            status=LLMCoachingGateStatus.REJECTED,
+            rejection_reason=None,
+            suggestion=None,
+        )
+
+    monkeypatch.setattr(
+        subject.LLMCoachingResultGate, "evaluate", reject_without_reason
+    )
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError) as raised:
+        subject._admit_result(
+            policy=artifacts.policy,
+            event=subject._transcript_event(),
+            result=valid_result(),
+        )
+
+    assert str(raised.value) == "E_ADMISSION"
+
+
+def test_valid_no_suggestion_has_distinct_phase() -> None:
+    artifacts = subject._load_artifacts()
+    no_suggestion = json.dumps(
+        {
+            "decision": "no_suggestion",
+            "tenant_id": subject.TENANT_ID,
+            "call_id": subject.CALL_ID,
+            "revision": subject.TRANSCRIPT_REVISION,
+        }
+    )
+
+    with pytest.raises(
+        subject.WindowsRAGVLLME2EError, match="E_ADMISSION_NO_SUGGESTION"
+    ):
+        subject._admit_result(
+            policy=artifacts.policy,
+            event=subject._transcript_event(),
+            result=valid_result(generated_text=no_suggestion),
+        )
+
+
+@pytest.mark.parametrize(
+    "private_output",
+    [
+        "not-json private-output",
+        '{"decision":"suggestion"',
+        "```json\n{}\n``` private-output",
+        "prose before json private-output",
+    ],
+)
+def test_invalid_completion_shapes_do_not_leak_content(private_output: str) -> None:
+    artifacts = subject._load_artifacts()
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError) as raised:
+        subject._admit_result(
+            policy=artifacts.policy,
+            event=subject._transcript_event(),
+            result=valid_result(generated_text=private_output),
+        )
+
+    assert str(raised.value) == "E_ADMISSION_INVALID_JSON"
+    assert private_output not in str(raised.value)
+
+
+def test_final_suggestion_mismatch_has_distinct_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = subject._load_artifacts()
+    monkeypatch.setattr(
+        subject.DeterministicLLMCoachingSuggestionFactory,
+        "create",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(subject.WindowsRAGVLLME2EError, match="E_ADMISSION_SUGGESTION"):
+        subject._admit_result(
+            policy=artifacts.policy,
+            event=subject._transcript_event(),
+            result=valid_result(),
+        )
+
+
+def test_admission_phase_runs_cleanup_and_is_not_masked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mocked_flow: list[str],
+) -> None:
+    cleanup_calls = 0
+
+    def cleanup(*_args: object, **_kwargs: object) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        mocked_flow.append("cleanup")
+        if cleanup_calls == 2:
+            raise RuntimeError("synthetic private cleanup detail")
+
+    monkeypatch.setattr(subject, "_cleanup_synthetic_scope", cleanup)
+    monkeypatch.setattr(
+        subject,
+        "orchestrate_profile_bound_postgres_rag",
+        lambda **_kwargs: valid_result(generated_text="truncated private output"),
+    )
+
+    with pytest.raises(
+        subject.WindowsRAGVLLME2EError, match="E_ADMISSION_INVALID_JSON"
+    ):
+        subject.run(preflight_only=False, environment=environment(tmp_path))
+
+    assert cleanup_calls == 2
+    assert mocked_flow[-1] == "cleanup"
 
 
 def test_retrieval_unavailable_has_deterministic_fallback_and_cleanup(

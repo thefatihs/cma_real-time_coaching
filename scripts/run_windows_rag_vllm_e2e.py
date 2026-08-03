@@ -18,6 +18,11 @@ from psycopg import Error as PsycopgError
 from psycopg import connect as psycopg_connect
 from pydantic import SecretStr
 
+from app.coaching.llm_result_gate import (
+    LLMCoachingGateStatus,
+    LLMCoachingRejectionReason,
+    LLMCoachingResultGate,
+)
 from app.composition.postgres_rag import (
     KnowledgeBaseRAGProviderSettings,
     PostgreSQLVectorStoreSettings,
@@ -94,6 +99,20 @@ SYNTHETIC_TRANSCRIPT = (
     "Sentetik deneme ürününü iade etmek için süre ve gerekli belge nedir?"
 )
 FIXED_TIME = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+
+GATE_REJECTION_PHASES = {
+    LLMCoachingRejectionReason.INVALID_JSON: "E_ADMISSION_INVALID_JSON",
+    LLMCoachingRejectionReason.DUPLICATE_KEY: "E_ADMISSION_DUPLICATE_KEY",
+    LLMCoachingRejectionReason.PAYLOAD_TOO_LARGE: "E_ADMISSION_PAYLOAD_TOO_LARGE",
+    LLMCoachingRejectionReason.PAYLOAD_TOO_DEEP: "E_ADMISSION_PAYLOAD_TOO_DEEP",
+    LLMCoachingRejectionReason.SCHEMA_VALIDATION_FAILED: "E_ADMISSION_SCHEMA",
+    LLMCoachingRejectionReason.SCOPE_MISMATCH: "E_ADMISSION_GATE_SCOPE",
+    LLMCoachingRejectionReason.UNSUPPORTED_DECISION: "E_ADMISSION_DECISION",
+    LLMCoachingRejectionReason.CITATION_NOT_ALLOWED: (
+        "E_ADMISSION_CITATION_NOT_ALLOWED"
+    ),
+    LLMCoachingRejectionReason.DUPLICATE_CITATION: ("E_ADMISSION_DUPLICATE_CITATION"),
+}
 
 
 class WindowsRAGVLLME2EError(RuntimeError):
@@ -335,8 +354,33 @@ def _admit_result(
         result.tenant_id != TENANT_ID
         or result.call_id != CALL_ID
         or result.transcript_revision != TRANSCRIPT_REVISION
-        or tuple((item.document_id, item.chunk_id) for item in result.citations)
-        != ((DOCUMENT_ID, CHUNK_ID),)
+    ):
+        raise WindowsRAGVLLME2EError("E_ADMISSION_SCOPE")
+    citation_identities = tuple(
+        (item.document_id, item.chunk_id) for item in result.citations
+    )
+    if citation_identities != ((DOCUMENT_ID, CHUNK_ID),):
+        raise WindowsRAGVLLME2EError("E_ADMISSION_CITATION")
+    gate_result = LLMCoachingResultGate().evaluate(
+        tenant_id=event.tenant_id,
+        call_id=event.call_id,
+        revision=event.revision,
+        raw_output=result.generated_text,
+        allowed_citations=set(citation_identities),
+    )
+    if gate_result.status is LLMCoachingGateStatus.VALID_NO_SUGGESTION:
+        raise WindowsRAGVLLME2EError("E_ADMISSION_NO_SUGGESTION")
+    if gate_result.status is LLMCoachingGateStatus.REJECTED:
+        rejection_reason = gate_result.rejection_reason
+        if rejection_reason is None:
+            raise WindowsRAGVLLME2EError("E_ADMISSION")
+        phase = GATE_REJECTION_PHASES.get(rejection_reason)
+        if phase is None:
+            raise WindowsRAGVLLME2EError("E_ADMISSION")
+        raise WindowsRAGVLLME2EError(phase)
+    if (
+        gate_result.status is not LLMCoachingGateStatus.VALID_SUGGESTION
+        or gate_result.suggestion is None
     ):
         raise WindowsRAGVLLME2EError("E_ADMISSION")
     factory = DeterministicLLMCoachingSuggestionFactory(
@@ -361,7 +405,7 @@ def _admit_result(
         or suggestion.source is not CoachingSuggestionSource.LLM
         or not suggestion.suggestion.strip()
     ):
-        raise WindowsRAGVLLME2EError("E_ADMISSION")
+        raise WindowsRAGVLLME2EError("E_ADMISSION_SUGGESTION")
 
 
 def _cleanup_synthetic_scope(

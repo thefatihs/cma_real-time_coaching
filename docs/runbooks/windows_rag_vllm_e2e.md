@@ -70,6 +70,17 @@ are separated into `E_INITIAL_CLEANUP`, `E_PROVISIONING`, `E_INGESTION`, and
 `E_RETRIEVAL_UNAVAILABLE`, without exposing database exception details. Final
 exact-scope cleanup always runs and cannot replace an existing primary phase.
 
+Admission diagnostics are fixed and content-free. Outer orchestration scope and
+citation mismatches use `E_ADMISSION_SCOPE` and `E_ADMISSION_CITATION`.
+`valid_no_suggestion` uses `E_ADMISSION_NO_SUGGESTION`. Gate rejections use
+`E_ADMISSION_INVALID_JSON`, `E_ADMISSION_DUPLICATE_KEY`,
+`E_ADMISSION_PAYLOAD_TOO_LARGE`, `E_ADMISSION_PAYLOAD_TOO_DEEP`,
+`E_ADMISSION_SCHEMA`, `E_ADMISSION_GATE_SCOPE`, `E_ADMISSION_DECISION`,
+`E_ADMISSION_CITATION_NOT_ALLOWED`, or `E_ADMISSION_DUPLICATE_CITATION`.
+Final factory/output validation uses `E_ADMISSION_SUGGESTION`; `E_ADMISSION`
+remains only a defensive fallback. These codes never include model output,
+JSON fragments, prompt or citation values, exception details, or private paths.
+
 The cleanup does not remove PostgreSQL volumes, embedding/model caches,
 certificates, tunnels, containers, networks, or unrelated tenant data. If the
 process is forcibly terminated, repeat the same exact-scope cleanup through an
