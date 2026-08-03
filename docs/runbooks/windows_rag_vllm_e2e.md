@@ -54,6 +54,13 @@ ready, run without `--preflight-only`. The controller:
    requires the exact citation/scope, non-empty suggestion, and `llm` source;
 6. deletes only the synthetic vector records/profile on success or failure.
 
+The ephemeral TLS `application.dsn` role is provisioned with `DELETE` only on
+`callmetric_vector.vector_records` and `callmetric_vector.embedding_profiles`.
+That narrow privilege is required for steps 1 and 6; both deletes remain
+parameterized and fixed to `tenant_alpha` / `kb_smoke`, with child records
+deleted before their restricted parent profile. No unrelated table receives
+`DELETE`.
+
 The only stdout success values are `PREFLIGHT_OK` and `E2E_OK`. Failures use a
 fixed phase code. No transcript, document, prompt, completion, token, DSN,
 certificate value/path, or private path is printed. Missing retrieval and vLLM

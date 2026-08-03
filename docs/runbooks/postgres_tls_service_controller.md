@@ -35,8 +35,13 @@ It generates fresh passwords and one-day TLS material, binds only a random
 `127.0.0.1` port, validates the certificate, waits for container health, then
 runs the existing PR52 integration proof. That proof applies migration 0001,
 checks its idempotence and schema readiness, and performs synthetic tenant-safe
-pgvector operations. `READY` is emitted only after all of those checks and the
-owner-only handoff succeed.
+pgvector operations. The opt-in ephemeral application role retains its existing
+`CONNECT`, schema `USAGE`, and table `SELECT`/`INSERT`/`UPDATE` privileges. It
+also receives `DELETE` only on `callmetric_vector.vector_records` and
+`callmetric_vector.embedding_profiles`, which permits the Windows E2E to remove
+its fixed `tenant_alpha` / `kb_smoke` scope child-first. It receives no broad or
+future-table delete grant. `READY` is emitted only after all of those checks and
+the owner-only handoff succeed.
 
 ## Bounded command timeouts
 
