@@ -38,10 +38,10 @@ identity, verify-full PostgreSQL configuration, localhost HTTPS endpoint,
 token file, CA file, strict TLS setting, and bounds are structurally valid.
 Preflight opens no database or HTTP connection and performs no write.
 
-## Future real E2E lifecycle
+## Verified real E2E lifecycle
 
-Only after PostgreSQL, the external tunnel, and AWS vLLM are independently
-ready, run without `--preflight-only`. The controller:
+After PostgreSQL, the external tunnel, and AWS vLLM are independently ready,
+run without `--preflight-only`. The controller:
 
 1. clears only the fixed synthetic tenant/KB scope;
 2. verifies schema readiness and provisions the exact embedding profile;
@@ -105,3 +105,35 @@ The cleanup does not remove PostgreSQL volumes, embedding/model caches,
 certificates, tunnels, containers, networks, or unrelated tenant data. If the
 process is forcibly terminated, repeat the same exact-scope cleanup through an
 approved database procedure before another run.
+
+## Verified PR54 result
+
+The real Windows preflight printed `PREFLIGHT_OK`, and the real fixed-scope
+synthetic run printed `E2E_OK`. The verified chain was the Windows
+runner/dashboard contract through verify-full TLS PostgreSQL/pgvector, exact
+profile provisioning, scoped ingestion, local normalized 384-dimensional
+embedding, tenant/KB-bound retrieval, deterministic structured prompting, SSH
+loopback forwarding, strict HTTPS/authenticated vLLM `/v1/completions`, vLLM
+structured JSON output, `LLMCoachingResultGate`, and an admitted LLM coaching
+suggestion.
+
+The exact served model was `callmetric-qwen25-7b-awq`, backed by the official
+`Qwen/Qwen2.5-7B-Instruct-AWQ`. The embedding model was
+`sentence-transformers/all-MiniLM-L6-v2`, running on CPU with 384 normalized
+dimensions and verified local-files-only/offline loading. The proof used only
+`tenant_alpha` / `kb_smoke` / `urun_bilgisi`; it used no customer data or
+production endpoint and did not publicly expose AWS vLLM.
+
+Final cleanup verification found the SSH tunnel closed; zero vLLM port,
+container, network, and GPU use; zero PostgreSQL container, network, volume,
+handoff, and temporary TLS residue; and removal of the temporary Windows vLLM
+token and CA. The persistent model cache was preserved. Forced process
+termination, host crash, and power loss can bypass Python cleanup, so operators
+must perform exact-project residue verification; never use prune or broad
+deletion.
+
+Final focused schema/gate/E2E verification reported 193 passed and 1 opt-in
+skip. Focused Pyright reported 0 errors; Ruff, lock, conflict-marker, and diff
+checks passed. The latest observed Windows full suite reported 2,427 passed,
+17 skipped, and 22 unrelated environment-specific ACL/OpenSSL failures; it was
+not a green full-suite result.
