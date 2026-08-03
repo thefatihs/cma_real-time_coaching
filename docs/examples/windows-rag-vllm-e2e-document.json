@@ -1,0 +1,22 @@
+{
+  "tenant_id": "tenant_alpha",
+  "knowledge_base_id": "kb_smoke",
+  "category": "urun_bilgisi",
+  "chunks": [
+    {
+      "document_id": "sentetik_urun_iade_politikasi_v1",
+      "chunk_id": "sentetik_urun_iade_001",
+      "text": "Sentetik ürün bilgisi: Açılmamış deneme ürünü, teslim tarihinden itibaren 14 gün içinde sentetik sipariş belgesiyle ücretsiz iade edilebilir.",
+      "metadata": [
+        [
+          "category",
+          "urun_bilgisi"
+        ],
+        [
+          "data_class",
+          "synthetic"
+        ]
+      ]
+    }
+  ]
+}
