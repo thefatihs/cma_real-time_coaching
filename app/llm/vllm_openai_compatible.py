@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from copy import deepcopy
 import json
 import math
 import re
@@ -20,6 +22,7 @@ _NUMERIC_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 _INTEGER_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _INVALID_RESPONSE = "vLLM response is invalid"
 _INVALID_TLS_CONFIGURATION = "vLLM TLS configuration is invalid"
+_INVALID_STRUCTURED_OUTPUT = "vLLM structured output schema is invalid"
 
 
 class VLLMOpenAICompatibleSettings(BaseSettings):
@@ -138,6 +141,7 @@ class VLLMOpenAICompatibleGateway:
         settings: VLLMOpenAICompatibleSettings,
         *,
         transport: httpx.BaseTransport | None = None,
+        structured_output_json_schema: Mapping[str, object] | None = None,
     ) -> None:
         if not isinstance(settings, VLLMOpenAICompatibleSettings):
             raise ValueError("settings must be VLLMOpenAICompatibleSettings")
@@ -145,6 +149,9 @@ class VLLMOpenAICompatibleGateway:
             raise ValueError("transport must be an httpx BaseTransport")
         self._settings = settings
         self._transport = transport
+        self._structured_output_json_schema = _validated_schema_copy(
+            structured_output_json_schema
+        )
 
     def generate(self, request: LLMRequest) -> LLMResponse:
         if not isinstance(request, LLMRequest):
@@ -159,6 +166,17 @@ class VLLMOpenAICompatibleGateway:
         headers = {"Accept": "application/json"}
         if settings.api_token is not None:
             headers["Authorization"] = f"Bearer {settings.api_token.get_secret_value()}"
+        request_payload: dict[str, object] = {
+            "model": settings.model_id,
+            "prompt": request.input_text,
+            "max_tokens": settings.max_output_tokens,
+            "temperature": settings.temperature,
+            "stream": False,
+        }
+        if self._structured_output_json_schema is not None:
+            request_payload["structured_outputs"] = {
+                "json": deepcopy(self._structured_output_json_schema)
+            }
         with httpx.Client(
             verify=_tls_verification(settings),
             timeout=timeout,
@@ -167,13 +185,7 @@ class VLLMOpenAICompatibleGateway:
         ) as client:
             response = client.post(
                 f"{settings.base_url}/completions",
-                json={
-                    "model": settings.model_id,
-                    "prompt": request.input_text,
-                    "max_tokens": settings.max_output_tokens,
-                    "temperature": settings.temperature,
-                    "stream": False,
-                },
+                json=request_payload,
             )
             response.raise_for_status()
             try:
@@ -199,6 +211,22 @@ def _strict_numeric(value: object) -> float:
     if not math.isfinite(numeric):
         raise ValueError("numeric setting must be finite")
     return numeric
+
+
+def _validated_schema_copy(
+    value: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(_INVALID_STRUCTURED_OUTPUT)
+    try:
+        copied = json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError(_INVALID_STRUCTURED_OUTPUT) from None
+    if not isinstance(copied, dict) or not copied:
+        raise ValueError(_INVALID_STRUCTURED_OUTPUT)
+    return copied
 
 
 def _tls_verification(
@@ -234,6 +262,8 @@ def _response_text(payload: object) -> str:
         raise ValueError(_INVALID_RESPONSE)
     choice = choices[0]
     if not isinstance(choice, dict):
+        raise ValueError(_INVALID_RESPONSE)
+    if choice.get("finish_reason") == "length":
         raise ValueError(_INVALID_RESPONSE)
     text = choice.get("text")
     if not isinstance(text, str):

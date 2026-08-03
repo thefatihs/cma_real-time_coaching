@@ -54,6 +54,16 @@ ready, run without `--preflight-only`. The controller:
    requires the exact citation/scope, non-empty suggestion, and `llm` source;
 6. deletes only the synthetic vector records/profile on success or failure.
 
+The Windows E2E and production PostgreSQL RAG coaching entry point explicitly
+opt in to the pinned vLLM 0.26 structured-output extension. Their Completions
+payload adds only `structured_outputs.json`, containing the flattened coaching
+wire schema. The schema permits both `suggestion` and `no_suggestion`, contains
+no references, and constrains structure without trusting generated tenant,
+call, revision, or citation values; the existing prompt and result gate still
+validate those values. Generic gateway callers remain unconstrained by default.
+The removed `guided_json` alias is not used, and an HTTP schema rejection is
+never retried without the constraint.
+
 The ephemeral TLS `application.dsn` role is provisioned with `DELETE` only on
 `callmetric_vector.vector_records` and `callmetric_vector.embedding_profiles`.
 That narrow privilege is required for steps 1 and 6; both deletes remain
@@ -80,6 +90,10 @@ citation mismatches use `E_ADMISSION_SCOPE` and `E_ADMISSION_CITATION`.
 Final factory/output validation uses `E_ADMISSION_SUGGESTION`; `E_ADMISSION`
 remains only a defensive fallback. These codes never include model output,
 JSON fragments, prompt or citation values, exception details, or private paths.
+
+The 256-token output bound is unchanged. A Completions response reporting
+`finish_reason=length` fails closed with the fixed invalid-response error;
+truncation remains a bounded risk rather than triggering an unconstrained retry.
 
 The cleanup does not remove PostgreSQL volumes, embedding/model caches,
 certificates, tunnels, containers, networks, or unrelated tenant data. If the

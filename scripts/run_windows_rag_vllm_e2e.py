@@ -22,6 +22,7 @@ from app.coaching.llm_result_gate import (
     LLMCoachingGateStatus,
     LLMCoachingRejectionReason,
     LLMCoachingResultGate,
+    coaching_wire_json_schema,
 )
 from app.composition.postgres_rag import (
     KnowledgeBaseRAGProviderSettings,
@@ -530,6 +531,7 @@ def run(
                     max_prompt_characters=8_192,
                 ),
                 psycopg_connect=connect,
+                structured_output_json_schema=coaching_wire_json_schema(),
             ),
         )
         if result is None:

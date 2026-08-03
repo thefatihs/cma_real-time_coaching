@@ -334,3 +334,41 @@ def test_gateway_uses_exact_mock_transport_and_preserves_exception() -> None:
             )
         )
     assert raised.value is expected
+
+
+def test_prompt_bound_gateway_passes_optional_schema_only_when_supplied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructions: list[dict[str, object]] = []
+    schema = {"type": "object", "additionalProperties": False}
+
+    class Gateway:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            constructions.append(kwargs)
+
+        def generate(self, _request: object) -> object:
+            return object()
+
+    monkeypatch.setattr(deployment, "VLLMOpenAICompatibleGateway", Gateway)
+    request = deployment.LLMRequest(
+        tenant_id="tenant-synthetic",
+        call_id="call-synthetic",
+        input_text="Synthetic prompt",
+    )
+    unconstrained = deployment._PromptBoundVLLMGateway(
+        settings=_vllm(), max_prompt_characters=100, transport=None
+    )
+    constrained = deployment._PromptBoundVLLMGateway(
+        settings=_vllm(),
+        max_prompt_characters=100,
+        transport=None,
+        structured_output_json_schema=schema,
+    )
+
+    unconstrained.generate(request)
+    constrained.generate(request)
+
+    assert constructions == [
+        {"transport": None, "structured_output_json_schema": None},
+        {"transport": None, "structured_output_json_schema": schema},
+    ]

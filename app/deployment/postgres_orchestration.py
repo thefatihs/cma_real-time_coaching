@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from threading import Lock
 from typing import Any
 
@@ -64,10 +65,12 @@ class _PromptBoundVLLMGateway:
         settings: VLLMOpenAICompatibleSettings,
         max_prompt_characters: int,
         transport: httpx.BaseTransport | None,
+        structured_output_json_schema: Mapping[str, object] | None = None,
     ) -> None:
         self._settings = settings
         self._max_prompt_characters = max_prompt_characters
         self._transport = transport
+        self._structured_output_json_schema = structured_output_json_schema
         self._gateway: LLMGateway | None = None
         self._lock = Lock()
 
@@ -82,6 +85,9 @@ class _PromptBoundVLLMGateway:
                     gateway = VLLMOpenAICompatibleGateway(
                         self._settings,
                         transport=self._transport,
+                        structured_output_json_schema=(
+                            self._structured_output_json_schema
+                        ),
                     )
                     self._gateway = gateway
         return gateway.generate(request)
@@ -97,6 +103,7 @@ def orchestrate_profile_bound_postgres_rag(
     psycopg_connect: PsycopgConnect,
     embedding_backend_factory: BackendFactory | None = None,
     vllm_transport: httpx.BaseTransport | None = None,
+    structured_output_json_schema: Mapping[str, object] | None = None,
 ) -> OrchestrationResult | None:
     """Verify readiness/profile identity, then run RAG orchestration once."""
     if not isinstance(postgres_settings, PostgreSQLVectorStoreSettings):
@@ -121,6 +128,10 @@ def orchestrate_profile_bound_postgres_rag(
         vllm_transport, httpx.BaseTransport
     ):
         raise ValueError("vllm_transport must be an httpx BaseTransport")
+    if structured_output_json_schema is not None and not isinstance(
+        structured_output_json_schema, Mapping
+    ):
+        raise ValueError("structured_output_json_schema must be a mapping")
     if request.tenant_id != knowledge_base_settings.tenant_id:
         raise ValueError("request tenant_id does not match provider scope")
     if request.knowledge_base_id != knowledge_base_settings.knowledge_base_id:
@@ -135,6 +146,7 @@ def orchestrate_profile_bound_postgres_rag(
             settings=vllm_settings,
             max_prompt_characters=limits.max_prompt_characters,
             transport=vllm_transport,
+            structured_output_json_schema=structured_output_json_schema,
         )
 
     composition = compose_profile_bound_postgres_rag_orchestration(

@@ -278,6 +278,9 @@ def test_orchestration_receives_existing_settings_and_bounded_limits(
     assert request.knowledge_base_id == subject.KNOWLEDGE_BASE_ID  # type: ignore[attr-defined]
     assert request.top_k == 1  # type: ignore[attr-defined]
     assert limits.max_prompt_characters == 8_192  # type: ignore[attr-defined]
+    assert captured["structured_output_json_schema"] == (
+        subject.coaching_wire_json_schema()
+    )
 
 
 def test_exact_citation_scope_is_admitted_with_llm_source(

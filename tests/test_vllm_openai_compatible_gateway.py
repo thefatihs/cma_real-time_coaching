@@ -6,7 +6,7 @@ import json
 import ssl
 from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, cast
 
 import httpx
@@ -78,10 +78,12 @@ def _gateway(
     handler: Any,
     *,
     settings: VLLMOpenAICompatibleSettings | None = None,
+    structured_output_json_schema: Mapping[str, object] | None = None,
 ) -> VLLMOpenAICompatibleGateway:
     return VLLMOpenAICompatibleGateway(
         settings if settings is not None else _settings(),
         transport=_transport(handler),
+        structured_output_json_schema=structured_output_json_schema,
     )
 
 
@@ -478,6 +480,106 @@ def test_exact_http_request_scope_and_response_mapping() -> None:
     assert b"tenant-synthetic" not in serialized
     assert b"call-synthetic" not in serialized
     assert b"knowledge_base" not in serialized
+
+
+def test_opt_in_structured_output_has_exact_payload_delta_and_private_copy() -> None:
+    payloads: list[dict[str, object]] = []
+    schema: dict[str, object] = {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"decision": {"enum": ["synthetic"]}},
+                "required": ["decision"],
+                "additionalProperties": False,
+            }
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert isinstance(payload, dict)
+        payloads.append(payload)
+        return httpx.Response(200, json={"choices": [{"text": "Synthetic"}]})
+
+    gateway = _gateway(handler, structured_output_json_schema=schema)
+    schema["mutated"] = True
+    gateway.generate(_request())
+    first_payload = payloads[0]
+    gateway.generate(_request())
+
+    expected_schema = {
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {"decision": {"enum": ["synthetic"]}},
+                "required": ["decision"],
+                "additionalProperties": False,
+            }
+        ]
+    }
+    expected_payload = {
+        "model": "synthetic/model-v1",
+        "prompt": _request().input_text,
+        "max_tokens": 512,
+        "temperature": 0.25,
+        "stream": False,
+        "structured_outputs": {"json": expected_schema},
+    }
+    assert first_payload == expected_payload
+    first_payload["structured_outputs"] = "mutated"
+    assert payloads[1] == expected_payload
+
+
+@pytest.mark.parametrize("schema", [{}, {"bad": object()}, {"bad": float("nan")}])
+def test_invalid_structured_output_schema_has_fixed_safe_error(
+    schema: Mapping[str, object],
+) -> None:
+    with pytest.raises(ValueError) as raised:
+        _gateway(
+            lambda _request: httpx.Response(200),
+            structured_output_json_schema=schema,
+        )
+
+    assert str(raised.value) == "vLLM structured output schema is invalid"
+
+
+def test_schema_http_rejection_is_not_retried_unconstrained() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(400, json={"detail": "synthetic schema rejection"})
+
+    with pytest.raises(httpx.HTTPStatusError):
+        _gateway(
+            handler,
+            structured_output_json_schema={"type": "object"},
+        ).generate(_request())
+
+    assert len(requests) == 1
+    assert "structured_outputs" in json.loads(requests[0].content)
+
+
+def test_length_finish_reason_fails_closed_without_output() -> None:
+    gateway = _gateway(
+        lambda _request: httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "text": "synthetic private truncated output",
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+        )
+    )
+
+    with pytest.raises(ValueError) as raised:
+        gateway.generate(_request())
+
+    assert str(raised.value) == "vLLM response is invalid"
+    assert "truncated" not in str(raised.value)
 
 
 def test_authorization_header_is_absent_without_token() -> None:
