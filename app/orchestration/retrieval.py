@@ -51,6 +51,7 @@ class RetrievalOrchestrator:
             PromptBuildRequest(
                 tenant_id=request.tenant_id,
                 call_id=request.call_id,
+                transcript_revision=request.transcript_revision,
                 user_input=request.user_input,
                 retrieved_context=tuple(
                     PromptContextItem(

@@ -1,6 +1,7 @@
 import json
 import logging
 
+from jsonschema import Draft202012Validator
 import pytest
 from pydantic import ValidationError
 
@@ -12,6 +13,7 @@ from app.coaching.llm_result_gate import (
     LLMCoachingGateStatus,
     LLMCoachingRejectionReason,
     LLMCoachingResultGate,
+    coaching_wire_json_schema,
 )
 from app.events.models import (
     CoachingAction,
@@ -24,9 +26,21 @@ CALL_ID = "call_001"
 REVISION = 7
 ALLOWED = {("guide_a", "chunk_1"), ("guide_b", "chunk_2")}
 
+type JSONValue = (
+    None | bool | int | float | str | list[JSONValue] | dict[str, JSONValue]
+)
 
-def suggestion_payload(**changes: object) -> dict[str, object]:
-    values: dict[str, object] = {
+
+def json_object(**values: JSONValue) -> dict[str, JSONValue]:
+    return values
+
+
+def json_array(*values: JSONValue) -> list[JSONValue]:
+    return list(values)
+
+
+def suggestion_payload(**changes: JSONValue) -> dict[str, JSONValue]:
+    values: dict[str, JSONValue] = {
         "decision": "suggestion",
         "tenant_id": TENANT_ID,
         "call_id": CALL_ID,
@@ -35,15 +49,15 @@ def suggestion_payload(**changes: object) -> dict[str, object]:
         "title": "Synthetic guidance",
         "suggestion": "Use the approved synthetic guidance.",
         "priority": "HIGH",
-        "citations": [{"document_id": "guide_a", "chunk_id": "chunk_1"}],
+        "citations": json_array(json_object(document_id="guide_a", chunk_id="chunk_1")),
         "source": "llm",
     }
     values.update(changes)
     return values
 
 
-def no_suggestion_payload(**changes: object) -> dict[str, object]:
-    values: dict[str, object] = {
+def no_suggestion_payload(**changes: JSONValue) -> dict[str, JSONValue]:
+    values: dict[str, JSONValue] = {
         "decision": "no_suggestion",
         "tenant_id": TENANT_ID,
         "call_id": CALL_ID,
@@ -51,6 +65,97 @@ def no_suggestion_payload(**changes: object) -> dict[str, object]:
     }
     values.update(changes)
     return values
+
+
+def test_coaching_wire_schema_is_flattened_exact_and_fresh() -> None:
+    first = coaching_wire_json_schema()
+    second = coaching_wire_json_schema()
+
+    assert first == second
+    assert first is not second
+    assert set(first) == {"oneOf"}
+    serialized = json.dumps(first, sort_keys=True)
+    assert "$ref" not in serialized
+    assert "$defs" not in serialized
+    assert "guided_json" not in serialized
+    assert "uniqueItems" not in serialized
+    branches = first["oneOf"]
+    assert isinstance(branches, list)
+    assert len(branches) == 2
+    assert all(
+        isinstance(branch, dict) and branch.get("additionalProperties") is False
+        for branch in branches
+    )
+    suggestion = branches[0]
+    assert isinstance(suggestion, dict)
+    properties = suggestion["properties"]
+    assert isinstance(properties, dict)
+    citations = properties["citations"]
+    assert citations == {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "string", "minLength": 1},
+                "chunk_id": {"type": "string", "minLength": 1},
+            },
+            "required": ["document_id", "chunk_id"],
+            "additionalProperties": False,
+        },
+        "minItems": 1,
+        "maxItems": 20,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "accepted"),
+    [
+        (suggestion_payload(), True),
+        (no_suggestion_payload(), True),
+        (suggestion_payload(extra="forbidden"), False),
+        (suggestion_payload(action="UNKNOWN"), False),
+        (suggestion_payload(priority="UNKNOWN"), False),
+        (suggestion_payload(title="x" * 121), False),
+        (suggestion_payload(suggestion="x" * 501), False),
+        (suggestion_payload(citations=json_array()), False),
+        (
+            suggestion_payload(
+                citations=json_array(
+                    *(
+                        json_object(document_id=f"guide_{index}", chunk_id="chunk")
+                        for index in range(21)
+                    )
+                )
+            ),
+            False,
+        ),
+        (
+            suggestion_payload(
+                citations=json_array(
+                    json_object(
+                        document_id="guide_a",
+                        chunk_id="chunk_1",
+                        extra="forbidden",
+                    )
+                )
+            ),
+            False,
+        ),
+        (no_suggestion_payload(extra="forbidden"), False),
+    ],
+)
+def test_wire_schema_and_gate_have_equivalent_structural_results(
+    payload: dict[str, JSONValue], accepted: bool
+) -> None:
+    schema_accepts = Draft202012Validator(coaching_wire_json_schema()).is_valid(payload)
+    gate_result = evaluate(payload)
+    gate_accepts = gate_result.status in {
+        LLMCoachingGateStatus.VALID_SUGGESTION,
+        LLMCoachingGateStatus.VALID_NO_SUGGESTION,
+    }
+
+    assert schema_accepts is accepted
+    assert gate_accepts is accepted
 
 
 def evaluate(
@@ -154,16 +259,16 @@ def test_duplicate_json_keys_are_rejected_at_any_level() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"extra": "not allowed"},
-        {"revision": "7"},
-        {"citations": "guide_a:chunk_1"},
-        {"priority": 1},
-        {"source": "rule"},
-        {"action": "UNKNOWN"},
+        json_object(extra="not allowed"),
+        json_object(revision="7"),
+        json_object(citations="guide_a:chunk_1"),
+        json_object(priority=1),
+        json_object(source="rule"),
+        json_object(action="UNKNOWN"),
     ],
 )
 def test_extra_and_wrong_type_fields_fail_schema(
-    changes: dict[str, object],
+    changes: dict[str, JSONValue],
 ) -> None:
     result = evaluate(suggestion_payload(**changes))
 
@@ -185,7 +290,7 @@ def test_payload_character_limit_is_enforced_before_parsing() -> None:
 
 
 def test_payload_depth_limit_is_enforced() -> None:
-    nested: object = "leaf"
+    nested: JSONValue = "leaf"
     for _ in range(MAX_JSON_DEPTH + 1):
         nested = {"nested": nested}
 
@@ -197,12 +302,12 @@ def test_payload_depth_limit_is_enforced() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"tenant_id": "tenant_beta"},
-        {"call_id": "call_002"},
-        {"revision": REVISION + 1},
+        json_object(tenant_id="tenant_beta"),
+        json_object(call_id="call_002"),
+        json_object(revision=REVISION + 1),
     ],
 )
-def test_scope_mismatch_is_rejected(changes: dict[str, object]) -> None:
+def test_scope_mismatch_is_rejected(changes: dict[str, JSONValue]) -> None:
     result = evaluate(suggestion_payload(**changes))
 
     assert result.rejection_reason is LLMCoachingRejectionReason.SCOPE_MISMATCH
@@ -226,13 +331,13 @@ def test_missing_scope_fails_schema(missing: str) -> None:
 
 
 def test_nested_scope_field_in_citation_is_rejected_as_extra() -> None:
-    citation = {
-        "document_id": "guide_a",
-        "chunk_id": "chunk_1",
-        "tenant_id": "tenant_beta",
-    }
+    citation = json_object(
+        document_id="guide_a",
+        chunk_id="chunk_1",
+        tenant_id="tenant_beta",
+    )
 
-    result = evaluate(suggestion_payload(citations=[citation]))
+    result = evaluate(suggestion_payload(citations=json_array(citation)))
 
     assert result.rejection_reason is (
         LLMCoachingRejectionReason.SCHEMA_VALIDATION_FAILED
@@ -242,33 +347,35 @@ def test_nested_scope_field_in_citation_is_rejected_as_extra() -> None:
 @pytest.mark.parametrize(
     ("citation", "allowed"),
     [
-        ({"document_id": "invented", "chunk_id": "chunk_1"}, ALLOWED),
-        ({"document_id": "guide_a", "chunk_id": "invented"}, ALLOWED),
+        (json_object(document_id="invented", chunk_id="chunk_1"), ALLOWED),
+        (json_object(document_id="guide_a", chunk_id="invented"), ALLOWED),
         (
-            {"document_id": "guide_a", "chunk_id": "chunk_2"},
+            json_object(document_id="guide_a", chunk_id="chunk_2"),
             ALLOWED,
         ),
-        ({"document_id": "guide_a", "chunk_id": "chunk_1"}, set()),
+        (json_object(document_id="guide_a", chunk_id="chunk_1"), set()),
     ],
 )
 def test_ungrounded_citations_are_rejected(
-    citation: dict[str, str],
+    citation: dict[str, JSONValue],
     allowed: set[tuple[str, str]],
 ) -> None:
-    result = evaluate(suggestion_payload(citations=[citation]), allowed=allowed)
+    result = evaluate(
+        suggestion_payload(citations=json_array(citation)), allowed=allowed
+    )
 
     assert result.rejection_reason is (LLMCoachingRejectionReason.CITATION_NOT_ALLOWED)
 
 
 def test_duplicate_citation_is_rejected() -> None:
-    citation = {"document_id": "guide_a", "chunk_id": "chunk_1"}
-    result = evaluate(suggestion_payload(citations=[citation, citation]))
+    citation = json_object(document_id="guide_a", chunk_id="chunk_1")
+    result = evaluate(suggestion_payload(citations=json_array(citation, citation)))
 
     assert result.rejection_reason is (LLMCoachingRejectionReason.DUPLICATE_CITATION)
 
 
 def test_suggestion_without_citation_fails_schema() -> None:
-    result = evaluate(suggestion_payload(citations=[]))
+    result = evaluate(suggestion_payload(citations=json_array()))
 
     assert result.rejection_reason is (
         LLMCoachingRejectionReason.SCHEMA_VALIDATION_FAILED
@@ -278,14 +385,16 @@ def test_suggestion_without_citation_fails_schema() -> None:
 @pytest.mark.parametrize(
     "extra",
     [
-        {"citations": [{"document_id": "guide_a", "chunk_id": "chunk_1"}]},
-        {"suggestion": "Unexpected"},
-        {"title": "Unexpected"},
-        {"source": "llm"},
+        json_object(
+            citations=json_array(json_object(document_id="guide_a", chunk_id="chunk_1"))
+        ),
+        json_object(suggestion="Unexpected"),
+        json_object(title="Unexpected"),
+        json_object(source="llm"),
     ],
 )
 def test_no_suggestion_rejects_suggestion_content(
-    extra: dict[str, object],
+    extra: dict[str, JSONValue],
 ) -> None:
     result = evaluate(no_suggestion_payload(**extra))
 

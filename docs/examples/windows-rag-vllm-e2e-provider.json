@@ -1,0 +1,10 @@
+{
+  "tenant_id": "tenant_alpha",
+  "knowledge_base_id": "kb_smoke",
+  "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "model_name_or_path": "sentence-transformers/all-MiniLM-L6-v2",
+  "vector_dimension": 384,
+  "normalize_embeddings": true,
+  "device": "cpu",
+  "local_files_only": true
+}

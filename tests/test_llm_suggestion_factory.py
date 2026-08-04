@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, timezone
 from typing import cast
@@ -56,7 +57,20 @@ def orchestration_result(**changes: object) -> OrchestrationResult:
         "tenant_id": "tenant_alpha",
         "call_id": "call_001",
         "transcript_revision": 7,
-        "generated_text": "Synthetic generated coaching.",
+        "generated_text": json.dumps(
+            {
+                "decision": "suggestion",
+                "tenant_id": "tenant_alpha",
+                "call_id": "call_001",
+                "revision": 7,
+                "action": "RAG_ACTION",
+                "title": "Synthetic model title",
+                "suggestion": "Synthetic generated coaching.",
+                "priority": "HIGH",
+                "citations": [{"document_id": "document_1", "chunk_id": "chunk_1"}],
+                "source": "llm",
+            }
+        ),
         "citations": (
             OrchestrationCitationReference(
                 document_id="document_1",
@@ -111,7 +125,7 @@ def test_exact_trusted_mapping_and_explicit_policy() -> None:
     assert suggestion.source_transcript_event_id == event.event_id
     assert suggestion.suggestion_id == "suggestion_7"
     assert suggestion.created_at_utc is NOW
-    assert suggestion.suggestion == result.generated_text
+    assert suggestion.suggestion == "Synthetic generated coaching."
     assert suggestion.source is CoachingSuggestionSource.LLM
     assert suggestion.title == "Synthetic policy title"
     assert suggestion.action is CoachingAction.RAG_ACTION
@@ -353,6 +367,72 @@ def test_optional_none_policy_is_preserved() -> None:
     assert suggestion is not None
     assert suggestion.label_id is None
     assert suggestion.expires_after_seconds is None
+
+
+@pytest.mark.parametrize(
+    "generated_text",
+    [
+        "Synthetic arbitrary non-empty text.",
+        "{malformed",
+        json.dumps(
+            {
+                "decision": "suggestion",
+                "tenant_id": "tenant_alpha",
+                "call_id": "call_001",
+                "revision": 7,
+            }
+        ),
+        json.dumps(
+            {
+                "decision": "suggestion",
+                "tenant_id": "tenant_alpha",
+                "call_id": "call_001",
+                "revision": 7,
+                "action": "RAG_ACTION",
+                "title": "Synthetic title",
+                "suggestion": "Synthetic guidance.",
+                "priority": "HIGH",
+                "citations": [{"document_id": "unknown", "chunk_id": "chunk_1"}],
+                "source": "llm",
+            }
+        ),
+    ],
+)
+def test_rejected_gate_output_skips_callbacks(generated_text: str) -> None:
+    id_callback = Callback("synthetic_id")
+    clock_callback = Callback(NOW)
+
+    suggestion = factory(
+        id_callback=cast(Callable[[], str], id_callback),
+        clock_callback=cast(Callable[[], datetime], clock_callback),
+    ).create(
+        event=transcript(),
+        orchestration_result=orchestration_result(generated_text=generated_text),
+        current_seconds=7,
+    )
+
+    assert suggestion is None
+    assert id_callback.calls == clock_callback.calls == 0
+
+
+def test_valid_no_suggestion_output_is_not_admitted() -> None:
+    raw_output = json.dumps(
+        {
+            "decision": "no_suggestion",
+            "tenant_id": "tenant_alpha",
+            "call_id": "call_001",
+            "revision": 7,
+        }
+    )
+
+    assert (
+        factory().create(
+            event=transcript(),
+            orchestration_result=orchestration_result(generated_text=raw_output),
+            current_seconds=7,
+        )
+        is None
+    )
 
 
 def test_existing_integration_exports_are_preserved() -> None:

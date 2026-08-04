@@ -29,6 +29,7 @@ class PromptBuildRequest(BaseModel):
 
     tenant_id: str
     call_id: str
+    transcript_revision: int
     user_input: str
     retrieved_context: tuple[PromptContextItem, ...] = ()
 
@@ -36,6 +37,13 @@ class PromptBuildRequest(BaseModel):
     @classmethod
     def validate_required_text(cls, value: str, info: object) -> str:
         return _required_text(value, getattr(info, "field_name", "value"))
+
+    @field_validator("transcript_revision")
+    @classmethod
+    def validate_transcript_revision(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("transcript_revision cannot be negative")
+        return value
 
 
 class PromptBuildResult(BaseModel):
