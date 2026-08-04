@@ -65,6 +65,20 @@ unchanged. These tables provide persistence only. Dashboard document upload,
 extraction, embedding workers, object storage, and document services are not
 implemented by this migration.
 
+## Phase-one document preparation
+
+The in-memory preparation layer accepts PDF, UTF-8 TXT and UTF-8 Markdown only.
+Uploads are limited to 10 MiB, PDFs to 100 pages, and normalized extracted text
+to 1,000,000 Unicode characters. Encrypted PDFs, OCR, archives, external URLs,
+empty documents, invalid UTF-8, NUL content and filename path semantics are
+rejected with fixed non-sensitive failures. PDF parsing uses lock-pinned
+PyMuPDF from in-memory bytes; no client-controlled filesystem path is used.
+
+Preparation calculates SHA-256 over accepted source bytes, normalizes text and
+builds deterministic chunks with page metadata where applicable. It does not
+create embeddings. Dashboard upload UI, registry persistence, object storage,
+job workers and progress polling are not implemented by this change.
+
 ## External PostgreSQL requirement
 
 Real smoke testing requires an externally managed PostgreSQL/pgvector endpoint
