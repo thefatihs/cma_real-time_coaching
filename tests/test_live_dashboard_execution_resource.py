@@ -183,7 +183,7 @@ def test_microphone_session_survives_rerun_and_resource_close_revokes_once() -> 
     assert resource.microphone_session is None
 
 
-def test_microphone_first_chunk_advances_snapshot_before_disconnect_end() -> None:
+def test_microphone_first_chunk_advances_snapshot_before_explicit_call_end() -> None:
     class OneChunkNormalizer:
         def normalize(self, frame: av.AudioFrame) -> tuple[_NormalizedAudio, ...]:
             del frame
@@ -233,7 +233,7 @@ def test_microphone_first_chunk_advances_snapshot_before_disconnect_end() -> Non
     )
     session.start(arrived_at_utc=NOW)
     session.accept_frame(av.AudioFrame(), arrived_at_utc=NOW)
-    session.disconnect(arrived_at_utc=NOW)
+    session.request_stop(arrived_at_utc=NOW)
 
     assert first_processed.wait(timeout=2)
     resource.join_worker()

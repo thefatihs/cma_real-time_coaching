@@ -10,12 +10,13 @@ from enum import Enum
 from fractions import Fraction
 from hashlib import sha256
 from ipaddress import ip_address
-from math import isfinite
+from math import isfinite, sqrt
 from threading import Condition, Event, RLock
 from typing import Never, Protocol, runtime_checkable
 from uuid import uuid4
 
 import av
+import numpy as np
 
 from app.audio_ingress.boundary import (
     IngressAcceptanceStatus,
@@ -37,12 +38,17 @@ LOCAL_MIC_CODEC_NAME = "pcm_s16le"
 LOCAL_MIC_CHUNK_SECONDS = 2.0
 LOCAL_MIC_CHUNK_BYTES = 64_000
 LOCAL_MIC_MAX_QUEUE_DEPTH = 8
+_MAX_LOCAL_MIC_DIAGNOSTIC_COUNT = 1_000_000
+_MAX_LOCAL_MIC_AUDIO_VALUE_COUNT = 2_000_000_000
 
 
 class LocalMicrophoneStatus(str, Enum):
     PERMISSION_PENDING = "PERMISSION_PENDING"
     READY = "READY"
     STREAMING = "STREAMING"
+    PAUSING = "PAUSING"
+    PAUSED = "PAUSED"
+    RECONNECTING = "RECONNECTING"
     STOP_REQUESTED = "STOP_REQUESTED"
     COMPLETED = "COMPLETED"
     PERMISSION_DENIED = "PERMISSION_DENIED"
@@ -71,6 +77,24 @@ class LocalMicrophoneTerminalReason(str, Enum):
     RESOURCE_CLOSED = "RESOURCE_CLOSED"
 
 
+class LocalMicrophoneTranscriptRejectionReason(str, Enum):
+    NONE = "NONE"
+    STEP_SCOPE_MISMATCH = "STEP_SCOPE_MISMATCH"
+    RESULT_SCOPE_MISMATCH = "RESULT_SCOPE_MISMATCH"
+    EVENT_SCOPE_MISMATCH = "EVENT_SCOPE_MISMATCH"
+    REVISION_REGRESSION = "REVISION_REGRESSION"
+
+
+class LocalMicrophoneAudioRejectionReason(str, Enum):
+    NONE = "NONE"
+    STALE_CAPTURE_GENERATION = "STALE_CAPTURE_GENERATION"
+    ASR_NOT_READY = "ASR_NOT_READY"
+    CAPABILITY_REVOKED = "CAPABILITY_REVOKED"
+    CAPTURE_NOT_STREAMING = "CAPTURE_NOT_STREAMING"
+    NORMALIZATION_FAILED = "NORMALIZATION_FAILED"
+    INGRESS_REJECTED = "INGRESS_REJECTED"
+
+
 @dataclass(frozen=True, slots=True)
 class LocalMicrophoneASRTimings:
     engine_construction_seconds: float | None = None
@@ -93,6 +117,31 @@ class LocalMicrophoneDiagnostics:
     queue_depth: int
     estimated_latency_seconds: float | None
     end_emitted: bool
+    capture_generation: int
+    pause_count: int
+    reconnect_count: int
+    in_flight_chunk_count: int
+    asr_non_empty_result_count: int
+    asr_empty_result_count: int
+    asr_segment_count: int
+    latest_window_duration_seconds: float
+    partial_event_count: int
+    stable_commit_count: int
+    rejected_transcript_event_count: int
+    latest_transcript_rejection_reason: LocalMicrophoneTranscriptRejectionReason
+    callback_frame_count: int
+    rejected_capture_frame_count: int
+    latest_audio_rejection_reason: LocalMicrophoneAudioRejectionReason
+    input_sample_rate_hz: int | None
+    input_channel_count: int | None
+    input_sample_count: int
+    pre_resample_rms: float
+    pre_resample_peak: float
+    post_resample_rms: float
+    post_resample_peak: float
+    post_resample_nonzero_ratio: float
+    post_resample_clipping_ratio: float
+    produced_pcm_byte_count: int
 
 
 @dataclass(slots=True)
@@ -210,6 +259,15 @@ class _NormalizedAudio:
     media_time_seconds: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class _AudioEnergy:
+    sample_count: int
+    square_sum: float
+    peak: float
+    nonzero_count: int
+    clipping_count: int
+
+
 class _AudioNormalizerProtocol(Protocol):
     def normalize(self, frame: av.AudioFrame) -> tuple[_NormalizedAudio, ...]: ...
 
@@ -283,6 +341,37 @@ class LocalMicrophoneIngressSession:
         self._first_media_time: float | None = None
         self._capture_origin_utc: datetime | None = None
         self._sequence = 0
+        self._call_started = False
+        self._capture_generation = 1
+        self._pause_count = 0
+        self._reconnect_count = 0
+        self._pause_pending = False
+        self._capture_stop_status: LocalMicrophoneStatus | None = None
+        self._in_flight_chunk_count = 0
+        self._asr_non_empty_result_count = 0
+        self._asr_empty_result_count = 0
+        self._asr_segment_count = 0
+        self._latest_window_duration_seconds = 0.0
+        self._partial_event_count = 0
+        self._stable_commit_count = 0
+        self._rejected_transcript_event_count = 0
+        self._latest_transcript_rejection_reason = (
+            LocalMicrophoneTranscriptRejectionReason.NONE
+        )
+        self._callback_frame_count = 0
+        self._rejected_capture_frame_count = 0
+        self._latest_audio_rejection_reason = LocalMicrophoneAudioRejectionReason.NONE
+        self._input_sample_rate_hz: int | None = None
+        self._input_channel_count: int | None = None
+        self._input_sample_count = 0
+        self._pre_resample_square_sum = 0.0
+        self._pre_resample_peak = 0.0
+        self._post_resample_sample_count = 0
+        self._post_resample_square_sum = 0.0
+        self._post_resample_peak = 0.0
+        self._post_resample_nonzero_count = 0
+        self._post_resample_clipping_count = 0
+        self._produced_pcm_byte_count = 0
         self._status = LocalMicrophoneStatus.PERMISSION_PENDING
         self._asr_readiness = LocalMicrophoneASRReadiness.PREPARING_MODEL
         self._asr_timings = LocalMicrophoneASRTimings()
@@ -314,6 +403,45 @@ class LocalMicrophoneIngressSession:
                 queue_depth=self._boundary.retained_audio_chunk_count,
                 estimated_latency_seconds=self._estimated_latency_seconds,
                 end_emitted=self._end_emitted,
+                capture_generation=self._capture_generation,
+                pause_count=self._pause_count,
+                reconnect_count=self._reconnect_count,
+                in_flight_chunk_count=self._in_flight_chunk_count,
+                asr_non_empty_result_count=self._asr_non_empty_result_count,
+                asr_empty_result_count=self._asr_empty_result_count,
+                asr_segment_count=self._asr_segment_count,
+                latest_window_duration_seconds=(self._latest_window_duration_seconds),
+                partial_event_count=self._partial_event_count,
+                stable_commit_count=self._stable_commit_count,
+                rejected_transcript_event_count=(self._rejected_transcript_event_count),
+                latest_transcript_rejection_reason=(
+                    self._latest_transcript_rejection_reason
+                ),
+                callback_frame_count=self._callback_frame_count,
+                rejected_capture_frame_count=self._rejected_capture_frame_count,
+                latest_audio_rejection_reason=self._latest_audio_rejection_reason,
+                input_sample_rate_hz=self._input_sample_rate_hz,
+                input_channel_count=self._input_channel_count,
+                input_sample_count=self._input_sample_count,
+                pre_resample_rms=_rms(
+                    self._pre_resample_square_sum,
+                    self._input_sample_count,
+                ),
+                pre_resample_peak=self._pre_resample_peak,
+                post_resample_rms=_rms(
+                    self._post_resample_square_sum,
+                    self._post_resample_sample_count,
+                ),
+                post_resample_peak=self._post_resample_peak,
+                post_resample_nonzero_ratio=_ratio(
+                    self._post_resample_nonzero_count,
+                    self._post_resample_sample_count,
+                ),
+                post_resample_clipping_ratio=_ratio(
+                    self._post_resample_clipping_count,
+                    self._post_resample_sample_count,
+                ),
+                produced_pcm_byte_count=self._produced_pcm_byte_count,
             )
 
     def start(self, *, arrived_at_utc: datetime | None = None) -> bool:
@@ -326,19 +454,24 @@ class LocalMicrophoneIngressSession:
                 return False
             if self._asr_readiness is not LocalMicrophoneASRReadiness.READY_TO_CAPTURE:
                 raise RuntimeError("local_microphone_asr_not_ready")
-            if self._status is not LocalMicrophoneStatus.PERMISSION_PENDING:
+            if self._status not in {
+                LocalMicrophoneStatus.PERMISSION_PENDING,
+                LocalMicrophoneStatus.RECONNECTING,
+            }:
                 raise RuntimeError("local_microphone_session_not_startable")
             now = _aware_utc(arrived_at_utc)
-            result = self._boundary.accept(
-                self._event(
-                    LiveAudioEventType.START,
-                    captured_at_utc=now,
-                    arrived_at_utc=now,
+            if not self._call_started:
+                result = self._boundary.accept(
+                    self._event(
+                        LiveAudioEventType.START,
+                        captured_at_utc=now,
+                        arrived_at_utc=now,
+                    )
                 )
-            )
-            if result.status is not IngressAcceptanceStatus.ACCEPTED:
-                raise RuntimeError("local_microphone_start_rejected")
-            self._sequence += 1
+                if result.status is not IngressAcceptanceStatus.ACCEPTED:
+                    raise RuntimeError("local_microphone_start_rejected")
+                self._sequence += 1
+                self._call_started = True
             self._status = LocalMicrophoneStatus.READY
             self._asr_readiness = LocalMicrophoneASRReadiness.STREAMING
             return True
@@ -352,9 +485,7 @@ class LocalMicrophoneIngressSession:
         if not isinstance(readiness, LocalMicrophoneASRReadiness):
             raise ValueError("invalid_local_microphone_asr_readiness")
         with self._condition:
-            self._require_authorized()
-            if resource is not self._resource:
-                raise PermissionError("invalid_local_microphone_capability")
+            self._require_resource(resource)
             if readiness is self._asr_readiness:
                 return False
             allowed = {
@@ -367,9 +498,11 @@ class LocalMicrophoneIngressSession:
                     LocalMicrophoneASRReadiness.FAILED,
                 },
                 LocalMicrophoneASRReadiness.READY_TO_CAPTURE: {
+                    LocalMicrophoneASRReadiness.STREAMING,
                     LocalMicrophoneASRReadiness.FAILED,
                 },
                 LocalMicrophoneASRReadiness.STREAMING: {
+                    LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
                     LocalMicrophoneASRReadiness.FAILED,
                 },
             }.get(self._asr_readiness, set())
@@ -397,9 +530,7 @@ class LocalMicrophoneIngressSession:
         ):
             raise ValueError("invalid_local_microphone_asr_timing")
         with self._condition:
-            self._require_authorized()
-            if resource is not self._resource:
-                raise PermissionError("invalid_local_microphone_capability")
+            self._require_resource(resource)
             current = self._asr_timings
             self._asr_timings = LocalMicrophoneASRTimings(
                 engine_construction_seconds=(
@@ -441,9 +572,7 @@ class LocalMicrophoneIngressSession:
         ):
             raise ValueError("invalid_local_microphone_asr_timing")
         with self._condition:
-            self._require_authorized()
-            if resource is not self._resource:
-                raise PermissionError("invalid_local_microphone_capability")
+            self._require_resource(resource)
             current = self._asr_timings
             self._asr_timings = LocalMicrophoneASRTimings(
                 engine_construction_seconds=current.engine_construction_seconds,
@@ -464,37 +593,439 @@ class LocalMicrophoneIngressSession:
                 inference_count=current.inference_count + 1,
             )
 
+    def record_transcript_step(
+        self,
+        *,
+        resource: object,
+        asr_result_non_empty: bool,
+        asr_segment_count: int = 0,
+        window_duration_seconds: float = 0.0,
+        partial_event_count: int,
+        stable_commit_count: int,
+        rejected_event_count: int = 0,
+        rejection_reason: LocalMicrophoneTranscriptRejectionReason = (
+            LocalMicrophoneTranscriptRejectionReason.NONE
+        ),
+    ) -> None:
+        """Retain bounded content-free transcript pipeline counters."""
+        counts = (
+            asr_segment_count,
+            partial_event_count,
+            stable_commit_count,
+            rejected_event_count,
+        )
+        if (
+            type(asr_result_non_empty) is not bool
+            or any(
+                type(value) is not int or value < 0 or value > 64 for value in counts
+            )
+            or not isfinite(window_duration_seconds)
+            or window_duration_seconds < 0
+            or not isinstance(
+                rejection_reason,
+                LocalMicrophoneTranscriptRejectionReason,
+            )
+            or (
+                rejected_event_count == 0
+                and rejection_reason
+                is not LocalMicrophoneTranscriptRejectionReason.NONE
+            )
+            or (
+                rejected_event_count > 0
+                and rejection_reason is LocalMicrophoneTranscriptRejectionReason.NONE
+            )
+        ):
+            raise ValueError("invalid_local_microphone_transcript_diagnostic")
+        with self._condition:
+            self._require_resource(resource)
+            if asr_result_non_empty:
+                self._asr_non_empty_result_count = _bounded_counter_increment(
+                    self._asr_non_empty_result_count
+                )
+            else:
+                self._asr_empty_result_count = _bounded_counter_increment(
+                    self._asr_empty_result_count
+                )
+            self._asr_segment_count = _bounded_counter_increment(
+                self._asr_segment_count,
+                asr_segment_count,
+            )
+            self._latest_window_duration_seconds = window_duration_seconds
+            self._partial_event_count = _bounded_counter_increment(
+                self._partial_event_count,
+                partial_event_count,
+            )
+            self._stable_commit_count = _bounded_counter_increment(
+                self._stable_commit_count,
+                stable_commit_count,
+            )
+            self._rejected_transcript_event_count = _bounded_counter_increment(
+                self._rejected_transcript_event_count,
+                rejected_event_count,
+            )
+            if rejection_reason is not LocalMicrophoneTranscriptRejectionReason.NONE:
+                self._latest_transcript_rejection_reason = rejection_reason
+
+    def record_final_transcript_event(
+        self,
+        *,
+        resource: object,
+        accepted: bool,
+        rejection_reason: LocalMicrophoneTranscriptRejectionReason = (
+            LocalMicrophoneTranscriptRejectionReason.NONE
+        ),
+    ) -> None:
+        if (
+            type(accepted) is not bool
+            or not isinstance(
+                rejection_reason,
+                LocalMicrophoneTranscriptRejectionReason,
+            )
+            or (
+                accepted
+                and rejection_reason
+                is not LocalMicrophoneTranscriptRejectionReason.NONE
+            )
+        ):
+            raise ValueError("invalid_local_microphone_transcript_diagnostic")
+        with self._condition:
+            self._require_resource(resource)
+            if accepted:
+                self._stable_commit_count = _bounded_counter_increment(
+                    self._stable_commit_count
+                )
+            if rejection_reason is not LocalMicrophoneTranscriptRejectionReason.NONE:
+                self._rejected_transcript_event_count = _bounded_counter_increment(
+                    self._rejected_transcript_event_count
+                )
+                self._latest_transcript_rejection_reason = rejection_reason
+
     def accept_frame(
         self,
         frame: av.AudioFrame,
         *,
         arrived_at_utc: datetime | None = None,
+        capture_generation: int | None = None,
     ) -> av.AudioFrame:
         now = _aware_utc(arrived_at_utc)
-        if self.diagnostics.asr_readiness not in {
-            LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
-            LocalMicrophoneASRReadiness.STREAMING,
-        }:
-            raise RuntimeError("local_microphone_asr_not_ready")
-        if self.diagnostics.status is LocalMicrophoneStatus.PERMISSION_PENDING:
-            self.start(arrived_at_utc=now)
-        normalized = self._normalizer.normalize(frame)
         with self._condition:
-            self._require_authorized()
+            if (
+                capture_generation is not None
+                and capture_generation != self._capture_generation
+            ):
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.STALE_CAPTURE_GENERATION
+                )
+                raise PermissionError("stale_local_microphone_capture_generation")
+            if self._asr_readiness not in {
+                LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+                LocalMicrophoneASRReadiness.STREAMING,
+            }:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.ASR_NOT_READY
+                )
+                raise RuntimeError("local_microphone_asr_not_ready")
+            if self._status in {
+                LocalMicrophoneStatus.PERMISSION_PENDING,
+                LocalMicrophoneStatus.RECONNECTING,
+            }:
+                self.start(arrived_at_utc=now)
+            try:
+                self._require_authorized()
+            except PermissionError:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.CAPABILITY_REVOKED
+                )
+                raise
             if self._status not in {
                 LocalMicrophoneStatus.READY,
                 LocalMicrophoneStatus.STREAMING,
             }:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.CAPTURE_NOT_STREAMING
+                )
                 raise RuntimeError("local_microphone_session_not_streaming")
-            for item in normalized:
-                self._append_normalized(item, arrived_at_utc=now)
+            try:
+                input_energy = _frame_energy(frame)
+            except Exception:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.NORMALIZATION_FAILED
+                )
+                raise
+            self._callback_frame_count = _bounded_counter_increment(
+                self._callback_frame_count
+            )
+            self._input_sample_rate_hz = (
+                frame.sample_rate if frame.sample_rate > 0 else None
+            )
+            channel_count = len(frame.layout.channels)
+            self._input_channel_count = channel_count if channel_count > 0 else None
+            self._accumulate_input_energy(input_energy)
+            try:
+                normalized = self._normalizer.normalize(frame)
+            except Exception:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.NORMALIZATION_FAILED
+                )
+                raise
+            self._record_normalized_energy(normalized)
+            try:
+                for item in normalized:
+                    self._append_normalized(item, arrived_at_utc=now)
+            except Exception:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.INGRESS_REJECTED
+                )
+                raise
             if self._capability.active:
                 self._status = LocalMicrophoneStatus.STREAMING
             self._condition.notify_all()
         return frame
 
+    def _record_audio_rejection(
+        self,
+        reason: LocalMicrophoneAudioRejectionReason,
+    ) -> None:
+        self._rejected_capture_frame_count = _bounded_counter_increment(
+            self._rejected_capture_frame_count
+        )
+        self._latest_audio_rejection_reason = reason
+
+    def _accumulate_input_energy(self, energy: _AudioEnergy) -> None:
+        accepted = min(
+            energy.sample_count,
+            _MAX_LOCAL_MIC_AUDIO_VALUE_COUNT - self._input_sample_count,
+        )
+        if accepted <= 0:
+            return
+        retained_fraction = accepted / energy.sample_count
+        self._input_sample_count += accepted
+        self._pre_resample_square_sum += energy.square_sum * retained_fraction
+        self._pre_resample_peak = max(self._pre_resample_peak, energy.peak)
+
+    def _accumulate_output_energy(self, energy: _AudioEnergy) -> None:
+        accepted = min(
+            energy.sample_count,
+            _MAX_LOCAL_MIC_AUDIO_VALUE_COUNT - self._post_resample_sample_count,
+        )
+        if accepted <= 0:
+            return
+        retained_fraction = accepted / energy.sample_count
+        self._post_resample_sample_count += accepted
+        self._post_resample_square_sum += energy.square_sum * retained_fraction
+        self._post_resample_peak = max(self._post_resample_peak, energy.peak)
+        self._post_resample_nonzero_count = min(
+            self._post_resample_nonzero_count
+            + round(energy.nonzero_count * retained_fraction),
+            self._post_resample_sample_count,
+        )
+        self._post_resample_clipping_count = min(
+            self._post_resample_clipping_count
+            + round(energy.clipping_count * retained_fraction),
+            self._post_resample_sample_count,
+        )
+
+    def _record_normalized_energy(
+        self,
+        normalized: tuple[_NormalizedAudio, ...],
+    ) -> None:
+        self._accumulate_output_energy(_pcm_energy(normalized))
+        self._produced_pcm_byte_count = min(
+            self._produced_pcm_byte_count
+            + sum(len(item.pcm_s16le) for item in normalized),
+            _MAX_LOCAL_MIC_AUDIO_VALUE_COUNT,
+        )
+
+    def pause_capture(
+        self,
+        *,
+        resource: object,
+        arrived_at_utc: datetime | None = None,
+    ) -> bool:
+        """Flush and revoke one capture without ending the retained call."""
+        return self._stop_capture(
+            resource=resource,
+            final_status=LocalMicrophoneStatus.PAUSED,
+            arrived_at_utc=arrived_at_utc,
+            flush=True,
+        )
+
+    def resume_capture(
+        self,
+        capability: LocalMicTestCapability,
+        *,
+        resource: object,
+        normalizer: _AudioNormalizerProtocol | None = None,
+    ) -> bool:
+        """Install a fresh exact-scope capture while retaining call state."""
+        with self._condition:
+            if self._closed or resource is not self._resource:
+                raise PermissionError("invalid_local_microphone_capability")
+            if self._status in {
+                LocalMicrophoneStatus.PERMISSION_PENDING,
+                LocalMicrophoneStatus.READY,
+                LocalMicrophoneStatus.STREAMING,
+                LocalMicrophoneStatus.RECONNECTING,
+                LocalMicrophoneStatus.PAUSING,
+            }:
+                return False
+            if self._status not in {
+                LocalMicrophoneStatus.PAUSED,
+                LocalMicrophoneStatus.PERMISSION_DENIED,
+                LocalMicrophoneStatus.DISCONNECTED,
+                LocalMicrophoneStatus.FAILED,
+            }:
+                raise RuntimeError("local_microphone_capture_not_resumable")
+            if capability is self._capability or not capability.authorizes(
+                tenant_id=self._capability.tenant_id,
+                call_id=self._capability.call_id,
+                resource=resource,
+            ):
+                raise PermissionError("invalid_local_microphone_capability")
+            if self._capability.active:
+                raise RuntimeError("previous_local_microphone_capability_active")
+            self._capability = capability
+            self._normalizer = normalizer or PyAVLocalMicrophoneNormalizer()
+            self._capture_generation += 1
+            component_digest = sha256(
+                f"{self._provider_stream_id}:{self._capture_generation}".encode("utf-8")
+            ).hexdigest()
+            self._component_key = f"local-mic-{component_digest[:24]}"
+            self._buffer.clear()
+            self._buffer_capture_utc = None
+            self._first_media_time = None
+            self._capture_origin_utc = None
+            self._pause_pending = False
+            self._capture_stop_status = None
+            self._status = LocalMicrophoneStatus.PERMISSION_PENDING
+            self._asr_readiness = LocalMicrophoneASRReadiness.READY_TO_CAPTURE
+            self._condition.notify_all()
+            return True
+
+    def mark_reconnecting(self, *, capture_generation: int | None = None) -> bool:
+        """Treat a media-track end as transient until explicit user action."""
+        with self._condition:
+            if (
+                capture_generation is not None
+                and capture_generation != self._capture_generation
+            ):
+                return False
+            if self._closed or not self._capability.active:
+                return False
+            if self._status is LocalMicrophoneStatus.RECONNECTING:
+                return False
+            if self._status not in {
+                LocalMicrophoneStatus.READY,
+                LocalMicrophoneStatus.STREAMING,
+            }:
+                return False
+            self._status = LocalMicrophoneStatus.RECONNECTING
+            self._reconnect_count += 1
+            self._asr_readiness = LocalMicrophoneASRReadiness.READY_TO_CAPTURE
+            self._condition.notify_all()
+            return True
+
+    def fail_capture(
+        self,
+        *,
+        resource: object,
+        status: LocalMicrophoneStatus = LocalMicrophoneStatus.FAILED,
+    ) -> bool:
+        if status not in {
+            LocalMicrophoneStatus.FAILED,
+            LocalMicrophoneStatus.PERMISSION_DENIED,
+            LocalMicrophoneStatus.DISCONNECTED,
+        }:
+            raise ValueError("invalid_local_microphone_capture_failure")
+        return self._stop_capture(
+            resource=resource,
+            final_status=status,
+            arrived_at_utc=None,
+            flush=False,
+        )
+
+    def _stop_capture(
+        self,
+        *,
+        resource: object,
+        final_status: LocalMicrophoneStatus,
+        arrived_at_utc: datetime | None,
+        flush: bool,
+    ) -> bool:
+        now = _aware_utc(arrived_at_utc)
+        with self._condition:
+            if self._closed or resource is not self._resource:
+                raise PermissionError("invalid_local_microphone_capability")
+            if self._status in {
+                LocalMicrophoneStatus.PAUSING,
+                LocalMicrophoneStatus.PAUSED,
+            }:
+                return False
+            if not self._capability.active:
+                return False
+            self._status = LocalMicrophoneStatus.PAUSING
+            flushed: tuple[_NormalizedAudio, ...] = ()
+            if flush:
+                try:
+                    flushed = self._normalizer.flush()
+                    self._record_normalized_energy(flushed)
+                except Exception:
+                    self._record_audio_rejection(
+                        LocalMicrophoneAudioRejectionReason.NORMALIZATION_FAILED
+                    )
+                    final_status = LocalMicrophoneStatus.FAILED
+            try:
+                for item in flushed:
+                    self._append_normalized(item, arrived_at_utc=now)
+                self._emit_buffer(arrived_at_utc=now, allow_short=True)
+            except Exception:
+                self._buffer.clear()
+                self._buffer_capture_utc = None
+                final_status = LocalMicrophoneStatus.FAILED
+            self._pause_count += 1
+            self._pause_pending = True
+            self._capture_stop_status = final_status
+            self._capability.revoke()
+            self._asr_readiness = LocalMicrophoneASRReadiness.READY_TO_CAPTURE
+            self._first_media_time = None
+            self._capture_origin_utc = None
+            self._finish_capture_stop_if_drained()
+            self._condition.notify_all()
+            return True
+
+    def _finish_capture_stop_if_drained(self) -> None:
+        if (
+            self._pause_pending
+            and self._boundary.retained_audio_chunk_count == 0
+            and self._in_flight_chunk_count == 0
+        ):
+            self._pause_pending = False
+            self._status = self._capture_stop_status or LocalMicrophoneStatus.PAUSED
+            self._capture_stop_status = None
+
+    def acknowledge_processed_chunk(self, *, resource: object) -> None:
+        with self._condition:
+            self._require_resource(resource)
+            if self._in_flight_chunk_count <= 0:
+                raise RuntimeError("local_microphone_chunk_not_in_flight")
+            self._in_flight_chunk_count -= 1
+            self._finish_capture_stop_if_drained()
+            self._condition.notify_all()
+
     def request_stop(self, *, arrived_at_utc: datetime | None = None) -> bool:
+        return self.finish_call(
+            resource=self._resource,
+            arrived_at_utc=arrived_at_utc,
+        )
+
+    def finish_call(
+        self,
+        *,
+        resource: object,
+        arrived_at_utc: datetime | None = None,
+    ) -> bool:
         return self._request_draining_end(
+            resource=resource,
             terminal_status=LocalMicrophoneStatus.COMPLETED,
             end_reason=LiveAudioEndReason.COMPLETED,
             arrived_at_utc=arrived_at_utc,
@@ -503,28 +1034,30 @@ class LocalMicrophoneIngressSession:
     def _request_draining_end(
         self,
         *,
+        resource: object,
         terminal_status: LocalMicrophoneStatus,
         end_reason: LiveAudioEndReason,
         arrived_at_utc: datetime | None,
     ) -> bool:
         now = _aware_utc(arrived_at_utc)
-        try:
-            flushed = self._normalizer.flush()
-        except Exception:
-            self._cancel(LocalMicrophoneTerminalReason.FAILED)
-            return False
         with self._condition:
             if self._end_reason is not None or self._closed:
                 return False
-            self._require_authorized()
-            if self._boundary.active_stream_count == 0:
-                self._cancel(
-                    (
-                        LocalMicrophoneTerminalReason.DISCONNECTED
-                        if terminal_status is LocalMicrophoneStatus.DISCONNECTED
-                        else LocalMicrophoneTerminalReason.COMPLETED
+            if resource is not self._resource:
+                raise PermissionError("invalid_local_microphone_capability")
+            flushed: tuple[_NormalizedAudio, ...] = ()
+            if self._capability.active:
+                try:
+                    flushed = self._normalizer.flush()
+                    self._record_normalized_energy(flushed)
+                except Exception:
+                    self._record_audio_rejection(
+                        LocalMicrophoneAudioRejectionReason.NORMALIZATION_FAILED
                     )
-                )
+                    self._cancel(LocalMicrophoneTerminalReason.FAILED)
+                    return False
+            if self._boundary.active_stream_count == 0:
+                self._cancel(LocalMicrophoneTerminalReason.COMPLETED)
                 return True
             for item in flushed:
                 self._append_normalized(item, arrived_at_utc=now)
@@ -532,8 +1065,11 @@ class LocalMicrophoneIngressSession:
             if self._closed:
                 return False
             self._status = LocalMicrophoneStatus.STOP_REQUESTED
+            self._pause_pending = False
+            self._capture_stop_status = None
             self._terminal_status = terminal_status
             self._end_reason = end_reason
+            self._capability.revoke()
             if self._boundary.retained_audio_chunk_count == 0:
                 self._emit_end()
             self._condition.notify_all()
@@ -565,6 +1101,7 @@ class LocalMicrophoneIngressSession:
                 )
                 if drained:
                     chunk = drained[0].audio_chunk
+                    self._in_flight_chunk_count += 1
                     self._condition.notify_all()
                 elif self._end_reason is not None:
                     self._emit_end()
@@ -576,11 +1113,8 @@ class LocalMicrophoneIngressSession:
             yield chunk
 
     def disconnect(self, *, arrived_at_utc: datetime | None = None) -> bool:
-        return self._request_draining_end(
-            terminal_status=LocalMicrophoneStatus.DISCONNECTED,
-            end_reason=LiveAudioEndReason.CANCELLED,
-            arrived_at_utc=arrived_at_utc,
-        )
+        del arrived_at_utc
+        return self.mark_reconnecting()
 
     def fail(self) -> None:
         with self._condition:
@@ -588,7 +1122,10 @@ class LocalMicrophoneIngressSession:
         self._cancel(LocalMicrophoneTerminalReason.FAILED)
 
     def deny_permission(self) -> None:
-        self._cancel(LocalMicrophoneTerminalReason.PERMISSION_DENIED)
+        self.fail_capture(
+            resource=self._resource,
+            status=LocalMicrophoneStatus.PERMISSION_DENIED,
+        )
 
     def close(
         self,
@@ -768,6 +1305,10 @@ class LocalMicrophoneIngressSession:
         ):
             raise PermissionError("local_microphone_capability_revoked")
 
+    def _require_resource(self, resource: object) -> None:
+        if self._closed or resource is not self._resource:
+            raise PermissionError("invalid_local_microphone_capability")
+
 
 def _frame_media_time(frame: av.AudioFrame) -> float | None:
     if frame.pts is None or frame.time_base is None:
@@ -797,3 +1338,68 @@ def _aware_utc(value: datetime | None) -> datetime:
     if resolved.tzinfo is None or resolved.utcoffset() is None:
         raise ValueError("timezone_required")
     return resolved.astimezone(UTC)
+
+
+def _frame_energy(frame: av.AudioFrame) -> _AudioEnergy:
+    if frame.samples == 0:
+        return _AudioEnergy(0, 0.0, 0.0, 0, 0)
+    samples = frame.to_ndarray()
+    if np.issubdtype(samples.dtype, np.floating):
+        normalized = samples.astype(np.float64, copy=False)
+    elif np.issubdtype(samples.dtype, np.signedinteger):
+        info = np.iinfo(samples.dtype.name)
+        scale = float(max(abs(info.min), info.max))
+        normalized = samples.astype(np.float64) / scale
+    elif np.issubdtype(samples.dtype, np.unsignedinteger):
+        info = np.iinfo(samples.dtype.name)
+        midpoint = (float(info.max) + 1.0) / 2.0
+        normalized = (samples.astype(np.float64) - midpoint) / midpoint
+    else:
+        raise TypeError("unsupported_local_microphone_sample_format")
+    return _array_energy(normalized)
+
+
+def _pcm_energy(normalized: tuple[_NormalizedAudio, ...]) -> _AudioEnergy:
+    result = _AudioEnergy(0, 0.0, 0.0, 0, 0)
+    for item in normalized:
+        samples = np.frombuffer(item.pcm_s16le, dtype="<i2").astype(np.float64)
+        result = _combine_energy(result, _array_energy(samples / 32768.0))
+    return result
+
+
+def _array_energy(samples: np.ndarray) -> _AudioEnergy:
+    flattened = samples.reshape(-1)
+    if flattened.size == 0:
+        return _AudioEnergy(0, 0.0, 0.0, 0, 0)
+    if not bool(np.isfinite(flattened).all()):
+        raise ValueError("non_finite_local_microphone_samples")
+    absolute = np.abs(flattened)
+    return _AudioEnergy(
+        sample_count=int(flattened.size),
+        square_sum=float(np.dot(flattened, flattened)),
+        peak=float(absolute.max()),
+        nonzero_count=int(np.count_nonzero(flattened)),
+        clipping_count=int(np.count_nonzero(absolute >= (32767.0 / 32768.0))),
+    )
+
+
+def _combine_energy(first: _AudioEnergy, second: _AudioEnergy) -> _AudioEnergy:
+    return _AudioEnergy(
+        sample_count=first.sample_count + second.sample_count,
+        square_sum=first.square_sum + second.square_sum,
+        peak=max(first.peak, second.peak),
+        nonzero_count=first.nonzero_count + second.nonzero_count,
+        clipping_count=first.clipping_count + second.clipping_count,
+    )
+
+
+def _rms(square_sum: float, sample_count: int) -> float:
+    return sqrt(square_sum / sample_count) if sample_count else 0.0
+
+
+def _ratio(count: int, sample_count: int) -> float:
+    return count / sample_count if sample_count else 0.0
+
+
+def _bounded_counter_increment(current: int, increment: int = 1) -> int:
+    return min(current + increment, _MAX_LOCAL_MIC_DIAGNOSTIC_COUNT)

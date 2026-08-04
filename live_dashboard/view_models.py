@@ -136,6 +136,10 @@ class DashboardExecutionStage(str, Enum):
     LIVE_AUDIO = "LIVE_AUDIO"
     TRANSCRIPT_UPDATING = "TRANSCRIPT_UPDATING"
     COACHING_UPDATING = "COACHING_UPDATING"
+    MICROPHONE_PAUSING = "MICROPHONE_PAUSING"
+    MICROPHONE_PAUSED = "MICROPHONE_PAUSED"
+    MICROPHONE_RECONNECTING = "MICROPHONE_RECONNECTING"
+    MICROPHONE_CAPTURE_FAILED = "MICROPHONE_CAPTURE_FAILED"
     STOP_REQUESTED = "STOP_REQUESTED"
     MICROPHONE_DISCONNECTED = "MICROPHONE_DISCONNECTED"
     MICROPHONE_OVERLOADED = "MICROPHONE_OVERLOADED"
@@ -657,6 +661,15 @@ def consume_live_step(
     state.stage = "Konuşma metni güncelleniyor"
     _consume_step(state, step)
     state.elapsed_seconds = max(elapsed_seconds, 0.0)
+
+
+def consume_live_result(
+    state: LocalExecutionState,
+    result: StreamingASRResult,
+) -> None:
+    """Apply the final live-only event/outcomes without replaying step history."""
+    _consume_pipeline_result(state, result)
+    state.audio_duration_seconds = result.audio_duration_seconds
 
 
 def reset_runtime(runtime: DashboardRuntime) -> DashboardRuntime:

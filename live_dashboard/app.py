@@ -17,19 +17,27 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.asr.faster_whisper_engine import FasterWhisperEngine  # noqa: E402
 from app.audio_ingress.local_microphone import (  # noqa: E402
+    LocalMicTestCapability,
     LocalMicrophoneASRReadiness,
+    LocalMicrophoneDiagnostics,
     LocalMicrophoneIngressSession,
     LocalMicrophoneStatus,
     LocalMicrophoneTerminalReason,
+    LocalMicrophoneTranscriptRejectionReason,
     create_local_mic_test_capability,
     local_microphone_test_enabled,
 )
 from app.classification.runtime import RuntimeSetFitClassifier  # noqa: E402
 from app.classification.streaming import ProvisionalClassificationPolicy  # noqa: E402
-from app.events.models import AudioChunkEvent, CoachingSuggestionLifecycle  # noqa: E402
+from app.events.models import (  # noqa: E402
+    AudioChunkEvent,
+    CoachingSuggestionLifecycle,
+    TranscriptKind,
+)
 from app.streaming.pipeline import (  # noqa: E402
     StreamingASRPipeline,
     StreamingASRPlan,
+    StreamingASRResult,
     StreamingASRStep,
 )
 from app.streaming.window_transcriber import WindowTranscriber  # noqa: E402
@@ -92,6 +100,7 @@ from live_dashboard.view_models import (  # noqa: E402
     advance_runtime,
     create_local_execution,
     create_runtime,
+    consume_live_result,
     consume_live_step,
     dashboard_tabs,
     execute_local_once,
@@ -117,6 +126,8 @@ _EXECUTION_RESOURCE_CAPACITY = 8
 _EXECUTION_RESOURCE_SESSION_KEY = "dashboard_execution_resource_key"
 _RAG_RUNTIME_STATUS_SESSION_KEY = "dashboard_rag_runtime_status"
 _RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
+_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY = "local_mic_call_active"
+_LOCAL_MIC_FINISH_PENDING_SESSION_KEY = "local_mic_finish_pending"
 _LOCAL_MIC_ASR_MODEL_NAME = "tiny"
 _LOCAL_MIC_ASR_COMPUTE_TYPE = "int8"
 _LOCAL_MIC_ASR_CPU_THREADS = 4
@@ -139,6 +150,16 @@ _EXECUTION_STAGE_TEXT = {
     DashboardExecutionStage.LIVE_AUDIO: "Canlı ses işleniyor",
     DashboardExecutionStage.TRANSCRIPT_UPDATING: "Konuşma metni güncelleniyor",
     DashboardExecutionStage.COACHING_UPDATING: "Anlık öneri hazırlanıyor",
+    DashboardExecutionStage.MICROPHONE_PAUSING: "Mikrofon duraklatılıyor",
+    DashboardExecutionStage.MICROPHONE_PAUSED: (
+        "Mikrofon duraklatıldı. Görüşme verileri korunuyor."
+    ),
+    DashboardExecutionStage.MICROPHONE_RECONNECTING: (
+        "Mikrofon bağlantısı yeniden kuruluyor"
+    ),
+    DashboardExecutionStage.MICROPHONE_CAPTURE_FAILED: (
+        "Mikrofon kullanılamıyor. Yeniden başlatabilirsiniz."
+    ),
     DashboardExecutionStage.STOP_REQUESTED: "Mikrofon durduruluyor",
     DashboardExecutionStage.MICROPHONE_DISCONNECTED: ("Mikrofon bağlantısı kesildi"),
     DashboardExecutionStage.MICROPHONE_OVERLOADED: ("Ses kuyruğu kapasitesi aşıldı"),
@@ -343,19 +364,83 @@ def _local_microphone_session(
     existing = resource.microphone_session
     if existing is not None:
         return cast(LocalMicrophoneIngressSession, existing)
+    session = LocalMicrophoneIngressSession(
+        capability=_local_microphone_capability(runtime, resource),
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+    return session
+
+
+def _local_microphone_capability(
+    runtime: DashboardRuntime,
+    resource: DashboardExecutionResource,
+) -> LocalMicTestCapability:
     server_address = st.get_option("server.address")
-    capability = create_local_mic_test_capability(
+    return create_local_mic_test_capability(
         tenant_id=runtime.call_state.tenant_id,
         call_id=runtime.call_id,
         resource=resource,
         server_address=(server_address if isinstance(server_address, str) else None),
     )
-    session = LocalMicrophoneIngressSession(
-        capability=capability,
-        resource=resource,
+
+
+def _local_microphone_transcript_rejection(
+    local: LocalExecutionState,
+    step: StreamingASRStep,
+) -> tuple[int, LocalMicrophoneTranscriptRejectionReason]:
+    expected_scope = (
+        local.runtime.call_state.tenant_id,
+        local.runtime.call_id,
     )
-    resource.attach_microphone_session(session)
-    return session
+    if (step.tenant_id, step.call_id) != expected_scope:
+        return (
+            max(len(step.transcript_events), 1),
+            LocalMicrophoneTranscriptRejectionReason.STEP_SCOPE_MISMATCH,
+        )
+    if any(
+        (event.tenant_id, event.call_id) != expected_scope
+        for event in step.transcript_events
+    ):
+        return (
+            sum(
+                (event.tenant_id, event.call_id) != expected_scope
+                for event in step.transcript_events
+            ),
+            LocalMicrophoneTranscriptRejectionReason.EVENT_SCOPE_MISMATCH,
+        )
+    expected_revision = local.runtime.call_state.transcript_revision
+    rejected_revisions = 0
+    for event in step.transcript_events:
+        if event.revision < expected_revision:
+            rejected_revisions += 1
+        expected_revision = max(expected_revision, event.revision)
+    if rejected_revisions:
+        return (
+            rejected_revisions,
+            LocalMicrophoneTranscriptRejectionReason.REVISION_REGRESSION,
+        )
+    return (0, LocalMicrophoneTranscriptRejectionReason.NONE)
+
+
+def _local_microphone_final_rejection(
+    local: LocalExecutionState,
+    result: StreamingASRResult,
+) -> LocalMicrophoneTranscriptRejectionReason:
+    expected_scope = (
+        local.runtime.call_state.tenant_id,
+        local.runtime.call_id,
+    )
+    if (result.tenant_id, result.call_id) != expected_scope:
+        return LocalMicrophoneTranscriptRejectionReason.RESULT_SCOPE_MISMATCH
+    final_event = result.final_event
+    if final_event is None:
+        return LocalMicrophoneTranscriptRejectionReason.NONE
+    if (final_event.tenant_id, final_event.call_id) != expected_scope:
+        return LocalMicrophoneTranscriptRejectionReason.EVENT_SCOPE_MISMATCH
+    if final_event.revision < local.runtime.call_state.transcript_revision:
+        return LocalMicrophoneTranscriptRejectionReason.REVISION_REGRESSION
+    return LocalMicrophoneTranscriptRejectionReason.NONE
 
 
 def _start_local_microphone_worker(
@@ -458,16 +543,48 @@ def _start_local_microphone_worker(
                 nonlocal revision
                 if cancellation.is_set():
                     raise RuntimeError("dashboard_execution_cancelled")
+                rejected_count, rejection_reason = (
+                    _local_microphone_transcript_rejection(local, step)
+                )
+                partial_count = sum(
+                    event.kind is TranscriptKind.PARTIAL
+                    for event in step.transcript_events
+                )
+                stable_count = sum(
+                    event.kind in {TranscriptKind.STABLE, TranscriptKind.FINAL}
+                    for event in step.transcript_events
+                )
+                if rejected_count:
+                    session.record_transcript_step(
+                        resource=resource,
+                        asr_result_non_empty=bool(step.raw_window_text.strip()),
+                        asr_segment_count=step.asr_segment_count,
+                        window_duration_seconds=step.window_duration_seconds,
+                        partial_event_count=0,
+                        stable_commit_count=0,
+                        rejected_event_count=rejected_count,
+                        rejection_reason=rejection_reason,
+                    )
+                    raise ValueError("local_microphone_transcript_event_rejected")
                 consume_live_step(
                     local,
                     step,
                     elapsed_seconds=perf_counter() - started_at,
+                )
+                session.record_transcript_step(
+                    resource=resource,
+                    asr_result_non_empty=bool(step.raw_window_text.strip()),
+                    asr_segment_count=step.asr_segment_count,
+                    window_duration_seconds=step.window_duration_seconds,
+                    partial_event_count=partial_count,
+                    stable_commit_count=stable_count,
                 )
                 session.record_asr_inference(
                     resource=resource,
                     audio_preparation_seconds=(step.audio_preparation_time_seconds),
                     inference_seconds=step.transcription_time_seconds,
                 )
+                session.acknowledge_processed_chunk(resource=resource)
                 revision += 1
                 stage = (
                     DashboardExecutionStage.COACHING_UPDATING
@@ -515,6 +632,19 @@ def _start_local_microphone_worker(
                 cancellation=cancellation,
                 step_callback=show_step,
                 retain_history=False,
+            )
+            final_rejection = _local_microphone_final_rejection(local, result)
+            if final_rejection is not LocalMicrophoneTranscriptRejectionReason.NONE:
+                session.record_final_transcript_event(
+                    resource=resource,
+                    accepted=False,
+                    rejection_reason=final_rejection,
+                )
+                raise ValueError("local_microphone_transcript_event_rejected")
+            consume_live_result(local, result)
+            session.record_final_transcript_event(
+                resource=resource,
+                accepted=result.final_event is not None,
             )
             local.processing_seconds = max(perf_counter() - started_at, 0.0)
             local.audio_duration_seconds = result.audio_duration_seconds
@@ -599,6 +729,127 @@ def _start_local_microphone_worker(
     return resource.start_worker(initial, run_microphone)
 
 
+def _request_local_microphone_finish(
+    session: LocalMicrophoneIngressSession,
+    resource: DashboardExecutionResource,
+) -> bool:
+    if st.session_state.get(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, False):
+        return False
+    requested = session.finish_call(resource=resource)
+    if requested or session.diagnostics.status in {
+        LocalMicrophoneStatus.STOP_REQUESTED,
+        LocalMicrophoneStatus.COMPLETED,
+    }:
+        st.session_state[_LOCAL_MIC_FINISH_PENDING_SESSION_KEY] = True
+        st.session_state.local_mic_desired_playing = False
+        return True
+    return False
+
+
+def _request_local_microphone_reset(
+    session: LocalMicrophoneIngressSession,
+    resource: DashboardExecutionResource,
+) -> bool:
+    if st.session_state.get("local_mic_reset_pending", False):
+        return False
+    session.close(LocalMicrophoneTerminalReason.RESET)
+    resource.cancel()
+    st.session_state.local_mic_desired_playing = False
+    st.session_state[_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY] = False
+    st.session_state.pop(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, None)
+    st.session_state.local_mic_reset_pending = True
+    return True
+
+
+def _local_microphone_audio_diagnostic_cards(
+    diagnostics: LocalMicrophoneDiagnostics,
+) -> tuple[StatusCardViewModel, ...]:
+    input_format = "Henüz bilinmiyor"
+    if (
+        diagnostics.input_sample_rate_hz is not None
+        and diagnostics.input_channel_count is not None
+    ):
+        input_format = (
+            f"{diagnostics.input_sample_rate_hz} Hz · "
+            f"{diagnostics.input_channel_count} kanal"
+        )
+    return (
+        StatusCardViewModel(
+            "Mikrofon karesi",
+            str(diagnostics.callback_frame_count),
+        ),
+        StatusCardViewModel("Girdi biçimi", input_format),
+        StatusCardViewModel("Girdi örneği", str(diagnostics.input_sample_count)),
+        StatusCardViewModel(
+            "Dönüşüm öncesi RMS",
+            f"{diagnostics.pre_resample_rms:.6f}",
+        ),
+        StatusCardViewModel(
+            "Dönüşüm öncesi tepe",
+            f"{diagnostics.pre_resample_peak:.6f}",
+        ),
+        StatusCardViewModel(
+            "Dönüşüm sonrası RMS",
+            f"{diagnostics.post_resample_rms:.6f}",
+        ),
+        StatusCardViewModel(
+            "Dönüşüm sonrası tepe",
+            f"{diagnostics.post_resample_peak:.6f}",
+        ),
+        StatusCardViewModel(
+            "Sıfır olmayan örnek",
+            f"%{diagnostics.post_resample_nonzero_ratio * 100:.2f}",
+        ),
+        StatusCardViewModel(
+            "Kırpılan örnek",
+            f"%{diagnostics.post_resample_clipping_ratio * 100:.2f}",
+        ),
+        StatusCardViewModel(
+            "Üretilen PCM",
+            f"{diagnostics.produced_pcm_byte_count} bayt",
+        ),
+        StatusCardViewModel(
+            "ASR segmenti",
+            str(diagnostics.asr_segment_count),
+        ),
+        StatusCardViewModel(
+            "Son ASR penceresi",
+            f"{diagnostics.latest_window_duration_seconds:.2f} sn",
+        ),
+        StatusCardViewModel(
+            "ASR öncesi ret",
+            str(diagnostics.rejected_capture_frame_count),
+        ),
+    )
+
+
+def _local_microphone_audio_diagnostic_message(
+    diagnostics: LocalMicrophoneDiagnostics,
+) -> str | None:
+    if diagnostics.rejected_capture_frame_count:
+        return (
+            "Ses ASR öncesinde güvenli biçimde reddedildi: "
+            f"{diagnostics.latest_audio_rejection_reason.value}"
+        )
+    if diagnostics.rejected_transcript_event_count:
+        return (
+            "Metin olayı ASR sonrasında güvenli biçimde reddedildi: "
+            f"{diagnostics.latest_transcript_rejection_reason.value}"
+        )
+    if diagnostics.callback_frame_count == 0:
+        return "Henüz mikrofon karesi alınmadı."
+    if diagnostics.post_resample_rms <= 0.0001:
+        return "Mikrofon kareleri alındı ancak dönüştürülen ses etkili olarak sessiz."
+    if (
+        diagnostics.asr_empty_result_count
+        and diagnostics.asr_non_empty_result_count == 0
+    ):
+        return "Sessiz olmayan PCM ASR'ye ulaştı ancak model metin üretmedi."
+    if diagnostics.asr_non_empty_result_count:
+        return "Sessiz olmayan PCM ASR tarafından metne dönüştürülüyor."
+    return None
+
+
 def _render_local_microphone_controls(
     *,
     local: LocalExecutionState,
@@ -607,6 +858,45 @@ def _render_local_microphone_controls(
 ) -> tuple[DashboardExecutionResource, LocalMicrophoneIngressSession] | None:
     """Render the retained WebRTC component in the same fragment as polling."""
     try:
+        if st.session_state.get("local_mic_reset_pending", False):
+            retained = _retained_execution_resource(local.runtime)
+            if retained is not None and retained.worker_active:
+                st.info("Sistem sıfırlanıyor")
+                microphone_session = retained.microphone_session
+                return (
+                    (retained, cast(LocalMicrophoneIngressSession, microphone_session))
+                    if microphone_session is not None
+                    else None
+                )
+            if retained is not None:
+                _close_execution_resource()
+            st.session_state.pop("local_signature", None)
+            st.session_state.pop("call_id", None)
+            st.session_state.pop("local_mic_desired_playing", None)
+            st.session_state.pop("local_mic_reset_pending", None)
+            st.session_state.pop(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, None)
+            st.session_state[_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY] = False
+            st.session_state.suggestion_feedback = {}
+            st.rerun()
+            return None
+
+        call_active = st.session_state.get(_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY)
+        if call_active is None:
+            call_active = _retained_execution_resource(local.runtime) is not None
+            st.session_state[_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY] = call_active
+        if call_active is not True:
+            st.info("Yerel mikrofon testi başlatılmayı bekliyor")
+            if st.button(
+                "Mikrofon testini başlat",
+                type="primary",
+                use_container_width=True,
+            ):
+                st.session_state[_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY] = True
+                st.session_state.pop(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, None)
+                st.session_state.pop("local_mic_desired_playing", None)
+                st.rerun(scope="fragment")
+            return None
+
         resource = _local_microphone_resource(local.runtime)
         session = _local_microphone_session(local.runtime, resource)
         if resource.latest_snapshot is None:
@@ -618,17 +908,41 @@ def _render_local_microphone_controls(
                 availability=availability,
             )
         diagnostics = session.diagnostics
+        snapshot = resource.latest_snapshot
+        terminal_snapshot = snapshot is not None and snapshot.lifecycle_status in {
+            DashboardExecutionStatus.COMPLETED,
+            DashboardExecutionStatus.CANCELLED,
+            DashboardExecutionStatus.FAILED,
+        }
+        finish_pending = st.session_state.get(
+            _LOCAL_MIC_FINISH_PENDING_SESSION_KEY,
+            False,
+        )
         if (
-            st.session_state.get("local_mic_reset_pending", False)
-            and not resource.worker_active
+            finish_pending
+            or diagnostics.status
+            in {
+                LocalMicrophoneStatus.STOP_REQUESTED,
+                LocalMicrophoneStatus.COMPLETED,
+            }
+            or terminal_snapshot
         ):
-            _close_execution_resource()
-            st.session_state.pop("local_signature", None)
-            st.session_state.pop("local_mic_desired_playing", None)
-            st.session_state.pop("local_mic_reset_pending", None)
-            st.session_state.suggestion_feedback = {}
-            st.rerun(scope="fragment")
-            return
+            st.session_state.local_mic_desired_playing = False
+            if terminal_snapshot:
+                assert snapshot is not None
+                st.session_state.pop(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, None)
+                if snapshot.lifecycle_status is DashboardExecutionStatus.COMPLETED:
+                    st.success("Görüşme tamamlandı")
+                elif snapshot.lifecycle_status is DashboardExecutionStatus.FAILED:
+                    st.error("Görüşme güvenli biçimde tamamlanamadı")
+                else:
+                    st.warning("Görüşme durduruldu")
+            else:
+                st.info("Görüşme tamamlanıyor")
+            if st.button("Sistemi sıfırla", use_container_width=True):
+                if _request_local_microphone_reset(session, resource):
+                    st.rerun(scope="fragment")
+            return resource, session
         if diagnostics.asr_readiness not in {
             LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
             LocalMicrophoneASRReadiness.STREAMING,
@@ -673,31 +987,97 @@ def _render_local_microphone_controls(
                 )
             _metric_rows(tuple(preparation_cards))
             if st.button(
-                "Mikrofon testini sıfırla",
+                "Sistemi sıfırla",
                 use_container_width=True,
             ):
-                session.close(LocalMicrophoneTerminalReason.RESET)
-                resource.cancel()
-                st.session_state.local_mic_reset_pending = True
-                st.rerun(scope="fragment")
+                if _request_local_microphone_reset(session, resource):
+                    st.rerun(scope="fragment")
             return resource, session
-        context = microphone_webrtc_streamer(
+        resumable_statuses = {
+            LocalMicrophoneStatus.PAUSING,
+            LocalMicrophoneStatus.PAUSED,
+            LocalMicrophoneStatus.PERMISSION_DENIED,
+            LocalMicrophoneStatus.DISCONNECTED,
+            LocalMicrophoneStatus.FAILED,
+        }
+        if diagnostics.status in resumable_statuses:
+            connection = local_microphone_connection_view(session)
+            if diagnostics.status is LocalMicrophoneStatus.FAILED:
+                st.error(connection.status_text)
+            elif diagnostics.status in {
+                LocalMicrophoneStatus.PERMISSION_DENIED,
+                LocalMicrophoneStatus.DISCONNECTED,
+            }:
+                st.warning(connection.status_text)
+            else:
+                st.info(connection.status_text)
+            _metric_rows(
+                (
+                    StatusCardViewModel(
+                        "Alınan ses parçası",
+                        str(connection.received_chunk_count),
+                    ),
+                    StatusCardViewModel(
+                        "İşlenen ses",
+                        f"{connection.processed_audio_seconds:.2f} sn",
+                    ),
+                    StatusCardViewModel(
+                        "Yakalama oturumu",
+                        str(diagnostics.capture_generation),
+                    ),
+                    StatusCardViewModel(
+                        "Metin üreten ASR",
+                        str(diagnostics.asr_non_empty_result_count),
+                    ),
+                    StatusCardViewModel(
+                        "Boş ASR sonucu",
+                        str(diagnostics.asr_empty_result_count),
+                    ),
+                    StatusCardViewModel(
+                        "Reddedilen metin olayı",
+                        str(diagnostics.rejected_transcript_event_count),
+                    ),
+                )
+            )
+            _metric_rows(_local_microphone_audio_diagnostic_cards(diagnostics))
+            audio_message = _local_microphone_audio_diagnostic_message(diagnostics)
+            if audio_message is not None:
+                st.caption(audio_message)
+            if diagnostics.rejected_transcript_event_count:
+                st.caption(
+                    "Son güvenli ret nedeni: "
+                    f"{diagnostics.latest_transcript_rejection_reason.value}"
+                )
+            if st.button(
+                "Mikrofonu yeniden başlat",
+                disabled=diagnostics.status is LocalMicrophoneStatus.PAUSING,
+                use_container_width=True,
+            ):
+                session.resume_capture(
+                    _local_microphone_capability(local.runtime, resource),
+                    resource=resource,
+                )
+                st.session_state.local_mic_desired_playing = True
+                st.rerun(scope="fragment")
+            if st.button("Görüşmeyi bitir", use_container_width=True):
+                if _request_local_microphone_finish(session, resource):
+                    st.rerun(scope="fragment")
+            if st.button("Sistemi sıfırla", use_container_width=True):
+                if _request_local_microphone_reset(session, resource):
+                    st.rerun(scope="fragment")
+            return resource, session
+        desired_playing_state = st.session_state.get("local_mic_desired_playing")
+        if desired_playing_state is None and diagnostics.status in {
+            LocalMicrophoneStatus.READY,
+            LocalMicrophoneStatus.STREAMING,
+            LocalMicrophoneStatus.RECONNECTING,
+        }:
+            desired_playing_state = True
+        microphone_webrtc_streamer(
             session=session,
             key=session.component_key,
-            desired_playing_state=st.session_state.get("local_mic_desired_playing"),
+            desired_playing_state=desired_playing_state,
         )
-        if (
-            st.session_state.get("local_mic_reset_pending", False)
-            and not context.state.playing
-            and not context.state.signalling
-        ):
-            _close_execution_resource()
-            st.session_state.pop("local_signature", None)
-            st.session_state.pop("local_mic_desired_playing", None)
-            st.session_state.pop("local_mic_reset_pending", None)
-            st.session_state.suggestion_feedback = {}
-            st.rerun(scope="fragment")
-            return
         connection = local_microphone_connection_view(session)
         st.info(connection.status_text)
         diagnostic_cards: list[StatusCardViewModel] = [
@@ -710,6 +1090,26 @@ def _render_local_microphone_controls(
                 f"{connection.processed_audio_seconds:.2f} sn",
             ),
             StatusCardViewModel("Bağlantı", connection.status_text),
+            StatusCardViewModel(
+                "Metin üreten ASR",
+                str(diagnostics.asr_non_empty_result_count),
+            ),
+            StatusCardViewModel(
+                "Boş ASR sonucu",
+                str(diagnostics.asr_empty_result_count),
+            ),
+            StatusCardViewModel(
+                "Kısmi metin olayı",
+                str(diagnostics.partial_event_count),
+            ),
+            StatusCardViewModel(
+                "Kalıcı metin kaydı",
+                str(diagnostics.stable_commit_count),
+            ),
+            StatusCardViewModel(
+                "Reddedilen metin olayı",
+                str(diagnostics.rejected_transcript_event_count),
+            ),
         ]
         if connection.estimated_latency_seconds is not None:
             diagnostic_cards.append(
@@ -728,20 +1128,25 @@ def _render_local_microphone_controls(
             if value is not None:
                 diagnostic_cards.append(StatusCardViewModel(label, f"{value:.2f} sn"))
         _metric_rows(tuple(diagnostic_cards))
-        if st.button(
-            "Mikrofonu durdur",
-            disabled=not context.state.playing,
-            use_container_width=True,
-        ):
-            session.request_stop()
+        _metric_rows(_local_microphone_audio_diagnostic_cards(diagnostics))
+        audio_message = _local_microphone_audio_diagnostic_message(diagnostics)
+        if audio_message is not None:
+            st.caption(audio_message)
+        if diagnostics.rejected_transcript_event_count:
+            st.caption(
+                "Son güvenli ret nedeni: "
+                f"{diagnostics.latest_transcript_rejection_reason.value}"
+            )
+        if st.button("Mikrofonu duraklat", use_container_width=True):
+            session.pause_capture(resource=resource)
             st.session_state.local_mic_desired_playing = False
             st.rerun(scope="fragment")
-        if st.button("Mikrofon testini sıfırla", use_container_width=True):
-            session.close(LocalMicrophoneTerminalReason.RESET)
-            resource.cancel()
-            st.session_state.local_mic_desired_playing = False
-            st.session_state.local_mic_reset_pending = True
-            st.rerun(scope="fragment")
+        if st.button("Görüşmeyi bitir", use_container_width=True):
+            if _request_local_microphone_finish(session, resource):
+                st.rerun(scope="fragment")
+        if st.button("Sistemi sıfırla", use_container_width=True):
+            if _request_local_microphone_reset(session, resource):
+                st.rerun(scope="fragment")
         return resource, session
     except Exception:
         local.status = "error"
@@ -763,11 +1168,25 @@ def _local_microphone_presentation_snapshot(
             snapshot,
             execution_stage=DashboardExecutionStage.STOP_REQUESTED,
         )
+    if status is LocalMicrophoneStatus.PAUSING:
+        return replace(
+            snapshot,
+            execution_stage=DashboardExecutionStage.MICROPHONE_PAUSING,
+        )
+    if status is LocalMicrophoneStatus.PAUSED:
+        return replace(
+            snapshot,
+            execution_stage=DashboardExecutionStage.MICROPHONE_PAUSED,
+        )
+    if status is LocalMicrophoneStatus.RECONNECTING:
+        return replace(
+            snapshot,
+            execution_stage=DashboardExecutionStage.MICROPHONE_RECONNECTING,
+        )
     if status is LocalMicrophoneStatus.DISCONNECTED:
         return replace(
             snapshot,
-            lifecycle_status=DashboardExecutionStatus.CANCELLED,
-            execution_stage=DashboardExecutionStage.MICROPHONE_DISCONNECTED,
+            execution_stage=DashboardExecutionStage.MICROPHONE_CAPTURE_FAILED,
         )
     if status is LocalMicrophoneStatus.OVERLOADED:
         return replace(
@@ -778,8 +1197,12 @@ def _local_microphone_presentation_snapshot(
     if status is LocalMicrophoneStatus.FAILED:
         return replace(
             snapshot,
-            lifecycle_status=DashboardExecutionStatus.FAILED,
-            execution_stage=DashboardExecutionStage.FAILED,
+            execution_stage=DashboardExecutionStage.MICROPHONE_CAPTURE_FAILED,
+        )
+    if status is LocalMicrophoneStatus.PERMISSION_DENIED:
+        return replace(
+            snapshot,
+            execution_stage=DashboardExecutionStage.MICROPHONE_CAPTURE_FAILED,
         )
     return snapshot
 
@@ -1455,6 +1878,8 @@ with st.sidebar:
                 _close_execution_resource()
                 st.session_state.pop("local_mic_desired_playing", None)
                 st.session_state.pop("local_mic_reset_pending", None)
+                st.session_state.pop(_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY, None)
+                st.session_state.pop(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, None)
             if source_mode == "Dosya yükle":
                 uploaded = st.file_uploader(
                     "Ses dosyası",

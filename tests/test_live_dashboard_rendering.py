@@ -13,12 +13,22 @@ from typing import Any, cast
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from app.audio_ingress.local_microphone import (
+    LocalMicrophoneAudioRejectionReason,
+    LocalMicrophoneTranscriptRejectionReason,
+)
 from app.events.models import (
     AudioChunkEvent,
     CoachingSuggestionLifecycle,
     SuggestionPriority,
+    TranscriptEvent,
+    TranscriptKind,
 )
-from app.streaming.pipeline import StreamingASRPipeline
+from app.streaming.pipeline import (
+    StreamingASRPipeline,
+    StreamingASRResult,
+    StreamingASRStep,
+)
 from app.streaming.window_transcriber import WindowTranscriptionResult
 from live_dashboard.demo_data import tenant_demos
 from live_dashboard.presentation import ui_scope_identity
@@ -81,6 +91,8 @@ class _RecordingStreamlit:
         self.metrics: list[tuple[str, ...]] = []
         self.markdown_kwargs: list[dict[str, object]] = []
         self.toggle_values: dict[str, bool] = {}
+        self.button_values: dict[str, list[bool]] = {}
+        self.rerun_scopes: list[str | None] = []
         self.sidebar = nullcontext()
 
     def container(self, **_kwargs: object) -> Any:
@@ -152,8 +164,12 @@ class _RecordingStreamlit:
     ) -> bool:
         return self.toggle_values.get(label, value)
 
-    def button(self, *_args: object, **_kwargs: object) -> bool:
-        return False
+    def button(self, label: str, *_args: object, **_kwargs: object) -> bool:
+        configured = self.button_values.get(label, [])
+        return configured.pop(0) if configured else False
+
+    def rerun(self, *, scope: str | None = None) -> None:
+        self.rerun_scopes.append(scope)
 
     def caption(self, value: object, **_kwargs: object) -> None:
         self.captions.append(str(value))
@@ -665,8 +681,439 @@ def test_local_microphone_worker_prepares_model_once_and_survives_reruns(
     )
     assert calls == {"constructed": 1, "loaded": 1, "warmed": 1, "pipeline": 1}
 
+    original_component_key = session.component_key
+    original_snapshot = resource.latest_snapshot
+    assert session.pause_capture(resource=resource)
+    assert session.diagnostics.status is app.LocalMicrophoneStatus.PAUSED
+    assert not capability.active
+    resumed_capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-ready",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    assert session.resume_capture(resumed_capability, resource=resource)
+    assert session.component_key != original_component_key
+    assert resource.latest_snapshot is original_snapshot
+    assert not app._start_local_microphone_worker(**arguments)
+    assert calls == {"constructed": 1, "loaded": 1, "warmed": 1, "pipeline": 1}
+
     resource.cancel()
     resource.join_worker()
+
+
+def test_local_microphone_non_empty_asr_reaches_partial_and_completed_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-mic-text")
+    resource = app.DashboardExecutionResource(
+        app.DashboardExecutionIdentity("tenant_alpha", "call-mic-text"),
+        integration=None,
+    )
+    capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-text",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+    monkeypatch.setattr(
+        session,
+        "acknowledge_processed_chunk",
+        lambda *, resource: None,
+    )
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+    partial = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-text",
+        event_id="synthetic-partial",
+        kind=TranscriptKind.PARTIAL,
+        text="synthetic partial",
+        start_seconds=0.0,
+        end_seconds=2.0,
+        revision=1,
+        created_at_utc=now,
+        source_chunk_sequence=1,
+    )
+    final = TranscriptEvent(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-text",
+        event_id="synthetic-final",
+        kind=TranscriptKind.FINAL,
+        text="synthetic confirmed",
+        start_seconds=0.0,
+        end_seconds=4.0,
+        revision=2,
+        created_at_utc=now,
+        source_chunk_sequence=2,
+    )
+    step = StreamingASRStep(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-text",
+        sequence_number=1,
+        chunk_start_seconds=0.0,
+        chunk_end_seconds=2.0,
+        window_start_seconds=0.0,
+        window_end_seconds=2.0,
+        window_duration_seconds=2.0,
+        raw_window_text="synthetic partial",
+        transcript_events=(partial,),
+        stable_transcript="",
+        partial_transcript=partial.text,
+        transcription_time_seconds=0.1,
+        asr_segment_count=1,
+    )
+
+    class FakeEngine:
+        def load_model(self) -> float:
+            return 0.1
+
+        def warm_up(self) -> float:
+            return 0.1
+
+    class FakePipeline:
+        def configure_provisional_coaching(self, _policy: object) -> None:
+            return None
+
+        def run_live(self, *_args: object, **kwargs: object) -> object:
+            callback = cast(Any, kwargs["step_callback"])
+            callback(step)
+            return StreamingASRResult(
+                tenant_id="tenant_alpha",
+                call_id="call-mic-text",
+                steps=(),
+                final_event=final,
+                stable_transcript=final.text,
+                partial_transcript="",
+                total_chunks=1,
+                audio_duration_seconds=2.0,
+            )
+
+    monkeypatch.setattr(
+        app,
+        "_create_local_microphone_asr_engine",
+        lambda _config: FakeEngine(),
+    )
+    monkeypatch.setattr(
+        app,
+        "build_live_pipeline",
+        lambda *_args, **_kwargs: FakePipeline(),
+    )
+
+    assert app._start_local_microphone_worker(
+        local=state,
+        resource=resource,
+        session=session,
+        selection=DashboardServiceSelection(False, False),
+        availability=ArtifactAvailability(True),
+    )
+    resource.join_worker()
+
+    snapshot = resource.latest_snapshot
+    assert snapshot is not None
+    assert snapshot.revision > 0
+    assert snapshot.lifecycle_status is DashboardExecutionStatus.COMPLETED
+    assert snapshot.transcript.partial_text == ""
+    assert snapshot.transcript.stable_text == "synthetic confirmed"
+    assert snapshot.tabs.result.final_transcript == "synthetic confirmed"
+    diagnostics = session.diagnostics
+    assert diagnostics.asr_non_empty_result_count == 1
+    assert diagnostics.asr_empty_result_count == 0
+    assert diagnostics.asr_segment_count == 1
+    assert diagnostics.latest_window_duration_seconds == 2.0
+    assert diagnostics.partial_event_count == 1
+    assert diagnostics.stable_commit_count == 1
+    assert diagnostics.rejected_transcript_event_count == 0
+
+
+def test_local_microphone_audio_diagnostics_distinguish_safe_pipeline_stages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    resource = object()
+    capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-diagnostics",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    base = session.diagnostics
+
+    assert app._local_microphone_audio_diagnostic_message(base) == (
+        "Henüz mikrofon karesi alınmadı."
+    )
+    silent = replace(base, callback_frame_count=1, post_resample_rms=0.0)
+    assert "etkili olarak sessiz" in app._local_microphone_audio_diagnostic_message(
+        silent
+    )
+    asr_empty = replace(
+        silent,
+        post_resample_rms=0.25,
+        asr_empty_result_count=1,
+    )
+    assert "model metin üretmedi" in app._local_microphone_audio_diagnostic_message(
+        asr_empty
+    )
+    ingress_rejected = replace(
+        asr_empty,
+        rejected_capture_frame_count=1,
+        latest_audio_rejection_reason=(
+            LocalMicrophoneAudioRejectionReason.STALE_CAPTURE_GENERATION
+        ),
+    )
+    assert app._local_microphone_audio_diagnostic_message(ingress_rejected).endswith(
+        "STALE_CAPTURE_GENERATION"
+    )
+    transcript_rejected = replace(
+        asr_empty,
+        rejected_transcript_event_count=1,
+        latest_transcript_rejection_reason=(
+            LocalMicrophoneTranscriptRejectionReason.REVISION_REGRESSION
+        ),
+    )
+    assert app._local_microphone_audio_diagnostic_message(transcript_rejected).endswith(
+        "REVISION_REGRESSION"
+    )
+
+    cards = app._local_microphone_audio_diagnostic_cards(
+        replace(
+            asr_empty,
+            input_sample_rate_hz=48_000,
+            input_channel_count=2,
+            input_sample_count=9_600,
+            produced_pcm_byte_count=3_200,
+            asr_segment_count=0,
+            latest_window_duration_seconds=2.0,
+        )
+    )
+    values = {card.label: card.value for card in cards}
+    assert values["Girdi biçimi"] == "48000 Hz · 2 kanal"
+    assert values["Üretilen PCM"] == "3200 bayt"
+    assert values["Son ASR penceresi"] == "2.00 sn"
+
+
+def test_local_microphone_finish_is_edge_triggered_and_emits_end_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    resource = app.DashboardExecutionResource(
+        app.DashboardExecutionIdentity("tenant_alpha", "call-mic-finish"),
+        integration=None,
+    )
+    capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-finish",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    session.set_asr_readiness(
+        app.LocalMicrophoneASRReadiness.WARMING_UP,
+        resource=resource,
+    )
+    session.set_asr_readiness(
+        app.LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+        resource=resource,
+    )
+    session.start()
+
+    assert app._request_local_microphone_finish(session, resource)
+    assert not app._request_local_microphone_finish(session, resource)
+
+    assert recorder.session_state["local_mic_finish_pending"] is True
+    assert recorder.session_state["local_mic_desired_playing"] is False
+    assert session.diagnostics.status is app.LocalMicrophoneStatus.COMPLETED
+    assert session.diagnostics.end_emitted
+    assert not capability.active
+
+
+def test_completed_microphone_call_renders_terminal_state_without_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-mic-done")
+    resource = app.DashboardExecutionResource(
+        app.DashboardExecutionIdentity("tenant_alpha", "call-mic-done"),
+        integration=None,
+    )
+    capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-done",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+    initial = execution_snapshot(
+        state,
+        revision=0,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+    )
+    completed = execution_snapshot(
+        state,
+        revision=1,
+        lifecycle_status=DashboardExecutionStatus.COMPLETED,
+        execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+    )
+    assert resource.start_worker(initial, lambda _cancel, _publish: completed)
+    resource.join_worker()
+    session.close(app.LocalMicrophoneTerminalReason.COMPLETED)
+    recorder.session_state["local_mic_call_active"] = True
+    recorder.session_state["local_mic_finish_pending"] = True
+    starts: list[object] = []
+    streamers: list[object] = []
+    monkeypatch.setattr(app, "_local_microphone_resource", lambda _runtime: resource)
+    monkeypatch.setattr(
+        app,
+        "_local_microphone_session",
+        lambda _runtime, _resource: session,
+    )
+    monkeypatch.setattr(
+        app,
+        "_start_local_microphone_worker",
+        lambda **kwargs: starts.append(kwargs),
+    )
+    monkeypatch.setattr(
+        app,
+        "microphone_webrtc_streamer",
+        lambda **kwargs: streamers.append(kwargs),
+    )
+
+    retained = app._render_local_microphone_controls(
+        local=state,
+        selection=DashboardServiceSelection(False, False),
+        availability=ArtifactAvailability(True),
+    )
+
+    assert retained == (resource, session)
+    assert recorder.successes == ["Görüşme tamamlandı"]
+    assert starts == []
+    assert streamers == []
+    assert "local_mic_finish_pending" not in recorder.session_state
+    assert resource.latest_snapshot is completed
+
+
+def test_microphone_reset_cleanup_is_edge_triggered_and_returns_to_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-mic-reset")
+    resource = app.DashboardExecutionResource(
+        app.DashboardExecutionIdentity("tenant_alpha", "call-mic-reset"),
+        integration=None,
+    )
+    capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-mic-reset",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+    recorder.session_state["local_mic_call_active"] = True
+    recorder.session_state["local_signature"] = ("tenant_alpha", "call-mic-reset")
+    recorder.session_state["call_id"] = "call-mic-reset"
+    recorder.session_state["suggestion_feedback"] = {"synthetic": "Görüldü"}
+
+    assert app._request_local_microphone_reset(session, resource)
+    assert not app._request_local_microphone_reset(session, resource)
+
+    closes: list[bool] = []
+    monkeypatch.setattr(
+        app,
+        "_retained_execution_resource",
+        lambda _runtime: resource,
+    )
+    monkeypatch.setattr(
+        app,
+        "_close_execution_resource",
+        lambda: closes.append(True),
+    )
+    monkeypatch.setattr(
+        app,
+        "_local_microphone_resource",
+        lambda _runtime: pytest.fail("reset must not recreate a resource"),
+    )
+
+    assert (
+        app._render_local_microphone_controls(
+            local=state,
+            selection=DashboardServiceSelection(False, False),
+            availability=ArtifactAvailability(True),
+        )
+        is None
+    )
+
+    assert closes == [True]
+    assert recorder.rerun_scopes == [None]
+    assert recorder.session_state["local_mic_call_active"] is False
+    assert "local_signature" not in recorder.session_state
+    assert "call_id" not in recorder.session_state
+    assert "local_mic_reset_pending" not in recorder.session_state
+    assert recorder.session_state["suggestion_feedback"] == {}
+    assert session.diagnostics.end_emitted
+    assert not capability.active
+
+
+def test_microphone_start_action_is_retained_before_fragment_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    recorder.button_values["Mikrofon testini başlat"] = [True]
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-mic-start")
+    monkeypatch.setattr(
+        app,
+        "_retained_execution_resource",
+        lambda _runtime: None,
+    )
+    monkeypatch.setattr(
+        app,
+        "_local_microphone_resource",
+        lambda _runtime: pytest.fail("start edge must rerun before resource creation"),
+    )
+
+    assert (
+        app._render_local_microphone_controls(
+            local=state,
+            selection=DashboardServiceSelection(False, False),
+            availability=ArtifactAvailability(True),
+        )
+        is None
+    )
+
+    assert recorder.session_state["local_mic_call_active"] is True
+    assert recorder.rerun_scopes == ["fragment"]
 
 
 def test_local_microphone_model_preparation_failure_is_visible_and_revokes_once(
@@ -854,7 +1301,7 @@ def test_local_microphone_status_uses_live_indeterminate_progress(
     assert not any("%" in value for _label, value in recorder.metrics)
 
 
-def test_local_microphone_disconnect_replaces_ready_presentation(
+def test_local_microphone_transient_disconnect_preserves_running_presentation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recorder = _RecordingStreamlit()
@@ -869,22 +1316,59 @@ def test_local_microphone_disconnect_replaces_ready_presentation(
     )
     snapshot = app._local_microphone_presentation_snapshot(
         snapshot,
-        app.LocalMicrophoneStatus.DISCONNECTED,
+        app.LocalMicrophoneStatus.RECONNECTING,
     )
     recorder.infos.clear()
     recorder.warnings.clear()
 
     app._render_execution_status(snapshot)
 
-    disconnected = (
-        "Mikrofon ba\u011flant\u0131s\u0131 kesildi \u00b7 "
+    reconnecting = (
+        "Mikrofon ba\u011flant\u0131s\u0131 yeniden kuruluyor \u00b7 "
         "Tek konu\u015fmac\u0131l\u0131 mikrofon testi"
     )
-    assert recorder.warnings == [disconnected]
+    assert recorder.infos == [reconnecting]
+    assert recorder.warnings == []
+    assert snapshot.lifecycle_status is DashboardExecutionStatus.RUNNING
     rendered = " ".join(
         [*recorder.infos, *recorder.warnings, *recorder.errors, *recorder.successes]
     )
     assert "Mikrofon haz\u0131r" not in rendered
+
+
+def test_local_microphone_pause_preserves_transcript_and_coaching_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-microphone")
+    running = execution_snapshot(
+        state,
+        revision=7,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        execution_mode=DashboardExecutionMode.LOCAL_MIC_TEST,
+        execution_stage=DashboardExecutionStage.TRANSCRIPT_UPDATING,
+    )
+    running = replace(
+        running,
+        transcript=replace(
+            running.transcript,
+            stable_text="synthetic retained transcript",
+        ),
+        active_coaching=(_history_card(),),
+    )
+
+    paused = app._local_microphone_presentation_snapshot(
+        running,
+        app.LocalMicrophoneStatus.PAUSED,
+    )
+
+    assert paused.lifecycle_status is DashboardExecutionStatus.RUNNING
+    assert paused.execution_stage is DashboardExecutionStage.MICROPHONE_PAUSED
+    assert paused.revision == 7
+    assert paused.transcript == running.transcript
+    assert paused.active_coaching == running.active_coaching
+    assert paused.tabs == running.tabs
 
 
 def test_execution_status_progress_updates_across_snapshots(

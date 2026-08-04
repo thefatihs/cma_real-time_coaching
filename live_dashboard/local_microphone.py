@@ -27,6 +27,11 @@ LOCAL_MIC_STATUS_TEXT = {
     LocalMicrophoneStatus.PERMISSION_PENDING: "Mikrofon izni bekleniyor",
     LocalMicrophoneStatus.READY: "Mikrofon hazır",
     LocalMicrophoneStatus.STREAMING: "Canlı ses alınıyor",
+    LocalMicrophoneStatus.PAUSING: "Mikrofon duraklatılıyor",
+    LocalMicrophoneStatus.PAUSED: (
+        "Mikrofon duraklatıldı. Görüşme verileri korunuyor."
+    ),
+    LocalMicrophoneStatus.RECONNECTING: "Mikrofon bağlantısı yeniden kuruluyor",
     LocalMicrophoneStatus.STOP_REQUESTED: "Mikrofon durduruluyor",
     LocalMicrophoneStatus.COMPLETED: "Mikrofon durduruldu",
     LocalMicrophoneStatus.PERMISSION_DENIED: "Mikrofon erişimi reddedildi",
@@ -50,17 +55,18 @@ class LocalMicrophoneFrameCallback:
 
     def __init__(self, session: LocalMicrophoneIngressSession) -> None:
         self._session = session
+        self._capture_generation = session.diagnostics.capture_generation
 
     def __call__(self, frame: av.AudioFrame) -> av.AudioFrame:
-        return self._session.accept_frame(frame)
+        return self._session.accept_frame(
+            frame,
+            capture_generation=self._capture_generation,
+        )
 
     def on_audio_ended(self) -> None:
-        status = self._session.diagnostics.status
-        if status not in {
-            LocalMicrophoneStatus.STOP_REQUESTED,
-            LocalMicrophoneStatus.COMPLETED,
-        }:
-            self._session.disconnect()
+        self._session.mark_reconnecting(
+            capture_generation=self._capture_generation,
+        )
 
 
 def local_microphone_connection_view(

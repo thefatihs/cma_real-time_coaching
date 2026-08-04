@@ -1,12 +1,18 @@
+from collections.abc import Iterator
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, get_ident
 
+import av
 import pytest
 
 from app.audio_ingress.local_microphone import (
+    LOCAL_MIC_CHUNK_BYTES,
     LOCAL_MIC_GATE_ENVIRONMENT_KEY,
+    LocalMicrophoneASRReadiness,
+    LocalMicrophoneIngressSession,
+    _NormalizedAudio,
     create_local_mic_test_capability,
 )
 from app.classification.streaming import (
@@ -54,6 +60,7 @@ from app.streaming.pipeline import (
     CoachingProcessorProtocol,
     StreamingASRPipeline,
     StreamingASRPlan,
+    StreamingASRStep,
 )
 from app.streaming.window_transcriber import (
     WindowTranscriptionResult,
@@ -1621,6 +1628,102 @@ def test_live_microphone_publishes_provisional_coaching_before_end() -> None:
 
     assert result.total_chunks == 1
     assert result.final_event is not None
+
+
+def test_live_microphone_pause_resume_keeps_one_pipeline_and_monotonic_transcript() -> (
+    None
+):
+    class OneChunkNormalizer:
+        def normalize(self, frame: av.AudioFrame) -> tuple[_NormalizedAudio, ...]:
+            del frame
+            return (_NormalizedAudio(b"\0" * LOCAL_MIC_CHUNK_BYTES, None),)
+
+        def flush(self) -> tuple[_NormalizedAudio, ...]:
+            return ()
+
+    subject = pipeline(
+        [],
+        FakeTranscriber(
+            [
+                [("synthetic first", 0.0, 2.0)],
+                [
+                    ("synthetic first", 0.0, 2.0),
+                    ("synthetic second", 2.0, 4.0),
+                ],
+            ]
+        ),
+    )
+    resource = object()
+    initial_capability = create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={LOCAL_MIC_GATE_ENVIRONMENT_KEY: "1"},
+    )
+    session = LocalMicrophoneIngressSession(
+        capability=initial_capability,
+        resource=resource,
+        normalizer=OneChunkNormalizer(),
+    )
+    session.set_asr_readiness(
+        LocalMicrophoneASRReadiness.WARMING_UP,
+        resource=resource,
+    )
+    session.set_asr_readiness(
+        LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+        resource=resource,
+    )
+    cancellation = Event()
+    published: list[StreamingASRStep] = []
+
+    def live_chunks() -> Iterator[AudioChunkEvent]:
+        chunks = iter(session.iter_audio_chunks(cancellation=cancellation))
+        session.accept_frame(av.AudioFrame(), arrived_at_utc=NOW)
+        yield next(chunks)
+        assert session.pause_capture(resource=resource, arrived_at_utc=NOW)
+        assert not initial_capability.active
+        resumed_capability = create_local_mic_test_capability(
+            tenant_id="tenant_alpha",
+            call_id="call_001",
+            resource=resource,
+            server_address="127.0.0.1",
+            environment={LOCAL_MIC_GATE_ENVIRONMENT_KEY: "1"},
+        )
+        assert session.resume_capture(
+            resumed_capability,
+            resource=resource,
+            normalizer=OneChunkNormalizer(),
+        )
+        session.accept_frame(av.AudioFrame(), arrived_at_utc=NOW)
+        yield next(chunks)
+        assert session.finish_call(resource=resource, arrived_at_utc=NOW)
+        assert tuple(chunks) == ()
+
+    def publish(step: StreamingASRStep) -> None:
+        session.acknowledge_processed_chunk(resource=resource)
+        published.append(step)
+
+    result = subject.run_live(
+        live_chunks(),
+        "call_001",
+        capability=initial_capability,
+        execution_resource=resource,
+        cancellation=cancellation,
+        step_callback=publish,
+    )
+
+    assert [step.sequence_number for step in published] == [1, 2]
+    assert [step.asr_segment_count for step in published] == [1, 2]
+    revisions = [
+        event.revision for step in published for event in step.transcript_events
+    ]
+    assert revisions == sorted(revisions)
+    assert len(set(revisions)) == len(revisions)
+    assert result.total_chunks == 2
+    assert result.audio_duration_seconds == pytest.approx(4.0)
+    assert result.stable_transcript
+    assert session.diagnostics.end_emitted
 
 
 def test_live_microphone_capability_mismatch_and_revocation_fail_closed() -> None:

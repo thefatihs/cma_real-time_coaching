@@ -221,3 +221,43 @@ This log uses local chronological numbering and records only Fatih-owned work.
   formatting and Pyright passed.
 - Next planned step: run manual localhost microphone acceptance with the
   explicit local gate before committing.
+
+## F-023 — Persistent Local Microphone Capture
+
+- Separated the retained call/ASR worker lifecycle from each ephemeral browser
+  capture, adding manual PAUSING/PAUSED resume and transient RECONNECTING
+  behavior without emitting call END or clearing transcript/coaching state.
+- Manual pause flushes bounded audio once, drains accepted chunks, revokes the
+  old exact-scope capability, and resume issues a fresh capability/component
+  generation while preserving call scope, revisions, metrics, and the warmed
+  ASR pipeline.
+- Applied the final live pipeline result to the retained dashboard state so
+  reconciler FINAL transcript/classification/coaching outcomes are not lost;
+  added bounded content-free ASR/event acceptance diagnostics.
+- Made microphone Start, call Finish, and system Reset edge-triggered. Finish
+  retains the completed report without recreating WebRTC; Reset removes the
+  resource and performs a full rerun into a clean idle state.
+- Changed files: Fatih-owned local audio ingress and dashboard presentation,
+  focused microphone/dashboard/streaming tests, and this progress file.
+- Tests: focused microphone/dashboard/streaming/ASR 231 passed; PyAV/media 78
+  passed; full Windows suite 2477 passed, 17 skipped, with only the 19
+  documented Ubuntu/POSIX vLLM controller tests failing. Ruff and formatting
+  passed; Pyright remains limited to the three documented Ubuntu-only
+  `os.getuid`/`os.O_NOFOLLOW` Windows findings.
+- Next planned step: manually verify live transcript finalization and
+  edge-triggered finish/reset behavior on localhost.
+- Empty-ASR follow-up confirmed that PyAV normalization is unchanged from
+  `102a6da3` and preserves synthetic packed/planar float and signed amplitude
+  through mono 16 kHz PCM16 and the in-memory Whisper adapter.
+- Bound each WebRTC callback to its capture generation so callbacks retained
+  from a revoked capture cannot feed a resumed capability. Added bounded,
+  content-free pre/post-resample energy, PCM, ASR-window/segment, and fixed
+  rejection diagnostics with distinct dashboard states.
+- Tests: focused microphone/audio/streaming/dashboard 240 passed; media 124
+  passed; full Windows suite 2488 passed, 17 skipped, with only the 19
+  documented Ubuntu/POSIX vLLM controller failures. Ruff, formatting, lock,
+  dependency consistency, conflict and diff checks passed; Pyright remains
+  limited to the three documented Ubuntu-only portability findings.
+- Next planned step: rerun the localhost microphone acceptance test and use the
+  new aggregate energy fields to distinguish silent capture from an empty ASR
+  model result without exposing audio or transcript content.

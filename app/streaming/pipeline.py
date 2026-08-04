@@ -55,6 +55,7 @@ class StreamingASRStep:
     coaching_outcomes: tuple[StableCoachingOutcome, ...] = ()
     customer_routing_outcomes: tuple[CustomerRoutingOutcome, ...] = ()
     audio_preparation_time_seconds: float = 0.0
+    asr_segment_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +313,7 @@ class StreamingASRPipeline:
                 audio_preparation_time_seconds=(
                     transcription.audio_preparation_time_seconds
                 ),
+                asr_segment_count=len(transcription.segments),
             )
             if retain_history:
                 steps.append(step)
