@@ -66,6 +66,22 @@ class LocalMicrophoneASRReadiness(str, Enum):
     FAILED = "FAILED"
 
 
+class LocalMicrophoneASRProfileName(str, Enum):
+    CPU_TINY = "cpu-tiny"
+    GPU_LARGE_V3 = "gpu-large-v3"
+
+
+class LocalMicrophoneASRFailureReason(str, Enum):
+    NONE = "NONE"
+    INVALID_PROFILE = "INVALID_PROFILE"
+    CUDA_CHECK_FAILED = "CUDA_CHECK_FAILED"
+    CUDA_UNAVAILABLE = "CUDA_UNAVAILABLE"
+    FLOAT16_UNSUPPORTED = "FLOAT16_UNSUPPORTED"
+    MODEL_LOAD_FAILED = "MODEL_LOAD_FAILED"
+    WARMUP_FAILED = "WARMUP_FAILED"
+    PIPELINE_FAILED = "PIPELINE_FAILED"
+
+
 class LocalMicrophoneTerminalReason(str, Enum):
     COMPLETED = "COMPLETED"
     PERMISSION_DENIED = "PERMISSION_DENIED"
@@ -108,10 +124,25 @@ class LocalMicrophoneASRTimings:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalMicrophoneASRRuntime:
+    profile_name: LocalMicrophoneASRProfileName
+    model_name: str
+    device: str
+    compute_type: str
+    language: str
+    beam_size: int
+    cuda_available: bool | None
+    fallback_occurred: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class LocalMicrophoneDiagnostics:
     status: LocalMicrophoneStatus
     asr_readiness: LocalMicrophoneASRReadiness
     asr_timings: LocalMicrophoneASRTimings
+    asr_runtime: LocalMicrophoneASRRuntime | None
+    asr_failure_reason: LocalMicrophoneASRFailureReason
+    latest_real_time_factor: float | None
     received_chunk_count: int
     processed_audio_seconds: float
     queue_depth: int
@@ -375,6 +406,8 @@ class LocalMicrophoneIngressSession:
         self._status = LocalMicrophoneStatus.PERMISSION_PENDING
         self._asr_readiness = LocalMicrophoneASRReadiness.PREPARING_MODEL
         self._asr_timings = LocalMicrophoneASRTimings()
+        self._asr_runtime: LocalMicrophoneASRRuntime | None = None
+        self._asr_failure_reason = LocalMicrophoneASRFailureReason.NONE
         self._received_chunk_count = 0
         self._processed_audio_seconds = 0.0
         self._estimated_latency_seconds: float | None = None
@@ -398,6 +431,12 @@ class LocalMicrophoneIngressSession:
                 status=self._status,
                 asr_readiness=self._asr_readiness,
                 asr_timings=self._asr_timings,
+                asr_runtime=self._asr_runtime,
+                asr_failure_reason=self._asr_failure_reason,
+                latest_real_time_factor=_real_time_factor(
+                    self._asr_timings.latest_inference_seconds,
+                    self._latest_window_duration_seconds,
+                ),
                 received_chunk_count=self._received_chunk_count,
                 processed_audio_seconds=self._processed_audio_seconds,
                 queue_depth=self._boundary.retained_audio_chunk_count,
@@ -556,6 +595,53 @@ class LocalMicrophoneIngressSession:
                 latest_inference_seconds=current.latest_inference_seconds,
                 inference_count=current.inference_count,
             )
+
+    def record_asr_runtime(
+        self,
+        runtime: LocalMicrophoneASRRuntime,
+        *,
+        resource: object,
+    ) -> None:
+        if not isinstance(runtime, LocalMicrophoneASRRuntime):
+            raise ValueError("invalid_local_microphone_asr_runtime")
+        if (
+            not runtime.model_name
+            or len(runtime.model_name) > 64
+            or runtime.device not in {"cpu", "cuda"}
+            or runtime.compute_type not in {"int8", "float16"}
+            or not runtime.language
+            or len(runtime.language) > 16
+            or type(runtime.beam_size) is not int
+            or runtime.beam_size <= 0
+            or runtime.beam_size > 16
+            or (
+                runtime.cuda_available is not None
+                and type(runtime.cuda_available) is not bool
+            )
+            or type(runtime.fallback_occurred) is not bool
+        ):
+            raise ValueError("invalid_local_microphone_asr_runtime")
+        with self._condition:
+            self._require_resource(resource)
+            if self._asr_runtime is not None and self._asr_runtime != runtime:
+                raise RuntimeError("local_microphone_asr_runtime_already_recorded")
+            self._asr_runtime = runtime
+
+    def record_asr_failure(
+        self,
+        reason: LocalMicrophoneASRFailureReason,
+        *,
+        resource: object,
+    ) -> None:
+        if (
+            not isinstance(reason, LocalMicrophoneASRFailureReason)
+            or reason is LocalMicrophoneASRFailureReason.NONE
+        ):
+            raise ValueError("invalid_local_microphone_asr_failure_reason")
+        with self._condition:
+            self._require_resource(resource)
+            if self._asr_failure_reason is LocalMicrophoneASRFailureReason.NONE:
+                self._asr_failure_reason = reason
 
     def record_asr_inference(
         self,
@@ -1399,6 +1485,15 @@ def _rms(square_sum: float, sample_count: int) -> float:
 
 def _ratio(count: int, sample_count: int) -> float:
     return count / sample_count if sample_count else 0.0
+
+
+def _real_time_factor(
+    inference_seconds: float | None,
+    window_duration_seconds: float,
+) -> float | None:
+    if inference_seconds is None or window_duration_seconds <= 0:
+        return None
+    return inference_seconds / window_duration_seconds
 
 
 def _bounded_counter_increment(current: int, increment: int = 1) -> int:

@@ -118,6 +118,14 @@ class FasterWhisperEngine:
         self._get_model()
         return max(clock() - loading_started, 0.0)
 
+    def release_model(self) -> bool:
+        """Release the retained inference model exactly once."""
+        with self._model_lock:
+            if self._model is None:
+                return False
+            self._model = None
+            return True
+
     def warm_up(
         self,
         *,

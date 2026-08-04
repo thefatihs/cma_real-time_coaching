@@ -1,8 +1,9 @@
 """Professional synthetic and opt-in local-file coaching dashboard."""
 
+import os
 import sys
-from collections.abc import Callable, Iterable
-from dataclasses import replace
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 from time import perf_counter
@@ -18,7 +19,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.asr.faster_whisper_engine import FasterWhisperEngine  # noqa: E402
 from app.audio_ingress.local_microphone import (  # noqa: E402
     LocalMicTestCapability,
+    LocalMicrophoneASRFailureReason,
+    LocalMicrophoneASRProfileName,
     LocalMicrophoneASRReadiness,
+    LocalMicrophoneASRRuntime,
     LocalMicrophoneDiagnostics,
     LocalMicrophoneIngressSession,
     LocalMicrophoneStatus,
@@ -128,10 +132,8 @@ _RAG_RUNTIME_STATUS_SESSION_KEY = "dashboard_rag_runtime_status"
 _RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
 _LOCAL_MIC_CALL_ACTIVE_SESSION_KEY = "local_mic_call_active"
 _LOCAL_MIC_FINISH_PENDING_SESSION_KEY = "local_mic_finish_pending"
-_LOCAL_MIC_ASR_MODEL_NAME = "tiny"
-_LOCAL_MIC_ASR_COMPUTE_TYPE = "int8"
+_LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY = "CALLMETRIC_LOCAL_MIC_ASR_PROFILE"
 _LOCAL_MIC_ASR_CPU_THREADS = 4
-_LOCAL_MIC_ASR_BEAM_SIZE = 1
 _LOCAL_MIC_ASR_ROLLING_WINDOW_SECONDS = 6.0
 _LOCAL_MIC_ASR_STABLE_REGION_SECONDS = 2.0
 _EXECUTION_STAGE_TEXT = {
@@ -178,6 +180,50 @@ _EXECUTION_MODE_TEXT = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _LocalMicrophoneASRProfile:
+    name: LocalMicrophoneASRProfileName
+    model_name: str
+    device: str
+    compute_type: str
+    language: str
+    beam_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LocalMicrophoneCUDAReadiness:
+    available: bool
+    supported_compute_types: frozenset[str]
+
+
+_LOCAL_MIC_ASR_FAILURE_TEXT = {
+    LocalMicrophoneASRFailureReason.NONE: "",
+    LocalMicrophoneASRFailureReason.INVALID_PROFILE: (
+        "Geçersiz mikrofon ASR profili. cpu-tiny veya gpu-large-v3 seçin."
+    ),
+    LocalMicrophoneASRFailureReason.CUDA_CHECK_FAILED: (
+        "CUDA hazırlığı doğrulanamadı. NVIDIA sürücüsünü ve CUDA çalışma "
+        "zamanını kontrol edin."
+    ),
+    LocalMicrophoneASRFailureReason.CUDA_UNAVAILABLE: (
+        "CUDA görünür değil. gpu-large-v3 için CUDA erişimli bir GPU gereklidir."
+    ),
+    LocalMicrophoneASRFailureReason.FLOAT16_UNSUPPORTED: (
+        "GPU float16 hesaplamayı desteklemiyor; gpu-large-v3 başlatılamadı."
+    ),
+    LocalMicrophoneASRFailureReason.MODEL_LOAD_FAILED: (
+        "large-v3 modeli yüklenemedi. Model önbelleğini, GPU belleğini ve CUDA "
+        "kurulumunu kontrol edin."
+    ),
+    LocalMicrophoneASRFailureReason.WARMUP_FAILED: (
+        "ASR modeli ısınma çıkarımını tamamlayamadı; mikrofon etkinleştirilmedi."
+    ),
+    LocalMicrophoneASRFailureReason.PIPELINE_FAILED: (
+        "Canlı ASR hattı güvenli biçimde çalıştırılamadı."
+    ),
+}
+
+
 @st.cache_resource(show_spinner="ASR modeli yükleniyor…")
 def _load_asr_model(
     model_name: str,
@@ -199,13 +245,66 @@ def _load_asr_model(
     )
 
 
-def _local_microphone_asr_config(runtime: DashboardRuntime) -> TenantASRConfig:
-    """Return an explicit local-only CPU preset without mutating tenant config."""
+def _local_microphone_asr_profile(
+    runtime: DashboardRuntime,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> _LocalMicrophoneASRProfile:
+    source = os.environ if environment is None else environment
+    raw_name = source.get(
+        _LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY,
+        LocalMicrophoneASRProfileName.CPU_TINY.value,
+    )
+    try:
+        profile_name = LocalMicrophoneASRProfileName(raw_name)
+    except ValueError:
+        raise ValueError("invalid_local_microphone_asr_profile") from None
+    if profile_name is LocalMicrophoneASRProfileName.GPU_LARGE_V3:
+        return _LocalMicrophoneASRProfile(
+            name=profile_name,
+            model_name="large-v3",
+            device="cuda",
+            compute_type="float16",
+            language="tr",
+            beam_size=5,
+        )
+    return _LocalMicrophoneASRProfile(
+        name=profile_name,
+        model_name="tiny",
+        device="cpu",
+        compute_type="int8",
+        language=runtime.tenant.config.asr.language,
+        beam_size=1,
+    )
+
+
+def _inspect_local_microphone_cuda() -> _LocalMicrophoneCUDAReadiness:
+    import ctranslate2
+
+    device_count = ctranslate2.get_cuda_device_count()
+    supported = (
+        frozenset(ctranslate2.get_supported_compute_types("cuda", 0))
+        if device_count > 0
+        else frozenset()
+    )
+    return _LocalMicrophoneCUDAReadiness(
+        available=device_count > 0,
+        supported_compute_types=supported,
+    )
+
+
+def _local_microphone_asr_config(
+    runtime: DashboardRuntime,
+    profile: _LocalMicrophoneASRProfile | None = None,
+) -> TenantASRConfig:
+    """Return an explicit local-only preset without mutating tenant config."""
+    selected = profile or _local_microphone_asr_profile(runtime)
     source = runtime.tenant.config.asr.model_dump()
     source.update(
         {
-            "model_name": _LOCAL_MIC_ASR_MODEL_NAME,
-            "beam_size": _LOCAL_MIC_ASR_BEAM_SIZE,
+            "model_name": selected.model_name,
+            "language": selected.language,
+            "beam_size": selected.beam_size,
             "vad_filter": False,
             "rolling_window_seconds": _LOCAL_MIC_ASR_ROLLING_WINDOW_SECONDS,
             "chunk_duration_seconds": 2.0,
@@ -217,11 +316,12 @@ def _local_microphone_asr_config(runtime: DashboardRuntime) -> TenantASRConfig:
 
 def _create_local_microphone_asr_engine(
     config: TenantASRConfig,
+    profile: _LocalMicrophoneASRProfile,
 ) -> FasterWhisperEngine:
     return FasterWhisperEngine(
         config.model_name,
-        device="cpu",
-        compute_type=_LOCAL_MIC_ASR_COMPUTE_TYPE,
+        device=profile.device,
+        compute_type=profile.compute_type,
         language=config.language,
         beam_size=config.beam_size,
         cpu_threads=_LOCAL_MIC_ASR_CPU_THREADS,
@@ -229,6 +329,12 @@ def _create_local_microphone_asr_engine(
         condition_on_previous_text=config.condition_on_previous_text,
         initial_prompt=config.initial_prompt,
     )
+
+
+def _release_local_microphone_asr_engine(engine: object | None) -> None:
+    release = None if engine is None else getattr(engine, "release_model", None)
+    if callable(release):
+        release()
 
 
 @st.cache_resource(show_spinner=False)
@@ -472,10 +578,43 @@ def _start_local_microphone_worker(
     ) -> DashboardExecutionSnapshot:
         revision = 0
         started_at = perf_counter()
+        engine: FasterWhisperEngine | None = None
+        failure_reason = LocalMicrophoneASRFailureReason.INVALID_PROFILE
         try:
-            asr_config = _local_microphone_asr_config(local.runtime)
+            profile = _local_microphone_asr_profile(local.runtime)
+            cuda_readiness: _LocalMicrophoneCUDAReadiness | None = None
+            if profile.name is LocalMicrophoneASRProfileName.GPU_LARGE_V3:
+                failure_reason = LocalMicrophoneASRFailureReason.CUDA_CHECK_FAILED
+                try:
+                    cuda_readiness = _inspect_local_microphone_cuda()
+                except Exception:
+                    raise
+            session.record_asr_runtime(
+                LocalMicrophoneASRRuntime(
+                    profile_name=profile.name,
+                    model_name=profile.model_name,
+                    device=profile.device,
+                    compute_type=profile.compute_type,
+                    language=profile.language,
+                    beam_size=profile.beam_size,
+                    cuda_available=(
+                        None if cuda_readiness is None else cuda_readiness.available
+                    ),
+                    fallback_occurred=False,
+                ),
+                resource=resource,
+            )
+            if profile.name is LocalMicrophoneASRProfileName.GPU_LARGE_V3:
+                if cuda_readiness is None or not cuda_readiness.available:
+                    failure_reason = LocalMicrophoneASRFailureReason.CUDA_UNAVAILABLE
+                    raise RuntimeError("local_microphone_cuda_unavailable")
+                if profile.compute_type not in cuda_readiness.supported_compute_types:
+                    failure_reason = LocalMicrophoneASRFailureReason.FLOAT16_UNSUPPORTED
+                    raise RuntimeError("local_microphone_float16_unsupported")
+            asr_config = _local_microphone_asr_config(local.runtime, profile)
+            failure_reason = LocalMicrophoneASRFailureReason.MODEL_LOAD_FAILED
             construction_started = perf_counter()
-            engine = _create_local_microphone_asr_engine(asr_config)
+            engine = _create_local_microphone_asr_engine(asr_config, profile)
             session.record_asr_preparation(
                 resource=resource,
                 engine_construction_seconds=max(
@@ -488,6 +627,7 @@ def _start_local_microphone_worker(
                 resource=resource,
                 model_loading_seconds=model_loading_seconds,
             )
+            failure_reason = LocalMicrophoneASRFailureReason.WARMUP_FAILED
             session.set_asr_readiness(
                 LocalMicrophoneASRReadiness.WARMING_UP,
                 resource=resource,
@@ -508,6 +648,7 @@ def _start_local_microphone_worker(
                 resource=resource,
                 warmup_seconds=warmup_seconds,
             )
+            failure_reason = LocalMicrophoneASRFailureReason.PIPELINE_FAILED
             pipeline = build_live_pipeline(
                 local.runtime,
                 WindowTranscriber(engine),
@@ -691,6 +832,10 @@ def _start_local_microphone_worker(
             if cancelled:
                 session.close(LocalMicrophoneTerminalReason.RESOURCE_CLOSED)
             else:
+                session.record_asr_failure(
+                    failure_reason,
+                    resource=resource,
+                )
                 session.fail()
             local.status = "cancelled" if cancelled else "error"
             local.stage = (
@@ -725,6 +870,8 @@ def _start_local_microphone_worker(
                 ),
                 failure_reason=None if cancelled else "processing_failed",
             )
+        finally:
+            _release_local_microphone_asr_engine(engine)
 
     return resource.start_worker(initial, run_microphone)
 
@@ -759,6 +906,43 @@ def _request_local_microphone_reset(
     st.session_state.pop(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, None)
     st.session_state.local_mic_reset_pending = True
     return True
+
+
+def _local_microphone_asr_runtime_cards(
+    diagnostics: LocalMicrophoneDiagnostics,
+) -> tuple[StatusCardViewModel, ...]:
+    runtime = diagnostics.asr_runtime
+    if runtime is None:
+        return ()
+    cuda_text = (
+        "Kontrol edilmedi"
+        if runtime.cuda_available is None
+        else ("Evet" if runtime.cuda_available else "Hayır")
+    )
+    timings = diagnostics.asr_timings
+    values: list[StatusCardViewModel] = [
+        StatusCardViewModel("ASR profili", runtime.profile_name.value),
+        StatusCardViewModel("Model", runtime.model_name),
+        StatusCardViewModel("Aygıt", runtime.device),
+        StatusCardViewModel("Hesaplama", runtime.compute_type),
+        StatusCardViewModel("Dil", runtime.language),
+        StatusCardViewModel("Beam", str(runtime.beam_size)),
+        StatusCardViewModel("CUDA kullanılabilir", cuda_text),
+        StatusCardViewModel(
+            "Geri dönüş",
+            "Evet" if runtime.fallback_occurred else "Hayır",
+        ),
+    ]
+    for label, value in (
+        ("Model yükleme", timings.model_loading_seconds),
+        ("Model ısınma", timings.warmup_seconds),
+        ("Son ASR çıkarımı", timings.latest_inference_seconds),
+        ("Gerçek zaman katsayısı", diagnostics.latest_real_time_factor),
+    ):
+        if value is not None:
+            suffix = "x" if label == "Gerçek zaman katsayısı" else " sn"
+            values.append(StatusCardViewModel(label, f"{value:.2f}{suffix}"))
+    return tuple(values)
 
 
 def _local_microphone_audio_diagnostic_cards(
@@ -934,7 +1118,10 @@ def _render_local_microphone_controls(
                 if snapshot.lifecycle_status is DashboardExecutionStatus.COMPLETED:
                     st.success("Görüşme tamamlandı")
                 elif snapshot.lifecycle_status is DashboardExecutionStatus.FAILED:
-                    st.error("Görüşme güvenli biçimde tamamlanamadı")
+                    failure_text = _LOCAL_MIC_ASR_FAILURE_TEXT[
+                        diagnostics.asr_failure_reason
+                    ]
+                    st.error(failure_text or "Görüşme güvenli biçimde tamamlanamadı")
                 else:
                     st.warning("Görüşme durduruldu")
             else:
@@ -948,8 +1135,12 @@ def _render_local_microphone_controls(
             LocalMicrophoneASRReadiness.STREAMING,
         }:
             if diagnostics.asr_readiness is LocalMicrophoneASRReadiness.FAILED:
+                failure_text = _LOCAL_MIC_ASR_FAILURE_TEXT[
+                    diagnostics.asr_failure_reason
+                ]
                 st.error(
-                    _EXECUTION_STAGE_TEXT[
+                    failure_text
+                    or _EXECUTION_STAGE_TEXT[
                         DashboardExecutionStage.MODEL_PREPARATION_FAILED
                     ]
                 )
@@ -964,28 +1155,9 @@ def _render_local_microphone_controls(
                         )
                     ]
                 )
-            timings = diagnostics.asr_timings
-            preparation_cards = [
-                StatusCardViewModel(
-                    "Yerel mikrofon modeli",
-                    f"{_LOCAL_MIC_ASR_MODEL_NAME} · CPU {_LOCAL_MIC_ASR_COMPUTE_TYPE}",
-                )
-            ]
-            if timings.model_loading_seconds is not None:
-                preparation_cards.append(
-                    StatusCardViewModel(
-                        "Model yükleme",
-                        f"{timings.model_loading_seconds:.2f} sn",
-                    )
-                )
-            if timings.warmup_seconds is not None:
-                preparation_cards.append(
-                    StatusCardViewModel(
-                        "Model ısınma",
-                        f"{timings.warmup_seconds:.2f} sn",
-                    )
-                )
-            _metric_rows(tuple(preparation_cards))
+            runtime_cards = _local_microphone_asr_runtime_cards(diagnostics)
+            if runtime_cards:
+                _metric_rows(runtime_cards)
             if st.button(
                 "Sistemi sıfırla",
                 use_container_width=True,
@@ -1040,6 +1212,9 @@ def _render_local_microphone_controls(
                 )
             )
             _metric_rows(_local_microphone_audio_diagnostic_cards(diagnostics))
+            runtime_cards = _local_microphone_asr_runtime_cards(diagnostics)
+            if runtime_cards:
+                _metric_rows(runtime_cards)
             audio_message = _local_microphone_audio_diagnostic_message(diagnostics)
             if audio_message is not None:
                 st.caption(audio_message)
@@ -1118,16 +1293,10 @@ def _render_local_microphone_controls(
                     f"{connection.estimated_latency_seconds * 1000:.0f} ms",
                 )
             )
-        timings = diagnostics.asr_timings
-        for label, value in (
-            ("Model yükleme", timings.model_loading_seconds),
-            ("Model ısınma", timings.warmup_seconds),
-            ("İlk ses hazırlama", timings.first_audio_preparation_seconds),
-            ("İlk ASR çıkarımı", timings.first_inference_seconds),
-        ):
-            if value is not None:
-                diagnostic_cards.append(StatusCardViewModel(label, f"{value:.2f} sn"))
         _metric_rows(tuple(diagnostic_cards))
+        runtime_cards = _local_microphone_asr_runtime_cards(diagnostics)
+        if runtime_cards:
+            _metric_rows(runtime_cards)
         _metric_rows(_local_microphone_audio_diagnostic_cards(diagnostics))
         audio_message = _local_microphone_audio_diagnostic_message(diagnostics)
         if audio_message is not None:

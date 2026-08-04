@@ -177,6 +177,49 @@ def test_repeated_load_model_reuses_the_constructed_model(
     assert len(constructor_calls) == 1
 
 
+def test_gpu_large_v3_configuration_reaches_model_and_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_models, constructor_calls = install_fake_model(monkeypatch)
+    engine = FasterWhisperEngine(
+        "large-v3",
+        device="cuda",
+        compute_type="float16",
+        language="tr",
+        beam_size=5,
+    )
+
+    engine.transcribe_audio(np.zeros(32_000, dtype=np.float32))
+
+    assert constructor_calls == [
+        (
+            "large-v3",
+            {
+                "device": "cuda",
+                "compute_type": "float16",
+                "cpu_threads": 4,
+            },
+        )
+    ]
+    _waveform, settings = created_models[0].transcribe_calls[0]
+    assert settings["language"] == "tr"
+    assert settings["beam_size"] == 5
+    assert settings["vad_filter"] is False
+
+
+def test_release_model_is_exactly_once_and_allows_explicit_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _created_models, constructor_calls = install_fake_model(monkeypatch)
+    engine = FasterWhisperEngine()
+    engine.load_model()
+
+    assert engine.release_model()
+    assert not engine.release_model()
+    engine.load_model()
+    assert len(constructor_calls) == 2
+
+
 @pytest.mark.parametrize("duration", [0.0, -1.0, float("nan")])
 def test_warm_up_rejects_invalid_duration(duration: float) -> None:
     with pytest.raises(ValueError, match="finite and positive"):

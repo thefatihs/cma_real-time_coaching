@@ -261,3 +261,23 @@ This log uses local chronological numbering and records only Fatih-owned work.
 - Next planned step: rerun the localhost microphone acceptance test and use the
   new aggregate energy fields to distinguish silent capture from an empty ASR
   model result without exposing audio or transcript content.
+
+## F-024 — Explicit Local Microphone ASR Profiles
+
+- Preserved the default `cpu-tiny` profile and added an explicit
+  `gpu-large-v3` profile selected only through
+  `CALLMETRIC_LOCAL_MIC_ASR_PROFILE`.
+- The GPU profile requires visible CTranslate2 CUDA, float16 support, exact
+  `large-v3` CUDA/float16 model loading, and a successful warm-up before
+  microphone capture. Unknown profiles and readiness failures remain
+  fail-closed without CPU or model fallback.
+- Added bounded model/device/profile/timing diagnostics and Turkish readiness
+  failures. Pause/resume retains the warmed engine; completion/reset releases
+  the loaded model through one idempotent cleanup path.
+- Changed files: Fatih-owned ASR engine, local microphone ingress/dashboard,
+  focused ASR/dashboard tests, and this progress file.
+- Tests: focused ASR/microphone/streaming/dashboard 261 passed; PyAV/media 124
+  passed; full Windows suite 2497 passed and 17 skipped, with only the 19
+  documented Ubuntu/POSIX vLLM controller failures.
+- Next planned step: run manual `gpu-large-v3` acceptance on a CUDA machine and
+  verify displayed load, warm-up, inference, and real-time-factor diagnostics.

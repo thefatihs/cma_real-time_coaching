@@ -594,8 +594,14 @@ def test_local_microphone_preset_is_explicit_and_does_not_mutate_tenant_config(
     state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
     original = state.runtime.tenant.config.asr.model_copy(deep=True)
 
-    preset = app._local_microphone_asr_config(state.runtime)
+    profile = app._local_microphone_asr_profile(state.runtime, environment={})
+    preset = app._local_microphone_asr_config(state.runtime, profile)
 
+    assert profile.name is app.LocalMicrophoneASRProfileName.CPU_TINY
+    assert profile.model_name == "tiny"
+    assert profile.device == "cpu"
+    assert profile.compute_type == "int8"
+    assert profile.beam_size == 1
     assert preset.model_name == "tiny"
     assert preset.beam_size == 1
     assert not preset.vad_filter
@@ -603,6 +609,226 @@ def test_local_microphone_preset_is_explicit_and_does_not_mutate_tenant_config(
     assert preset.chunk_duration_seconds == pytest.approx(2.0)
     assert preset.stable_region_seconds == pytest.approx(2.0)
     assert state.runtime.tenant.config.asr == original
+
+
+def test_gpu_large_v3_profile_is_exact_and_has_no_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            captured.update(model_name=model_name, **kwargs)
+
+    profile = app._local_microphone_asr_profile(
+        state.runtime,
+        environment={app._LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY: "gpu-large-v3"},
+    )
+    preset = app._local_microphone_asr_config(state.runtime, profile)
+    monkeypatch.setattr(app, "FasterWhisperEngine", FakeEngine)
+
+    app._create_local_microphone_asr_engine(preset, profile)
+
+    assert profile.name is app.LocalMicrophoneASRProfileName.GPU_LARGE_V3
+    assert captured["model_name"] == "large-v3"
+    assert captured["device"] == "cuda"
+    assert captured["compute_type"] == "float16"
+    assert captured["language"] == "tr"
+    assert captured["beam_size"] == 5
+
+
+def test_uploaded_audio_asr_factory_remains_cpu_int8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            captured.update(model_name=model_name, **kwargs)
+
+    monkeypatch.setattr(app, "FasterWhisperEngine", FakeEngine)
+    app._load_asr_model("large-v3", "tr", 5, True, False, None)
+
+    assert captured["model_name"] == "large-v3"
+    assert captured["device"] == "cpu"
+    assert captured["compute_type"] == "int8"
+    assert captured["language"] == "tr"
+    assert captured["beam_size"] == 5
+
+
+def test_unknown_local_microphone_profile_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+
+    with pytest.raises(ValueError, match="invalid_local_microphone_asr_profile"):
+        app._local_microphone_asr_profile(
+            state.runtime,
+            environment={app._LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY: "unknown"},
+        )
+    assert (
+        "cpu-tiny veya gpu-large-v3"
+        in app._LOCAL_MIC_ASR_FAILURE_TEXT[
+            app.LocalMicrophoneASRFailureReason.INVALID_PROFILE
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("cuda_readiness", "expected_reason"),
+    [
+        (
+            (False, frozenset()),
+            "CUDA_UNAVAILABLE",
+        ),
+        (
+            (True, frozenset({"float32", "int8"})),
+            "FLOAT16_UNSUPPORTED",
+        ),
+    ],
+)
+def test_gpu_profile_fails_before_capture_when_cuda_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_readiness: tuple[bool, frozenset[str]],
+    expected_reason: str,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    monkeypatch.setenv(app._LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY, "gpu-large-v3")
+    monkeypatch.setattr(
+        app,
+        "_inspect_local_microphone_cuda",
+        lambda: app._LocalMicrophoneCUDAReadiness(
+            available=cuda_readiness[0],
+            supported_compute_types=cuda_readiness[1],
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "_create_local_microphone_asr_engine",
+        lambda *_args: pytest.fail("ASR model must not be constructed"),
+    )
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-gpu-check")
+    resource = app.DashboardExecutionResource(
+        app.DashboardExecutionIdentity("tenant_alpha", "call-gpu-check"),
+        integration=None,
+    )
+    capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-gpu-check",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+
+    assert app._start_local_microphone_worker(
+        local=state,
+        resource=resource,
+        session=session,
+        selection=DashboardServiceSelection(False, False),
+        availability=ArtifactAvailability(True),
+    )
+    resource.join_worker()
+
+    diagnostics = session.diagnostics
+    assert diagnostics.asr_readiness is app.LocalMicrophoneASRReadiness.FAILED
+    assert diagnostics.asr_failure_reason.value == expected_reason
+    assert diagnostics.asr_runtime is not None
+    assert diagnostics.asr_runtime.profile_name.value == "gpu-large-v3"
+    assert diagnostics.asr_runtime.device == "cuda"
+    assert diagnostics.asr_runtime.compute_type == "float16"
+    assert not diagnostics.asr_runtime.fallback_occurred
+    assert diagnostics.received_chunk_count == 0
+    assert not capability.active
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_reason"),
+    [
+        ("load", "MODEL_LOAD_FAILED"),
+        ("warmup", "WARMUP_FAILED"),
+    ],
+)
+def test_gpu_model_preparation_failure_never_enables_capture_or_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    expected_reason: str,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    monkeypatch.setenv(app._LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY, "gpu-large-v3")
+    monkeypatch.setattr(
+        app,
+        "_inspect_local_microphone_cuda",
+        lambda: app._LocalMicrophoneCUDAReadiness(
+            available=True,
+            supported_compute_types=frozenset({"float16"}),
+        ),
+    )
+    releases = 0
+
+    class FailingEngine:
+        def load_model(self) -> float:
+            if failure_stage == "load":
+                raise RuntimeError("synthetic model load")
+            return 1.0
+
+        def warm_up(self) -> float:
+            raise RuntimeError("synthetic warmup")
+
+        def release_model(self) -> bool:
+            nonlocal releases
+            releases += 1
+            return releases == 1
+
+    monkeypatch.setattr(
+        app,
+        "_create_local_microphone_asr_engine",
+        lambda *_args: FailingEngine(),
+    )
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-gpu-fail")
+    resource = app.DashboardExecutionResource(
+        app.DashboardExecutionIdentity("tenant_alpha", "call-gpu-fail"),
+        integration=None,
+    )
+    capability = app.create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call-gpu-fail",
+        resource=resource,
+        server_address="localhost",
+        environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=capability,
+        resource=resource,
+    )
+    resource.attach_microphone_session(session)
+
+    assert app._start_local_microphone_worker(
+        local=state,
+        resource=resource,
+        session=session,
+        selection=DashboardServiceSelection(False, False),
+        availability=ArtifactAvailability(True),
+    )
+    resource.join_worker()
+
+    diagnostics = session.diagnostics
+    assert diagnostics.asr_readiness is app.LocalMicrophoneASRReadiness.FAILED
+    assert diagnostics.asr_failure_reason.value == expected_reason
+    assert diagnostics.asr_runtime is not None
+    assert not diagnostics.asr_runtime.fallback_occurred
+    assert diagnostics.received_chunk_count == 0
+    assert releases == 1
 
 
 def test_local_microphone_worker_prepares_model_once_and_survives_reruns(
@@ -628,7 +854,13 @@ def test_local_microphone_worker_prepares_model_once_and_survives_reruns(
     )
     resource.attach_microphone_session(session)
     ready = Event()
-    calls = {"constructed": 0, "loaded": 0, "warmed": 0, "pipeline": 0}
+    calls = {
+        "constructed": 0,
+        "loaded": 0,
+        "warmed": 0,
+        "pipeline": 0,
+        "released": 0,
+    }
 
     class FakeEngine:
         def load_model(self) -> float:
@@ -638,6 +870,10 @@ def test_local_microphone_worker_prepares_model_once_and_survives_reruns(
         def warm_up(self) -> float:
             calls["warmed"] += 1
             return 0.5
+
+        def release_model(self) -> bool:
+            calls["released"] += 1
+            return calls["released"] == 1
 
     class FakePipeline:
         def configure_provisional_coaching(self, _policy: object) -> None:
@@ -649,7 +885,7 @@ def test_local_microphone_worker_prepares_model_once_and_survives_reruns(
             cancellation.wait()
             return SimpleNamespace(audio_duration_seconds=0.0)
 
-    def create_engine(_config: object) -> FakeEngine:
+    def create_engine(_config: object, _profile: object) -> FakeEngine:
         calls["constructed"] += 1
         return FakeEngine()
 
@@ -679,7 +915,22 @@ def test_local_microphone_worker_prepares_model_once_and_survives_reruns(
         session.diagnostics.asr_readiness
         is app.LocalMicrophoneASRReadiness.READY_TO_CAPTURE
     )
-    assert calls == {"constructed": 1, "loaded": 1, "warmed": 1, "pipeline": 1}
+    runtime = session.diagnostics.asr_runtime
+    assert runtime is not None
+    assert runtime.profile_name is app.LocalMicrophoneASRProfileName.CPU_TINY
+    assert runtime.model_name == "tiny"
+    assert runtime.device == "cpu"
+    assert runtime.compute_type == "int8"
+    assert runtime.beam_size == 1
+    assert runtime.cuda_available is None
+    assert not runtime.fallback_occurred
+    assert calls == {
+        "constructed": 1,
+        "loaded": 1,
+        "warmed": 1,
+        "pipeline": 1,
+        "released": 0,
+    }
 
     original_component_key = session.component_key
     original_snapshot = resource.latest_snapshot
@@ -697,10 +948,21 @@ def test_local_microphone_worker_prepares_model_once_and_survives_reruns(
     assert session.component_key != original_component_key
     assert resource.latest_snapshot is original_snapshot
     assert not app._start_local_microphone_worker(**arguments)
-    assert calls == {"constructed": 1, "loaded": 1, "warmed": 1, "pipeline": 1}
+    assert calls == {
+        "constructed": 1,
+        "loaded": 1,
+        "warmed": 1,
+        "pipeline": 1,
+        "released": 0,
+    }
 
-    resource.cancel()
+    assert app._request_local_microphone_reset(session, resource)
+    assert not app._request_local_microphone_reset(session, resource)
     resource.join_worker()
+    assert calls["released"] == 1
+    resource.close()
+    resource.close()
+    assert calls["released"] == 1
 
 
 def test_local_microphone_non_empty_asr_reaches_partial_and_completed_snapshot(
@@ -771,6 +1033,7 @@ def test_local_microphone_non_empty_asr_reaches_partial_and_completed_snapshot(
         transcription_time_seconds=0.1,
         asr_segment_count=1,
     )
+    releases = 0
 
     class FakeEngine:
         def load_model(self) -> float:
@@ -778,6 +1041,11 @@ def test_local_microphone_non_empty_asr_reaches_partial_and_completed_snapshot(
 
         def warm_up(self) -> float:
             return 0.1
+
+        def release_model(self) -> bool:
+            nonlocal releases
+            releases += 1
+            return releases == 1
 
     class FakePipeline:
         def configure_provisional_coaching(self, _policy: object) -> None:
@@ -800,7 +1068,7 @@ def test_local_microphone_non_empty_asr_reaches_partial_and_completed_snapshot(
     monkeypatch.setattr(
         app,
         "_create_local_microphone_asr_engine",
-        lambda _config: FakeEngine(),
+        lambda _config, _profile: FakeEngine(),
     )
     monkeypatch.setattr(
         app,
@@ -816,6 +1084,10 @@ def test_local_microphone_non_empty_asr_reaches_partial_and_completed_snapshot(
         availability=ArtifactAvailability(True),
     )
     resource.join_worker()
+    assert releases == 1
+    resource.close()
+    resource.close()
+    assert releases == 1
 
     snapshot = resource.latest_snapshot
     assert snapshot is not None
@@ -904,6 +1176,56 @@ def test_local_microphone_audio_diagnostics_distinguish_safe_pipeline_stages(
     assert values["Girdi biçimi"] == "48000 Hz · 2 kanal"
     assert values["Üretilen PCM"] == "3200 bayt"
     assert values["Son ASR penceresi"] == "2.00 sn"
+
+    session.record_asr_runtime(
+        app.LocalMicrophoneASRRuntime(
+            profile_name=app.LocalMicrophoneASRProfileName.GPU_LARGE_V3,
+            model_name="large-v3",
+            device="cuda",
+            compute_type="float16",
+            language="tr",
+            beam_size=5,
+            cuda_available=True,
+            fallback_occurred=False,
+        ),
+        resource=resource,
+    )
+    session.record_asr_preparation(
+        resource=resource,
+        model_loading_seconds=4.0,
+        warmup_seconds=1.0,
+    )
+    session.record_transcript_step(
+        resource=resource,
+        asr_result_non_empty=True,
+        asr_segment_count=1,
+        window_duration_seconds=2.0,
+        partial_event_count=1,
+        stable_commit_count=0,
+    )
+    session.record_asr_inference(
+        resource=resource,
+        audio_preparation_seconds=0.01,
+        inference_seconds=0.5,
+    )
+    runtime_values = {
+        card.label: card.value
+        for card in app._local_microphone_asr_runtime_cards(session.diagnostics)
+    }
+    assert runtime_values == {
+        "ASR profili": "gpu-large-v3",
+        "Model": "large-v3",
+        "Aygıt": "cuda",
+        "Hesaplama": "float16",
+        "Dil": "tr",
+        "Beam": "5",
+        "CUDA kullanılabilir": "Evet",
+        "Geri dönüş": "Hayır",
+        "Model yükleme": "4.00 sn",
+        "Model ısınma": "1.00 sn",
+        "Son ASR çıkarımı": "0.50 sn",
+        "Gerçek zaman katsayısı": "0.25x",
+    }
 
 
 def test_local_microphone_finish_is_edge_triggered_and_emits_end_once(
@@ -1146,7 +1468,7 @@ def test_local_microphone_model_preparation_failure_is_visible_and_revokes_once(
     monkeypatch.setattr(
         app,
         "_create_local_microphone_asr_engine",
-        lambda _config: FailingEngine(),
+        lambda _config, _profile: FailingEngine(),
     )
 
     assert app._start_local_microphone_worker(
