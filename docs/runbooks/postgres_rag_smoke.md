@@ -76,8 +76,37 @@ PyMuPDF from in-memory bytes; no client-controlled filesystem path is used.
 
 Preparation calculates SHA-256 over accepted source bytes, normalizes text and
 builds deterministic chunks with page metadata where applicable. It does not
-create embeddings. Dashboard upload UI, registry persistence, object storage,
-job workers and progress polling are not implemented by this change.
+create embeddings or perform storage operations.
+
+## Synchronous registry and ingestion lifecycle
+
+The document-registry repository accepts validated domain models only. Every
+operation is scoped by trusted `tenant_id` and `knowledge_base_id`; document and
+job IDs and opaque storage object keys are server-owned inputs. Creation inserts
+the document and its `QUEUED` job atomically. SHA-256 duplicates are resolved by
+the database uniqueness constraint within that exact scope, without a
+check-before-insert race. A ready duplicate returns its existing document/job
+identity without embedding or rewriting vectors. A failed duplicate remains
+failed until the bounded retry operation explicitly returns it to `QUEUED`.
+
+Synchronous ingestion claims the queued job, embeds all prepared chunks outside
+the final database transaction, and verifies the exact row count and registered
+vector dimension. The final transaction locks the document/job, admits the full
+vector batch through the caller-owned transaction, marks the job
+`SUCCEEDED`/`FINALIZE`, and sets `ready_at_utc`. Any vector or finalization error
+rolls back that complete transaction, then records only a fixed failure phase.
+No exception details, digest, source text, filename, object key, or scoped IDs
+are stored as failure text.
+
+Exact deletion locks one scoped document, deletes only its tenant/knowledge-base
+and document-matched vector rows, then deletes the registry row and lets the job
+foreign key cascade. After commit it returns the opaque object key to a future
+storage layer; this code performs no filesystem deletion. Embedding profiles and
+unrelated legacy vectors are untouched.
+
+Dashboard upload UI, HTTP APIs, object storage, background workers, and progress
+polling UI are not implemented by this change. The repository exposes scoped
+list and job-status operations for later server-side integration.
 
 ## External PostgreSQL requirement
 

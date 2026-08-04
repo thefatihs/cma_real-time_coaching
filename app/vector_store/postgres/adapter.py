@@ -131,7 +131,35 @@ class ProfileBoundPostgreSQLVectorStore:
         self,
         request: VectorBatchWriteRequest,
     ) -> VectorBatchWriteResult:
-        candidates = tuple(
+        candidates = self._canonical_candidates(request)
+        return self._transaction_runner.run_in_transaction(
+            lambda transaction: self._admit_candidates(transaction, candidates)
+        )
+
+    def admit_batch_in_transaction(
+        self,
+        transaction: PostgreSQLVectorTransaction,
+        request: VectorBatchWriteRequest,
+    ) -> VectorBatchWriteResult:
+        """Admit a batch using a caller-owned transaction without committing it."""
+        if not all(
+            callable(getattr(transaction, method, None))
+            for method in (
+                "acquire_scope_lock",
+                "get_profile",
+                "get_records",
+                "insert_records",
+            )
+        ):
+            raise ValueError("transaction must implement PostgreSQLVectorTransaction")
+        candidates = self._canonical_candidates(request)
+        return self._admit_candidates(transaction, candidates)
+
+    def _canonical_candidates(
+        self,
+        request: VectorBatchWriteRequest,
+    ) -> tuple[PostgreSQLStoredVectorRow, ...]:
+        return tuple(
             sorted(
                 _canonical_batch_rows(
                     request,
@@ -140,6 +168,12 @@ class ProfileBoundPostgreSQLVectorStore:
                 key=_row_identity,
             )
         )
+
+    def _admit_candidates(
+        self,
+        transaction: PostgreSQLVectorTransaction,
+        candidates: tuple[PostgreSQLStoredVectorRow, ...],
+    ) -> VectorBatchWriteResult:
         identities = tuple(
             VectorRecordIdentity(
                 document_id=row.document_id,
@@ -148,69 +182,62 @@ class ProfileBoundPostgreSQLVectorStore:
             for row in candidates
         )
 
-        def admit(
-            transaction: PostgreSQLVectorTransaction,
-        ) -> VectorBatchWriteResult:
-            tenant_id = self._expected_profile.tenant_id
-            knowledge_base_id = self._expected_profile.knowledge_base_id
-            transaction.acquire_scope_lock(
-                tenant_id=tenant_id,
-                knowledge_base_id=knowledge_base_id,
-            )
-            stored_profile = transaction.get_profile(
-                tenant_id=tenant_id,
-                knowledge_base_id=knowledge_base_id,
-                for_update=True,
-            )
-            if stored_profile is None:
-                raise ValueError("embedding profile is not registered")
-            if _profile_signature(stored_profile) != self._expected_profile_signature:
+        tenant_id = self._expected_profile.tenant_id
+        knowledge_base_id = self._expected_profile.knowledge_base_id
+        transaction.acquire_scope_lock(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        )
+        stored_profile = transaction.get_profile(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            for_update=True,
+        )
+        if stored_profile is None:
+            raise ValueError("embedding profile is not registered")
+        if _profile_signature(stored_profile) != self._expected_profile_signature:
+            raise ValueError("stored embedding profile conflicts with expected profile")
+
+        stored_rows = transaction.get_records(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            identities=identities,
+        )
+        stored_by_identity = _validated_stored_rows(
+            stored_rows,
+            requested_identities={
+                (identity.document_id, identity.chunk_id) for identity in identities
+            },
+            expected_profile=self._expected_profile,
+        )
+
+        inserted: list[VectorRecordIdentity] = []
+        unchanged: list[VectorRecordIdentity] = []
+        rows_to_insert: list[PostgreSQLStoredVectorRow] = []
+        for candidate, identity in zip(candidates, identities, strict=True):
+            key = (identity.document_id, identity.chunk_id)
+            stored = stored_by_identity.get(key)
+            if stored is None:
+                inserted.append(identity)
+                rows_to_insert.append(candidate)
+            elif _rows_are_equal(stored, candidate):
+                unchanged.append(identity)
+            else:
                 raise ValueError(
-                    "stored embedding profile conflicts with expected profile"
+                    "existing PostgreSQL vector record conflicts with batch record"
                 )
 
-            stored_rows = transaction.get_records(
-                tenant_id=tenant_id,
-                knowledge_base_id=knowledge_base_id,
-                identities=identities,
-            )
-            stored_by_identity = _validated_stored_rows(
-                stored_rows,
-                requested_identities={
-                    (identity.document_id, identity.chunk_id) for identity in identities
-                },
-                expected_profile=self._expected_profile,
-            )
-
-            inserted: list[VectorRecordIdentity] = []
-            unchanged: list[VectorRecordIdentity] = []
-            rows_to_insert: list[PostgreSQLStoredVectorRow] = []
-            for candidate, identity in zip(candidates, identities, strict=True):
-                key = (identity.document_id, identity.chunk_id)
-                stored = stored_by_identity.get(key)
-                if stored is None:
-                    inserted.append(identity)
-                    rows_to_insert.append(candidate)
-                elif _rows_are_equal(stored, candidate):
-                    unchanged.append(identity)
-                else:
-                    raise ValueError(
-                        "existing PostgreSQL vector record conflicts with batch record"
-                    )
-
-            rows_to_insert.sort(key=_row_identity)
-            inserted.sort(key=_identity_key)
-            unchanged.sort(key=_identity_key)
-            if rows_to_insert:
-                transaction.insert_records(tuple(rows_to_insert))
-            return VectorBatchWriteResult(
-                tenant_id=tenant_id,
-                knowledge_base_id=knowledge_base_id,
-                inserted_identities=tuple(inserted),
-                unchanged_identities=tuple(unchanged),
-            )
-
-        return self._transaction_runner.run_in_transaction(admit)
+        rows_to_insert.sort(key=_row_identity)
+        inserted.sort(key=_identity_key)
+        unchanged.sort(key=_identity_key)
+        if rows_to_insert:
+            transaction.insert_records(tuple(rows_to_insert))
+        return VectorBatchWriteResult(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            inserted_identities=tuple(inserted),
+            unchanged_identities=tuple(unchanged),
+        )
 
 
 def _canonical_search_arguments(
