@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
@@ -47,6 +47,7 @@ class SynchronousDocumentIngestionOrchestrator:
         document_embedder: DocumentEmbedder,
         vector_writer: TransactionAwareVectorBatchWriter,
         expected_vector_dimension: int,
+        cancellation_requested: Callable[[], bool] | None = None,
     ) -> None:
         if not callable(getattr(registry, "create_or_get", None)):
             raise ValueError("registry is invalid")
@@ -56,10 +57,13 @@ class SynchronousDocumentIngestionOrchestrator:
             raise ValueError("vector_writer is invalid")
         if type(expected_vector_dimension) is not int or expected_vector_dimension <= 0:
             raise ValueError("expected_vector_dimension must be positive")
+        if cancellation_requested is not None and not callable(cancellation_requested):
+            raise ValueError("cancellation_requested must be callable")
         self._registry = registry
         self._document_embedder = document_embedder
         self._vector_writer = vector_writer
         self._expected_vector_dimension = expected_vector_dimension
+        self._cancellation_requested = cancellation_requested
 
     def ingest(
         self,
@@ -101,6 +105,8 @@ class SynchronousDocumentIngestionOrchestrator:
             raise
         except Exception:
             raise DocumentRegistryError(DocumentOperationPhase.JOB_CLAIM) from None
+
+        self._cancel_if_requested(entry, DocumentIngestionPhase.EMBEDDING)
 
         try:
             output: object = self._document_embedder.embed_documents(
@@ -156,8 +162,16 @@ class SynchronousDocumentIngestionOrchestrator:
                 job_id=entry.job.job_id,
                 total_chunks=len(prepared.chunks),
                 vector_operation=write_vectors,
+                cancellation_requested=self._cancellation_requested,
             )
         except DocumentRegistryError as error:
+            if error.phase is DocumentOperationPhase.CANCEL:
+                self._cancel_if_requested(
+                    entry,
+                    DocumentIngestionPhase.VECTOR_WRITE,
+                    force=True,
+                )
+                raise
             failure_phase = (
                 DocumentIngestionPhase.VECTOR_WRITE
                 if error.phase is DocumentOperationPhase.VECTOR_WRITE
@@ -181,6 +195,29 @@ class SynchronousDocumentIngestionOrchestrator:
             created=created.created,
             vector_result=vector_result,
         )
+
+    def _cancel_if_requested(
+        self,
+        entry: DocumentRegistryEntry,
+        phase: DocumentIngestionPhase,
+        *,
+        force: bool = False,
+    ) -> None:
+        requested = self._cancellation_requested
+        if not force and (requested is None or not requested()):
+            return
+        try:
+            changed = self._registry.mark_cancelled(
+                tenant_id=entry.document.tenant_id,
+                knowledge_base_id=entry.document.knowledge_base_id,
+                job_id=entry.job.job_id,
+                phase=phase,
+            )
+        except Exception:
+            changed = False
+        if not changed:
+            raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
+        raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
 
     def _record_failure(
         self,

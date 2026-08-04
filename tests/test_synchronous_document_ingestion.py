@@ -62,7 +62,12 @@ def entry(
     started = now if state is not DocumentIngestionState.QUEUED else None
     finished = (
         now
-        if state in {DocumentIngestionState.SUCCEEDED, DocumentIngestionState.FAILED}
+        if state
+        in {
+            DocumentIngestionState.SUCCEEDED,
+            DocumentIngestionState.FAILED,
+            DocumentIngestionState.CANCELLED,
+        }
         else None
     )
     document = DocumentRegistryRecord(
@@ -100,6 +105,8 @@ def entry(
         if ready
         else DocumentReadiness.FAILED
         if state is DocumentIngestionState.FAILED
+        else DocumentReadiness.CANCELLED
+        if state is DocumentIngestionState.CANCELLED
         else DocumentReadiness.PENDING
     )
     return DocumentRegistryEntry(document=document, job=job, readiness=readiness)
@@ -113,6 +120,7 @@ class FakeRegistry:
         self.current = initial or entry(DocumentIngestionState.QUEUED)
         self.fail_finalize = False
         self.failures: list[DocumentIngestionPhase] = []
+        self.cancellations: list[DocumentIngestionPhase] = []
         self.transaction = object()
 
     def create_or_get(
@@ -132,6 +140,9 @@ class FakeRegistry:
         ],
         **scope: object,
     ) -> VectorBatchWriteResult:
+        cancellation_requested = scope.get("cancellation_requested")
+        if callable(cancellation_requested) and cancellation_requested():
+            raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
         result = vector_operation(self.transaction)  # type: ignore[arg-type]
         if self.fail_finalize:
             raise RuntimeError("synthetic finalization failure")
@@ -141,6 +152,11 @@ class FakeRegistry:
     def mark_failed(self, *, phase: DocumentIngestionPhase, **scope: object) -> bool:
         self.failures.append(phase)
         self.current = entry(DocumentIngestionState.FAILED)
+        return True
+
+    def mark_cancelled(self, *, phase: DocumentIngestionPhase, **scope: object) -> bool:
+        self.cancellations.append(phase)
+        self.current = entry(DocumentIngestionState.CANCELLED)
         return True
 
     def get_entry(self, **scope: str) -> DocumentRegistryEntry | None:
@@ -242,3 +258,38 @@ def test_succeeded_duplicate_skips_embedding_and_vector_write() -> None:
     assert result.created is False
     assert result.vector_result is None
     assert embedder.calls == writer.calls == 0
+
+
+def test_cancellation_before_embedding_skips_embedding_and_vectors() -> None:
+    registry = FakeRegistry()
+    embedder = FakeEmbedder()
+    writer = FakeWriter()
+    with pytest.raises(DocumentRegistryError) as caught:
+        SynchronousDocumentIngestionOrchestrator(
+            registry=registry,  # type: ignore[arg-type]
+            document_embedder=embedder,  # type: ignore[arg-type]
+            vector_writer=writer,
+            expected_vector_dimension=384,
+            cancellation_requested=lambda: True,
+        ).ingest(prepared(), job_id="job-new", storage_object_key="objects/server-1")
+    assert caught.value.phase is DocumentOperationPhase.CANCEL
+    assert registry.cancellations == [DocumentIngestionPhase.EMBEDDING]
+    assert embedder.calls == writer.calls == 0
+
+
+def test_cancellation_before_final_commit_does_not_mark_failed() -> None:
+    registry = FakeRegistry()
+    checks = iter((False, True))
+    writer = FakeWriter()
+    with pytest.raises(DocumentRegistryError) as caught:
+        SynchronousDocumentIngestionOrchestrator(
+            registry=registry,  # type: ignore[arg-type]
+            document_embedder=FakeEmbedder(),  # type: ignore[arg-type]
+            vector_writer=writer,
+            expected_vector_dimension=384,
+            cancellation_requested=lambda: next(checks),
+        ).ingest(prepared(), job_id="job-new", storage_object_key="objects/server-1")
+    assert caught.value.phase is DocumentOperationPhase.CANCEL
+    assert registry.cancellations == [DocumentIngestionPhase.VECTOR_WRITE]
+    assert registry.failures == []
+    assert writer.calls == 0

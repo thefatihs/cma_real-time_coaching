@@ -104,9 +104,40 @@ foreign key cascade. After commit it returns the opaque object key to a future
 storage layer; this code performs no filesystem deletion. Embedding profiles and
 unrelated legacy vectors are untouched.
 
-Dashboard upload UI, HTTP APIs, object storage, background workers, and progress
+Dashboard upload UI, HTTP APIs, background workers, and progress
 polling UI are not implemented by this change. The repository exposes scoped
 list and job-status operations for later server-side integration.
+
+## Private persistent document storage prerequisites
+
+The backend storage primitive requires an operator-created absolute directory
+outside this repository. It never creates the configured root or changes its
+ACL. The root, every path component and every managed object must be a regular
+non-link object without a symlink, junction or Windows reparse point. Filesystem
+roots, the user-profile root, broad shared roots, this repository and its
+descendants are rejected.
+
+On POSIX, the effective user must own the directory and its mode must be `0700`
+or stricter. On Windows, owner and DACL checks use security APIs rather than
+localized command output: the running account must own and control the root and
+no unrelated principal may have writable access. Validation failure is closed
+and emits only a fixed storage category. Operators remain responsible for
+creating and maintaining this owner-only directory before application startup.
+
+Accepted source bytes are stored under random server-owned direct-child keys;
+filenames, tenant/knowledge-base identifiers, digests and content never form a
+path. Writes are bounded to 10 MiB, flushed and synced before exclusive atomic
+publication. Successful ingestion retains the source for retry or audit.
+Registry deletion commits before source deletion, so a later storage failure
+creates an orphan and never restores the database row. Duplicate registry
+resolution deletes only the new attempt's object.
+
+Orphan reconciliation is an explicit primitive, not a scheduler. It requires a
+complete trusted registry-key snapshot, deletes nothing for incomplete input,
+ignores unrelated names, applies a 300-to-604800-second grace period and removes
+at most 100 deterministic candidates per invocation. It returns counts only.
+Dashboard document UI, background ingestion execution and automatic orphan
+scheduling are not implemented yet.
 
 ## External PostgreSQL requirement
 

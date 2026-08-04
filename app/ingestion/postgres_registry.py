@@ -9,11 +9,15 @@ import unicodedata
 from psycopg import Connection
 
 from app.ingestion.registry_models import (
+    MAX_CHUNK_COUNT,
+    MAX_DOCUMENT_LIST_PAGE_SIZE,
     MAX_INGESTION_ATTEMPTS,
     DocumentDeletionResult,
     DocumentIngestionJob,
     DocumentIngestionPhase,
     DocumentIngestionState,
+    DocumentListCursor,
+    DocumentListPage,
     DocumentOperationPhase,
     DocumentRegistryCreateRequest,
     DocumentRegistryCreateResult,
@@ -47,7 +51,7 @@ _JOB_INSERT = """
         tenant_id, knowledge_base_id, job_id, document_id, state, phase,
         processed_chunks, total_chunks, attempt_count
     )
-    VALUES (%s, %s, %s, %s, 'QUEUED', 'EMBEDDING', 0, %s, 0)
+    VALUES (%s, %s, %s, %s, 'QUEUED', %s, 0, %s, 0)
     """
 _ENTRY_COLUMNS = """
     documents.tenant_id, documents.knowledge_base_id, documents.document_id,
@@ -86,11 +90,33 @@ _ENTRY_LIST = f"""
     WHERE documents.tenant_id = %s
       AND documents.knowledge_base_id = %s
     ORDER BY documents.created_at_utc DESC, documents.document_id
+    LIMIT %s
     """
+_ENTRY_LIST_AFTER = f"""
+    SELECT {_ENTRY_COLUMNS}
+    {_ENTRY_FROM}
+    WHERE documents.tenant_id = %s
+      AND documents.knowledge_base_id = %s
+      AND (
+        documents.created_at_utc < %s
+        OR (
+          documents.created_at_utc = %s
+          AND documents.document_id > %s
+        )
+      )
+    ORDER BY documents.created_at_utc DESC, documents.document_id
+    LIMIT %s
+    """
+_ENTRY_BY_JOB = f"""
+    SELECT {_ENTRY_COLUMNS}
+    {_ENTRY_FROM}
+    WHERE jobs.tenant_id = %s AND jobs.knowledge_base_id = %s
+      AND jobs.job_id = %s
+    """
+_ENTRY_BY_JOB_FOR_UPDATE = _ENTRY_BY_JOB + " FOR UPDATE OF documents, jobs"
 _JOB_CLAIM = """
     UPDATE callmetric_vector.document_ingestion_jobs
-    SET state = 'PROCESSING', phase = 'EMBEDDING',
-        attempt_count = attempt_count + 1,
+    SET state = 'PROCESSING', attempt_count = attempt_count + 1,
         started_at_utc = CURRENT_TIMESTAMP,
         updated_at_utc = CURRENT_TIMESTAMP,
         finished_at_utc = NULL
@@ -99,7 +125,7 @@ _JOB_CLAIM = """
     """
 _JOB_RETRY = """
     UPDATE callmetric_vector.document_ingestion_jobs
-    SET state = 'QUEUED', phase = 'EMBEDDING', processed_chunks = 0,
+    SET state = 'QUEUED', processed_chunks = 0,
         started_at_utc = NULL, updated_at_utc = CURRENT_TIMESTAMP,
         finished_at_utc = NULL
     WHERE tenant_id = %s AND knowledge_base_id = %s AND job_id = %s
@@ -111,6 +137,21 @@ _JOB_FAIL = """
         finished_at_utc = CURRENT_TIMESTAMP
     WHERE tenant_id = %s AND knowledge_base_id = %s AND job_id = %s
       AND state = 'PROCESSING'
+    """
+_JOB_PROGRESS = """
+    UPDATE callmetric_vector.document_ingestion_jobs
+    SET phase = %s, processed_chunks = %s, total_chunks = %s,
+        updated_at_utc = CURRENT_TIMESTAMP
+    WHERE tenant_id = %s AND knowledge_base_id = %s AND job_id = %s
+      AND state = 'PROCESSING'
+    """
+_JOB_CANCEL = """
+    UPDATE callmetric_vector.document_ingestion_jobs
+    SET state = 'CANCELLED', phase = %s,
+        updated_at_utc = CURRENT_TIMESTAMP,
+        finished_at_utc = CURRENT_TIMESTAMP
+    WHERE tenant_id = %s AND knowledge_base_id = %s AND job_id = %s
+      AND state IN ('QUEUED', 'PROCESSING')
     """
 _JOB_SUCCEED = """
     UPDATE callmetric_vector.document_ingestion_jobs
@@ -186,6 +227,7 @@ class PsycopgDocumentRegistryRepository:
                             request.knowledge_base_id,
                             request.job_id,
                             request.document_id,
+                            request.initial_phase.value,
                             request.total_chunks,
                         ),
                     )
@@ -257,22 +299,183 @@ class PsycopgDocumentRegistryRepository:
         tenant_id: str,
         knowledge_base_id: str,
     ) -> tuple[DocumentRegistryEntry, ...]:
-        tenant, knowledge_base = _scope(tenant_id, knowledge_base_id)
+        return self.list_document_page(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+        ).entries
 
-        def operation(connection: Connection[Any]) -> tuple[DocumentRegistryEntry, ...]:
+    def list_document_page(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        page_size: int = MAX_DOCUMENT_LIST_PAGE_SIZE,
+        cursor: DocumentListCursor | None = None,
+    ) -> DocumentListPage:
+        tenant, knowledge_base = _scope(
+            tenant_id, knowledge_base_id, DocumentOperationPhase.LIST
+        )
+        if (
+            type(page_size) is not int
+            or not 1 <= page_size <= MAX_DOCUMENT_LIST_PAGE_SIZE
+            or (cursor is not None and not isinstance(cursor, DocumentListCursor))
+        ):
+            raise DocumentRegistryError(DocumentOperationPhase.LIST)
+
+        def operation(connection: Connection[Any]) -> DocumentListPage:
             with connection.cursor() as cursor:
-                cursor.execute(_ENTRY_LIST, (tenant, knowledge_base))
+                if cursor_value is None:
+                    cursor.execute(
+                        _ENTRY_LIST,
+                        (tenant, knowledge_base, page_size + 1),
+                    )
+                else:
+                    cursor.execute(
+                        _ENTRY_LIST_AFTER,
+                        (
+                            tenant,
+                            knowledge_base,
+                            cursor_value._created_at_utc,
+                            cursor_value._created_at_utc,
+                            cursor_value._document_id,
+                            page_size + 1,
+                        ),
+                    )
                 rows = cursor.fetchall()
-            entries = tuple(_entry_from_row(row) for row in rows)
+            entries = tuple(
+                _entry_from_row(row, DocumentOperationPhase.LIST) for row in rows
+            )
             ordering = tuple(
                 (-entry.document.created_at_utc.timestamp(), entry.document.document_id)
                 for entry in entries
             )
             if ordering != tuple(sorted(ordering)):
-                raise DocumentRegistryError(DocumentOperationPhase.REGISTRY_CREATE)
-            return entries
+                raise DocumentRegistryError(DocumentOperationPhase.LIST)
+            visible = entries[:page_size]
+            continuation = None
+            if len(entries) > page_size:
+                last = visible[-1].document
+                continuation = DocumentListCursor(
+                    last.created_at_utc,
+                    last.document_id,
+                )
+            return DocumentListPage(entries=visible, continuation=continuation)
 
-        return self._run(DocumentOperationPhase.REGISTRY_CREATE, operation)
+        cursor_value = cursor
+        return self._run(DocumentOperationPhase.LIST, operation)
+
+    def update_processing_progress(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        job_id: str,
+        phase: DocumentIngestionPhase,
+        processed_chunks: int,
+        total_chunks: int,
+    ) -> DocumentIngestionJob | None:
+        tenant, knowledge_base, job = _scope_job(
+            tenant_id,
+            knowledge_base_id,
+            job_id,
+            DocumentOperationPhase.PROGRESS,
+        )
+        if (
+            not isinstance(phase, DocumentIngestionPhase)
+            or type(processed_chunks) is not int
+            or type(total_chunks) is not int
+            or not 0 <= processed_chunks <= MAX_CHUNK_COUNT
+            or not 0 <= total_chunks <= MAX_CHUNK_COUNT
+            or (total_chunks == 0 and processed_chunks != 0)
+            or (total_chunks > 0 and processed_chunks > total_chunks)
+        ):
+            raise DocumentRegistryError(DocumentOperationPhase.PROGRESS)
+
+        def operation(connection: Connection[Any]) -> DocumentIngestionJob | None:
+            with connection.cursor() as cursor:
+                entry = _fetch_one_entry(
+                    cursor,
+                    _ENTRY_BY_JOB_FOR_UPDATE,
+                    (tenant, knowledge_base, job),
+                    DocumentOperationPhase.PROGRESS,
+                )
+                if entry is None:
+                    return None
+                current = entry.job
+                if current.state is not DocumentIngestionState.PROCESSING:
+                    raise DocumentRegistryError(DocumentOperationPhase.PROGRESS)
+                if _phase_rank(phase) < _phase_rank(current.phase):
+                    raise DocumentRegistryError(DocumentOperationPhase.PROGRESS)
+                if processed_chunks < current.processed_chunks:
+                    raise DocumentRegistryError(DocumentOperationPhase.PROGRESS)
+                if current.total_chunks > 0 and total_chunks != current.total_chunks:
+                    raise DocumentRegistryError(DocumentOperationPhase.PROGRESS)
+                cursor.execute(
+                    _JOB_PROGRESS,
+                    (
+                        phase.value,
+                        processed_chunks,
+                        total_chunks,
+                        tenant,
+                        knowledge_base,
+                        job,
+                    ),
+                )
+                _require_one_changed(cursor, DocumentOperationPhase.PROGRESS)
+                updated = _fetch_one_entry(
+                    cursor,
+                    _ENTRY_BY_JOB,
+                    (tenant, knowledge_base, job),
+                    DocumentOperationPhase.PROGRESS,
+                )
+            if updated is None:
+                raise DocumentRegistryError(DocumentOperationPhase.PROGRESS)
+            return updated.job
+
+        return self._run(DocumentOperationPhase.PROGRESS, operation)
+
+    def mark_cancelled(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        job_id: str,
+        phase: DocumentIngestionPhase,
+    ) -> bool:
+        tenant, knowledge_base, job = _scope_job(
+            tenant_id,
+            knowledge_base_id,
+            job_id,
+            DocumentOperationPhase.CANCEL,
+        )
+        if not isinstance(phase, DocumentIngestionPhase):
+            raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
+
+        def operation(connection: Connection[Any]) -> bool:
+            with connection.cursor() as cursor:
+                entry = _fetch_one_entry(
+                    cursor,
+                    _ENTRY_BY_JOB_FOR_UPDATE,
+                    (tenant, knowledge_base, job),
+                    DocumentOperationPhase.CANCEL,
+                )
+                if entry is None:
+                    return False
+                if entry.job.state not in {
+                    DocumentIngestionState.QUEUED,
+                    DocumentIngestionState.PROCESSING,
+                }:
+                    raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
+                if _phase_rank(phase) < _phase_rank(entry.job.phase):
+                    raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
+                cursor.execute(
+                    _JOB_CANCEL,
+                    (phase.value, tenant, knowledge_base, job),
+                )
+                _require_one_changed(cursor, DocumentOperationPhase.CANCEL)
+            return True
+
+        return self._run(DocumentOperationPhase.CANCEL, operation)
 
     def claim_queued_job(
         self,
@@ -379,6 +582,7 @@ class PsycopgDocumentRegistryRepository:
         job_id: str,
         total_chunks: int,
         vector_operation: VectorFinalizationOperation,
+        cancellation_requested: Callable[[], bool] | None = None,
     ) -> VectorBatchWriteResult:
         document_scope = _scope_document(tenant_id, knowledge_base_id, document_id)
         job = _identifier(job_id)
@@ -386,6 +590,8 @@ class PsycopgDocumentRegistryRepository:
             raise DocumentRegistryError(DocumentOperationPhase.FINALIZE)
         if not callable(vector_operation):
             raise DocumentRegistryError(DocumentOperationPhase.FINALIZE)
+        if cancellation_requested is not None and not callable(cancellation_requested):
+            raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
 
         def operation(connection: Connection[Any]) -> VectorBatchWriteResult:
             with connection.cursor() as cursor:
@@ -402,8 +608,14 @@ class PsycopgDocumentRegistryRepository:
                 ):
                     raise DocumentRegistryError(DocumentOperationPhase.FINALIZE)
 
+            if cancellation_requested is not None and cancellation_requested():
+                raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
+
             transaction = PsycopgPostgreSQLVectorTransaction(connection)
             result = vector_operation(transaction)
+
+            if cancellation_requested is not None and cancellation_requested():
+                raise DocumentRegistryError(DocumentOperationPhase.CANCEL)
 
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -481,17 +693,21 @@ def _fetch_one_entry(
     cursor: Any,
     query: str,
     parameters: tuple[object, ...],
+    phase: DocumentOperationPhase = DocumentOperationPhase.REGISTRY_CREATE,
 ) -> DocumentRegistryEntry | None:
     cursor.execute(query, parameters)
     rows = cursor.fetchall()
     if len(rows) > 1:
-        raise DocumentRegistryError(DocumentOperationPhase.REGISTRY_CREATE)
-    return None if not rows else _entry_from_row(rows[0])
+        raise DocumentRegistryError(phase)
+    return None if not rows else _entry_from_row(rows[0], phase)
 
 
-def _entry_from_row(raw: object) -> DocumentRegistryEntry:
+def _entry_from_row(
+    raw: object,
+    phase: DocumentOperationPhase = DocumentOperationPhase.REGISTRY_CREATE,
+) -> DocumentRegistryEntry:
     if not isinstance(raw, tuple) or len(raw) != 19:
-        raise DocumentRegistryError(DocumentOperationPhase.REGISTRY_CREATE)
+        raise DocumentRegistryError(phase)
     document = DocumentRegistryRecord(
         tenant_id=raw[0],
         knowledge_base_id=raw[1],
@@ -525,27 +741,39 @@ def _entry_from_row(raw: object) -> DocumentRegistryEntry:
     )
 
 
-def _scope(tenant_id: object, knowledge_base_id: object) -> tuple[str, str]:
-    return (_identifier(tenant_id), _identifier(knowledge_base_id))
+def _scope(
+    tenant_id: object,
+    knowledge_base_id: object,
+    phase: DocumentOperationPhase = DocumentOperationPhase.REGISTRY_CREATE,
+) -> tuple[str, str]:
+    return (_identifier(tenant_id, phase), _identifier(knowledge_base_id, phase))
 
 
 def _scope_document(
     tenant_id: object,
     knowledge_base_id: object,
     document_id: object,
+    phase: DocumentOperationPhase = DocumentOperationPhase.REGISTRY_CREATE,
 ) -> tuple[str, str, str]:
-    return (*_scope(tenant_id, knowledge_base_id), _identifier(document_id))
+    return (
+        *_scope(tenant_id, knowledge_base_id, phase),
+        _identifier(document_id, phase),
+    )
 
 
 def _scope_job(
     tenant_id: object,
     knowledge_base_id: object,
     job_id: object,
+    phase: DocumentOperationPhase = DocumentOperationPhase.REGISTRY_CREATE,
 ) -> tuple[str, str, str]:
-    return (*_scope(tenant_id, knowledge_base_id), _identifier(job_id))
+    return (*_scope(tenant_id, knowledge_base_id, phase), _identifier(job_id, phase))
 
 
-def _identifier(value: object) -> str:
+def _identifier(
+    value: object,
+    phase: DocumentOperationPhase = DocumentOperationPhase.REGISTRY_CREATE,
+) -> str:
     if (
         not isinstance(value, str)
         or value != value.strip()
@@ -553,7 +781,7 @@ def _identifier(value: object) -> str:
         or len(value) > 255
         or any(unicodedata.category(character).startswith("C") for character in value)
     ):
-        raise DocumentRegistryError(DocumentOperationPhase.REGISTRY_CREATE)
+        raise DocumentRegistryError(phase)
     return value
 
 
@@ -571,3 +799,7 @@ def _rollback_and_close(connection: Connection[Any]) -> None:
         connection.close()
     except Exception:
         pass
+
+
+def _phase_rank(phase: DocumentIngestionPhase) -> int:
+    return tuple(DocumentIngestionPhase).index(phase)

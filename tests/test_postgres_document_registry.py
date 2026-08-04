@@ -14,14 +14,23 @@ from app.ingestion.registry_models import (
 from app.vector_store.models import VectorBatchWriteResult
 
 
-def row(*, state: str = "QUEUED", ready: bool = False) -> tuple[object, ...]:
-    now = datetime.now(UTC)
+def row(
+    *,
+    state: str = "QUEUED",
+    ready: bool = False,
+    phase: str | None = None,
+    processed_chunks: int | None = None,
+    total_chunks: int = 1,
+    document_id: str = "doc-a",
+    now: datetime | None = None,
+) -> tuple[object, ...]:
+    now = datetime.now(UTC) if now is None else now
     started = now if state != "QUEUED" else None
     finished = now if state in {"SUCCEEDED", "FAILED"} else None
     return (
         "tenant-a",
         "kb-a",
-        "doc-a",
+        document_id,
         "guide.txt",
         "text/plain",
         10,
@@ -30,9 +39,11 @@ def row(*, state: str = "QUEUED", ready: bool = False) -> tuple[object, ...]:
         now if ready else None,
         "job-a",
         state,
-        "FINALIZE" if state == "SUCCEEDED" else "EMBEDDING",
-        1 if state == "SUCCEEDED" else 0,
-        1,
+        phase or ("FINALIZE" if state == "SUCCEEDED" else "EMBEDDING"),
+        (1 if state == "SUCCEEDED" else 0)
+        if processed_chunks is None
+        else processed_chunks,
+        total_chunks,
         1 if started else 0,
         now,
         started,
@@ -123,7 +134,14 @@ def test_create_document_and_job_commit_atomically_with_exact_scope() -> None:
         "a" * 64,
         "objects/server-1",
     )
-    assert executions[1][1] == ("tenant-a", "kb-a", "job-a", "doc-a", 1)
+    assert executions[1][1] == (
+        "tenant-a",
+        "kb-a",
+        "job-a",
+        "doc-a",
+        "EMBEDDING",
+        1,
+    )
 
 
 def test_duplicate_sha_returns_existing_identity_without_job_insert() -> None:
@@ -289,7 +307,7 @@ def test_listing_and_job_polling_are_scoped_and_deterministic() -> None:
     assert len(listed) == 1
     list_query, list_parameters = list_connection.cursor_value.executions[0]
     assert "ORDER BY documents.created_at_utc DESC, documents.document_id" in list_query
-    assert list_parameters == ("tenant-a", "kb-a")
+    assert list_parameters == ("tenant-a", "kb-a", 51)
 
     job_connection = FakeConnection([[row(state="PROCESSING")]])
     job = repository(job_connection).get_job(
@@ -301,3 +319,289 @@ def test_listing_and_job_polling_are_scoped_and_deterministic() -> None:
         "kb-a",
         "job-a",
     )
+
+
+def test_create_supports_explicit_staged_initial_phase() -> None:
+    connection = FakeConnection([[("doc-a",)], [row(phase="STORAGE", total_chunks=0)]])
+    repository(connection).create_or_get(
+        request(initial_phase=DocumentIngestionPhase.STORAGE, total_chunks=0)
+    )
+    assert connection.cursor_value.executions[1][1] == (
+        "tenant-a",
+        "kb-a",
+        "job-a",
+        "doc-a",
+        "STORAGE",
+        0,
+    )
+
+
+def test_processing_progress_moves_forward_and_sets_total_once() -> None:
+    connection = FakeConnection(
+        [
+            [row(state="PROCESSING", phase="EXTRACTION", total_chunks=0)],
+            [row(state="PROCESSING", phase="CHUNKING", total_chunks=2)],
+        ]
+    )
+    updated = repository(connection).update_processing_progress(
+        tenant_id="tenant-a",
+        knowledge_base_id="kb-a",
+        job_id="job-a",
+        phase=DocumentIngestionPhase.CHUNKING,
+        processed_chunks=0,
+        total_chunks=2,
+    )
+    assert updated is not None and updated.phase is DocumentIngestionPhase.CHUNKING
+    assert connection.cursor_value.executions[1][1] == (
+        "CHUNKING",
+        0,
+        2,
+        "tenant-a",
+        "kb-a",
+        "job-a",
+    )
+
+
+@pytest.mark.parametrize(
+    ("current", "requested"),
+    tuple(
+        zip(
+            tuple(DocumentIngestionPhase),
+            tuple(DocumentIngestionPhase)[1:],
+        )
+    ),
+)
+def test_every_adjacent_processing_phase_transition_is_allowed(
+    current: DocumentIngestionPhase,
+    requested: DocumentIngestionPhase,
+) -> None:
+    connection = FakeConnection(
+        [
+            [row(state="PROCESSING", phase=current.value)],
+            [row(state="PROCESSING", phase=requested.value)],
+        ]
+    )
+    updated = repository(connection).update_processing_progress(
+        tenant_id="tenant-a",
+        knowledge_base_id="kb-a",
+        job_id="job-a",
+        phase=requested,
+        processed_chunks=0,
+        total_chunks=1,
+    )
+    assert updated is not None and updated.phase is requested
+
+
+def test_processing_progress_cannot_decrease() -> None:
+    connection = FakeConnection(
+        [
+            [
+                row(
+                    state="PROCESSING",
+                    phase="EMBEDDING",
+                    processed_chunks=1,
+                    total_chunks=2,
+                )
+            ]
+        ]
+    )
+    with pytest.raises(DocumentRegistryError) as caught:
+        repository(connection).update_processing_progress(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            job_id="job-a",
+            phase=DocumentIngestionPhase.EMBEDDING,
+            processed_chunks=0,
+            total_chunks=2,
+        )
+    assert caught.value.phase is DocumentOperationPhase.PROGRESS
+
+
+@pytest.mark.parametrize(
+    ("current", "requested", "processed", "total"),
+    (
+        ("EMBEDDING", DocumentIngestionPhase.CHUNKING, 0, 2),
+        ("CHUNKING", DocumentIngestionPhase.CHUNKING, 0, 3),
+        ("CHUNKING", DocumentIngestionPhase.EMBEDDING, -1, 2),
+    ),
+)
+def test_invalid_progress_is_fixed_and_rolls_back(
+    current: str,
+    requested: DocumentIngestionPhase,
+    processed: int,
+    total: int,
+) -> None:
+    connection = FakeConnection(
+        [[row(state="PROCESSING", phase=current, total_chunks=2)]]
+    )
+    with pytest.raises(DocumentRegistryError) as caught:
+        repository(connection).update_processing_progress(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            job_id="job-a",
+            phase=requested,
+            processed_chunks=processed,
+            total_chunks=total,
+        )
+    assert caught.value.phase is DocumentOperationPhase.PROGRESS
+    assert connection.commits == 0
+
+
+@pytest.mark.parametrize("state", ("SUCCEEDED", "FAILED", "CANCELLED"))
+def test_terminal_jobs_reject_progress_and_cancellation(state: str) -> None:
+    progress_connection = FakeConnection(
+        [[row(state=state, ready=state == "SUCCEEDED")]]
+    )
+    with pytest.raises(DocumentRegistryError) as progress_error:
+        repository(progress_connection).update_processing_progress(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            job_id="job-a",
+            phase=DocumentIngestionPhase.FINALIZE,
+            processed_chunks=1,
+            total_chunks=1,
+        )
+    assert progress_error.value.phase is DocumentOperationPhase.PROGRESS
+
+    cancel_connection = FakeConnection([[row(state=state, ready=state == "SUCCEEDED")]])
+    with pytest.raises(DocumentRegistryError) as cancel_error:
+        repository(cancel_connection).mark_cancelled(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            job_id="job-a",
+            phase=DocumentIngestionPhase.FINALIZE,
+        )
+    assert cancel_error.value.phase is DocumentOperationPhase.CANCEL
+
+
+@pytest.mark.parametrize("state", ("QUEUED", "PROCESSING"))
+def test_active_job_cancellation_is_exact_scoped_and_reason_free(state: str) -> None:
+    connection = FakeConnection([[row(state=state)]])
+    assert repository(connection).mark_cancelled(
+        tenant_id="tenant-a",
+        knowledge_base_id="kb-a",
+        job_id="job-a",
+        phase=DocumentIngestionPhase.EMBEDDING,
+    )
+    query, parameters = connection.cursor_value.executions[1]
+    assert "state IN ('QUEUED', 'PROCESSING')" in query
+    assert parameters == ("EMBEDDING", "tenant-a", "kb-a", "job-a")
+    assert "reason" not in query.casefold() and "exception" not in query.casefold()
+
+
+def test_cross_scope_progress_and_cancel_are_non_disclosing() -> None:
+    progress_connection = FakeConnection([[]])
+    assert (
+        repository(progress_connection).update_processing_progress(
+            tenant_id="tenant-other",
+            knowledge_base_id="kb-a",
+            job_id="job-a",
+            phase=DocumentIngestionPhase.EMBEDDING,
+            processed_chunks=0,
+            total_chunks=1,
+        )
+        is None
+    )
+    cancel_connection = FakeConnection([[]])
+    assert not repository(cancel_connection).mark_cancelled(
+        tenant_id="tenant-other",
+        knowledge_base_id="kb-a",
+        job_id="job-a",
+        phase=DocumentIngestionPhase.EMBEDDING,
+    )
+
+
+def test_cancellation_inside_final_transaction_rolls_back_before_vectors() -> None:
+    connection = FakeConnection([[row(state="PROCESSING")]])
+    vector_calls: list[object] = []
+    with pytest.raises(DocumentRegistryError) as caught:
+        repository(connection).finalize_success(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            document_id="doc-a",
+            job_id="job-a",
+            total_chunks=1,
+            vector_operation=lambda transaction: vector_calls.append(transaction),  # type: ignore[arg-type,return-value]
+            cancellation_requested=lambda: True,
+        )
+    assert caught.value.phase is DocumentOperationPhase.CANCEL
+    assert vector_calls == []
+    assert connection.rollbacks == 1 and connection.commits == 0
+
+
+def test_cancellation_after_vector_callback_rolls_back_complete_batch() -> None:
+    connection = FakeConnection([[row(state="PROCESSING")]])
+    checks = iter((False, True))
+    vector_calls: list[object] = []
+
+    def write(transaction: object) -> VectorBatchWriteResult:
+        vector_calls.append(transaction)
+        return VectorBatchWriteResult(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            inserted_identities=(),
+            unchanged_identities=(),
+        )
+
+    with pytest.raises(DocumentRegistryError) as caught:
+        repository(connection).finalize_success(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            document_id="doc-a",
+            job_id="job-a",
+            total_chunks=1,
+            vector_operation=write,  # type: ignore[arg-type]
+            cancellation_requested=lambda: next(checks),
+        )
+    assert caught.value.phase is DocumentOperationPhase.CANCEL
+    assert len(vector_calls) == 1
+    assert len(connection.cursor_value.executions) == 1
+    assert connection.rollbacks == 1 and connection.commits == 0
+
+
+def test_keyset_listing_is_bounded_and_cursor_repr_hides_identity() -> None:
+    first_time = datetime(2026, 1, 2, tzinfo=UTC)
+    second_time = datetime(2026, 1, 1, tzinfo=UTC)
+    connection = FakeConnection(
+        [
+            [
+                row(document_id="doc-a", now=first_time),
+                row(document_id="doc-b", now=second_time),
+                row(document_id="doc-c", now=second_time),
+            ]
+        ]
+    )
+    page = repository(connection).list_document_page(
+        tenant_id="tenant-a", knowledge_base_id="kb-a", page_size=2
+    )
+    assert len(page.entries) == 2 and page.continuation is not None
+    assert "doc-b" not in repr(page.continuation)
+
+    next_connection = FakeConnection([[]])
+    repository(next_connection).list_document_page(
+        tenant_id="tenant-a",
+        knowledge_base_id="kb-a",
+        page_size=2,
+        cursor=page.continuation,
+    )
+    query, parameters = next_connection.cursor_value.executions[0]
+    assert "OFFSET" not in query
+    assert parameters == (
+        "tenant-a",
+        "kb-a",
+        second_time,
+        second_time,
+        "doc-b",
+        3,
+    )
+
+
+@pytest.mark.parametrize("page_size", (0, 51, True))
+def test_document_listing_rejects_invalid_page_size(page_size: object) -> None:
+    with pytest.raises(DocumentRegistryError) as caught:
+        repository(FakeConnection([])).list_document_page(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            page_size=page_size,  # type: ignore[arg-type]
+        )
+    assert caught.value.phase is DocumentOperationPhase.LIST

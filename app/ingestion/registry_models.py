@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -12,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 MAX_REGISTRY_IDENTIFIER_CHARACTERS = 255
 MAX_STORAGE_OBJECT_KEY_CHARACTERS = 512
 MAX_INGESTION_ATTEMPTS = 10
+MAX_DOCUMENT_LIST_PAGE_SIZE = 50
+MAX_CHUNK_COUNT = 2_147_483_647
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _STORAGE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9/_-]*$")
@@ -51,6 +54,9 @@ class DocumentOperationPhase(str, Enum):
     FINALIZE = "FINALIZE"
     RETRY = "RETRY"
     DELETE = "DELETE"
+    PROGRESS = "PROGRESS"
+    CANCEL = "CANCEL"
+    LIST = "LIST"
 
 
 _OPERATION_FAILURE_MESSAGES = {
@@ -80,6 +86,7 @@ class DocumentRegistryCreateRequest(BaseModel):
     sha256_hex: str
     storage_object_key: str
     total_chunks: int
+    initial_phase: DocumentIngestionPhase = DocumentIngestionPhase.EMBEDDING
 
     @field_validator("tenant_id", "knowledge_base_id", "document_id", "job_id")
     @classmethod
@@ -116,8 +123,22 @@ class DocumentRegistryCreateRequest(BaseModel):
     @field_validator("total_chunks")
     @classmethod
     def validate_total_chunks(cls, value: int) -> int:
-        if type(value) is not int or value <= 0:
-            raise ValueError("total_chunks must be positive")
+        if type(value) is not int or not 0 <= value <= MAX_CHUNK_COUNT:
+            raise ValueError("total_chunks is outside the allowed range")
+        return value
+
+    @field_validator("initial_phase")
+    @classmethod
+    def validate_initial_phase(
+        cls, value: DocumentIngestionPhase
+    ) -> DocumentIngestionPhase:
+        if value not in {
+            DocumentIngestionPhase.VALIDATION,
+            DocumentIngestionPhase.STORAGE,
+            DocumentIngestionPhase.EXTRACTION,
+            DocumentIngestionPhase.EMBEDDING,
+        }:
+            raise ValueError("initial_phase is invalid")
         return value
 
 
@@ -194,8 +215,8 @@ class DocumentIngestionJob(BaseModel):
     @field_validator("processed_chunks", "total_chunks", "attempt_count")
     @classmethod
     def validate_nonnegative(cls, value: int) -> int:
-        if type(value) is not int or value < 0:
-            raise ValueError("job counters must be nonnegative integers")
+        if type(value) is not int or not 0 <= value <= MAX_CHUNK_COUNT:
+            raise ValueError("job counters are outside the allowed range")
         return value
 
     @model_validator(mode="after")
@@ -277,6 +298,43 @@ class DocumentRegistryCreateResult(BaseModel):
 
     entry: DocumentRegistryEntry
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentListCursor:
+    """Opaque repository cursor; presentation code must never serialize it."""
+
+    _created_at_utc: datetime = field(repr=False)
+    _document_id: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        _aware_datetime(self._created_at_utc)
+        _bounded_identifier(self._document_id)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentListPage:
+    entries: tuple[DocumentRegistryEntry, ...]
+    continuation: DocumentListCursor | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple) or any(
+            not isinstance(entry, DocumentRegistryEntry) for entry in self.entries
+        ):
+            raise ValueError("document list entries are invalid")
+        if self.continuation is not None and not isinstance(
+            self.continuation, DocumentListCursor
+        ):
+            raise ValueError("document list continuation is invalid")
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __iter__(self):
+        return iter(self.entries)
+
+    def __getitem__(self, index: int) -> DocumentRegistryEntry:
+        return self.entries[index]
 
 
 class DocumentDeletionResult(BaseModel):

@@ -49,6 +49,35 @@ def test_create_request_accepts_only_scoped_lowercase_digest() -> None:
         create_request(media_type="application/octet-stream")
 
 
+@pytest.mark.parametrize(
+    "phase",
+    (
+        DocumentIngestionPhase.VALIDATION,
+        DocumentIngestionPhase.STORAGE,
+        DocumentIngestionPhase.EXTRACTION,
+    ),
+)
+def test_create_request_accepts_staged_initial_phases(
+    phase: DocumentIngestionPhase,
+) -> None:
+    assert create_request(initial_phase=phase, total_chunks=0).initial_phase is phase
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (
+        DocumentIngestionPhase.CHUNKING,
+        DocumentIngestionPhase.VECTOR_WRITE,
+        DocumentIngestionPhase.FINALIZE,
+    ),
+)
+def test_create_request_rejects_noninitial_phases(
+    phase: DocumentIngestionPhase,
+) -> None:
+    with pytest.raises(ValidationError):
+        create_request(initial_phase=phase)
+
+
 def test_registry_entry_derives_ready_state_without_digest_exposure() -> None:
     now = datetime.now(UTC)
     document = DocumentRegistryRecord(
