@@ -113,6 +113,9 @@ def test_success_writes_only_deterministic_result(
     assert console.out == "PostgreSQL RAG orchestration succeeded.\n"
     assert console.err == ""
     assert len(calls) == 1
+    assert calls[0]["structured_output_json_schema"] == (
+        cli.coaching_wire_json_schema()
+    )
 
 
 def test_empty_retrieval_writes_exact_null(

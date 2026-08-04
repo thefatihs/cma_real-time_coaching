@@ -1,0 +1,10 @@
+{
+  "rag_llm_enabled_labels": [
+    "urun_bilgisi"
+  ],
+  "title": "Sentetik ürün iade bilgisi",
+  "action": "RAG_ACTION",
+  "priority": "HIGH",
+  "label_id": "urun_bilgisi",
+  "expires_after_seconds": 60.0
+}

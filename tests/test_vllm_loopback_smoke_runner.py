@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import ssl
 import subprocess
 from pathlib import Path
 
@@ -268,11 +270,16 @@ def test_certificate_commands_use_exact_san_and_relative_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[tuple[list[str], Path]] = []
+    profiles: list[str] = []
 
     def fake_run(
         arguments: list[str], *, cwd: Path = subject.REPOSITORY_ROOT, **_kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         calls.append((arguments, cwd))
+        if "-extfile" in arguments:
+            profiles.append(
+                (cwd / arguments[arguments.index("-extfile") + 1]).read_text()
+            )
         if "x509" in arguments and "-ext" in arguments:
             return _completed(
                 arguments,
@@ -286,7 +293,12 @@ def test_certificate_commands_use_exact_san_and_relative_paths(
     monkeypatch.setattr(subject, "_run", fake_run)
     subject._generate_certificates(tmp_path)
     rendered = tuple(" ".join(arguments) for arguments, _cwd in calls)
-    assert any("subjectAltName=DNS:localhost,IP:127.0.0.1" in call for call in rendered)
+    assert any(
+        "basicConstraints=critical,CA:TRUE,pathlen:0" in call for call in rendered
+    )
+    assert profiles == [subject._SERVER_CERTIFICATE_EXTENSIONS]
+    assert "subjectAltName=DNS:localhost,IP:127.0.0.1" in profiles[0]
+    assert not (tmp_path / "server.ext").exists()
     assert all(str(tmp_path) not in call for call in rendered)
     assert all(cwd == tmp_path for _arguments, cwd in calls)
 
@@ -456,3 +468,170 @@ def test_protected_container_ids_are_exact_and_checked_after_cleanup() -> None:
     for container_id in subject.PROTECTED_CONTAINERS.values():
         assert len(container_id) == 64
     assert source.count("_protected_container_snapshot()") >= 2
+
+
+def _openssl(*arguments: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["openssl", *arguments],
+        cwd=cwd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=subject.SUBPROCESS_TIMEOUT_SECONDS,
+    )
+
+
+def _certificate_extension(directory: Path, certificate: str, name: str) -> str:
+    result = _openssl("x509", "-in", certificate, "-noout", "-ext", name, cwd=directory)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def _key_identifier(extension: str) -> str:
+    matched = re.search(r"(?:[0-9A-F]{2}:){19}[0-9A-F]{2}", extension)
+    assert matched is not None
+    return matched.group(0)
+
+
+def _complete_memory_bio_handshake(
+    client_context: ssl.SSLContext,
+    server_context: ssl.SSLContext,
+    *,
+    hostname: str,
+) -> None:
+    client_input = ssl.MemoryBIO()
+    client_output = ssl.MemoryBIO()
+    server_input = ssl.MemoryBIO()
+    server_output = ssl.MemoryBIO()
+    client = client_context.wrap_bio(
+        client_input,
+        client_output,
+        server_hostname=hostname,
+    )
+    server = server_context.wrap_bio(server_input, server_output, server_side=True)
+    client_complete = False
+    server_complete = False
+    for _ in range(20):
+        if not client_complete:
+            try:
+                client.do_handshake()
+                client_complete = True
+            except ssl.SSLWantReadError:
+                pass
+        client_bytes = client_output.read()
+        if client_bytes:
+            server_input.write(client_bytes)
+        if not server_complete:
+            try:
+                server.do_handshake()
+                server_complete = True
+            except ssl.SSLWantReadError:
+                pass
+        server_bytes = server_output.read()
+        if server_bytes:
+            client_input.write(server_bytes)
+        if client_complete and server_complete:
+            return
+    pytest.fail("in-memory TLS handshake did not complete")
+
+
+def test_generated_certificates_have_strict_extensions(tmp_path: Path) -> None:
+    subject._generate_certificates(tmp_path)
+
+    verified = _openssl(
+        "verify",
+        "-x509_strict",
+        "-CAfile",
+        "ca.crt",
+        "server.crt",
+        cwd=tmp_path,
+    )
+    assert verified.returncode == 0, verified.stderr
+    assert verified.stdout == "server.crt: OK\n"
+
+    ca_basic = _certificate_extension(tmp_path, "ca.crt", "basicConstraints")
+    ca_usage = _certificate_extension(tmp_path, "ca.crt", "keyUsage")
+    ca_ski = _certificate_extension(tmp_path, "ca.crt", "subjectKeyIdentifier")
+    ca_aki = _certificate_extension(tmp_path, "ca.crt", "authorityKeyIdentifier")
+    assert "X509v3 Basic Constraints: critical" in ca_basic
+    assert "CA:TRUE, pathlen:0" in ca_basic
+    assert "X509v3 Key Usage: critical" in ca_usage
+    assert "Certificate Sign, CRL Sign" in ca_usage
+    assert _key_identifier(ca_aki) == _key_identifier(ca_ski)
+
+    server_basic = _certificate_extension(tmp_path, "server.crt", "basicConstraints")
+    server_usage = _certificate_extension(tmp_path, "server.crt", "keyUsage")
+    server_eku = _certificate_extension(tmp_path, "server.crt", "extendedKeyUsage")
+    server_ski = _certificate_extension(tmp_path, "server.crt", "subjectKeyIdentifier")
+    server_aki = _certificate_extension(
+        tmp_path, "server.crt", "authorityKeyIdentifier"
+    )
+    server_san = _certificate_extension(tmp_path, "server.crt", "subjectAltName")
+    assert "X509v3 Basic Constraints: critical" in server_basic
+    assert "CA:FALSE" in server_basic
+    assert "X509v3 Key Usage: critical" in server_usage
+    assert "Digital Signature, Key Encipherment" in server_usage
+    assert "TLS Web Server Authentication" in server_eku
+    assert _key_identifier(server_ski) != _key_identifier(ca_ski)
+    assert _key_identifier(server_aki) == _key_identifier(ca_ski)
+    assert server_san.splitlines()[1].strip() == ("DNS:localhost, IP Address:127.0.0.1")
+
+
+def test_wrong_ca_and_hostname_still_fail(tmp_path: Path) -> None:
+    subject._generate_certificates(tmp_path)
+    wrong = tmp_path / "wrong"
+    wrong.mkdir()
+    subject._generate_certificates(wrong)
+
+    wrong_ca = _openssl(
+        "verify",
+        "-x509_strict",
+        "-CAfile",
+        str(wrong / "ca.crt"),
+        "server.crt",
+        cwd=tmp_path,
+    )
+    wrong_hostname = _openssl(
+        "verify",
+        "-x509_strict",
+        "-verify_hostname",
+        "wrong.invalid",
+        "-CAfile",
+        "ca.crt",
+        "server.crt",
+        cwd=tmp_path,
+    )
+    assert wrong_ca.returncode != 0
+    assert wrong_hostname.returncode != 0
+
+
+def test_python_ssl_context_strict_verification_when_supported(
+    tmp_path: Path,
+) -> None:
+    subject._generate_certificates(tmp_path)
+    wrong = tmp_path / "wrong"
+    wrong.mkdir()
+    subject._generate_certificates(wrong)
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(tmp_path / "server.crt", tmp_path / "server.key")
+
+    trusted = ssl.create_default_context(cafile=tmp_path / "ca.crt")
+    strict = getattr(ssl, "VERIFY_X509_STRICT", None)
+    if strict is not None:
+        trusted.verify_flags |= strict
+        assert trusted.verify_flags & strict
+    _complete_memory_bio_handshake(trusted, server_context, hostname="localhost")
+
+    wrong_hostname = ssl.create_default_context(cafile=tmp_path / "ca.crt")
+    if strict is not None:
+        wrong_hostname.verify_flags |= strict
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _complete_memory_bio_handshake(
+            wrong_hostname, server_context, hostname="wrong.invalid"
+        )
+
+    wrong_ca = ssl.create_default_context(cafile=wrong / "ca.crt")
+    if strict is not None:
+        wrong_ca.verify_flags |= strict
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _complete_memory_bio_handshake(wrong_ca, server_context, hostname="localhost")

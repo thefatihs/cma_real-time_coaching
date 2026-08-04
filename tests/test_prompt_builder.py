@@ -30,6 +30,7 @@ def request(**changes: object) -> PromptBuildRequest:
         "tenant_id": "tenant_alpha",
         "call_id": "call_001",
         "user_input": "Synthetic user question.",
+        "transcript_revision": 7,
         "retrieved_context": (),
     }
     values.update(changes)
@@ -118,6 +119,7 @@ def test_required_fields_reject_blank_values(
             "tenant_id": "tenant_alpha",
             "call_id": "call_001",
             "user_input": "Synthetic input.",
+            "transcript_revision": 7,
         },
         PromptBuildResult: {
             "tenant_id": "tenant_alpha",
@@ -137,6 +139,33 @@ def test_required_fields_reject_blank_values(
 def test_context_score_must_be_a_probability(score: float) -> None:
     with pytest.raises(ValidationError, match="between 0 and 1"):
         context("chunk_1", score=score)
+
+
+def test_prompt_demands_exact_result_gate_contract() -> None:
+    result = DeterministicPromptBuilder().build(
+        request(retrieved_context=(context("chunk_1", document_id="guide"),))
+    )
+
+    assert "Return exactly one JSON object" in result.system_prompt
+    assert "no markdown, prose, or code fences" in result.system_prompt
+    assert (
+        "decision, tenant_id, call_id, revision, action, title, suggestion, "
+        "priority, citations, source"
+    ) in result.system_prompt
+    assert "decision, tenant_id, call_id, revision" in result.system_prompt
+    assert "Copy trusted scope values exactly" in result.system_prompt
+    assert (
+        '{"tenant_id":"tenant_alpha","call_id":"call_001","revision":7}'
+        in result.user_prompt
+    )
+    assert '[{"document_id":"guide","chunk_id":"chunk_1"}]' in result.user_prompt
+    assert '"decision":"suggestion"' in result.user_prompt
+    assert '"decision":"no_suggestion"' in result.user_prompt
+
+
+def test_request_rejects_negative_transcript_revision() -> None:
+    with pytest.raises(ValidationError, match="transcript_revision cannot be negative"):
+        request(transcript_revision=-1)
 
 
 def test_models_are_immutable() -> None:

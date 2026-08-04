@@ -27,6 +27,74 @@ MAX_JSON_DEPTH = 8
 MAX_CITATIONS = 20
 
 
+def coaching_wire_json_schema() -> dict[str, object]:
+    """Return a fresh flattened schema for the untrusted coaching wire payload."""
+    citation = {
+        "type": "object",
+        "properties": {
+            "document_id": {"type": "string", "minLength": 1},
+            "chunk_id": {"type": "string", "minLength": 1},
+        },
+        "required": ["document_id", "chunk_id"],
+        "additionalProperties": False,
+    }
+    suggestion = {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["suggestion"]},
+            "tenant_id": {"type": "string", "minLength": 1},
+            "call_id": {"type": "string", "minLength": 1},
+            "revision": {"type": "integer", "minimum": 0},
+            "action": {
+                "type": "string",
+                "enum": [item.value for item in CoachingAction],
+            },
+            "title": {"type": "string", "minLength": 1, "maxLength": 120},
+            "suggestion": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+            },
+            "priority": {
+                "type": "string",
+                "enum": [item.value for item in SuggestionPriority],
+            },
+            "citations": {
+                "type": "array",
+                "items": citation,
+                "minItems": 1,
+                "maxItems": MAX_CITATIONS,
+            },
+            "source": {"type": "string", "enum": ["llm"]},
+        },
+        "required": [
+            "decision",
+            "tenant_id",
+            "call_id",
+            "revision",
+            "action",
+            "title",
+            "suggestion",
+            "priority",
+            "citations",
+            "source",
+        ],
+        "additionalProperties": False,
+    }
+    no_suggestion = {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["no_suggestion"]},
+            "tenant_id": {"type": "string", "minLength": 1},
+            "call_id": {"type": "string", "minLength": 1},
+            "revision": {"type": "integer", "minimum": 0},
+        },
+        "required": ["decision", "tenant_id", "call_id", "revision"],
+        "additionalProperties": False,
+    }
+    return {"oneOf": [suggestion, no_suggestion]}
+
+
 class LLMCoachingGateStatus(str, Enum):
     VALID_SUGGESTION = "valid_suggestion"
     VALID_NO_SUGGESTION = "valid_no_suggestion"

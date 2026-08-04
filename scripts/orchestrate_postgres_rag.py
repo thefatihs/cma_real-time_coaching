@@ -13,6 +13,7 @@ from typing import Any, NoReturn, cast
 import psycopg
 from pydantic import ValidationError
 
+from app.coaching.llm_result_gate import coaching_wire_json_schema
 from app.composition.postgres_rag import (
     KnowledgeBaseRAGProviderSettings,
     PostgreSQLVectorStoreSettings,
@@ -191,6 +192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             request=request,
             limits=limits,
             psycopg_connect=cast(Any, psycopg.connect),
+            structured_output_json_schema=coaching_wire_json_schema(),
         )
         _write_result(arguments.output, result)
     except Exception:

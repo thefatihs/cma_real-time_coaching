@@ -153,6 +153,13 @@ def _create_application_role() -> None:
                     "IN SCHEMA callmetric_vector TO {}"
                 ).format(sql.Identifier(APPLICATION_USER))
             )
+            cursor.execute(
+                sql.SQL(
+                    "GRANT DELETE ON TABLE "
+                    "callmetric_vector.vector_records, "
+                    "callmetric_vector.embedding_profiles TO {}"
+                ).format(sql.Identifier(APPLICATION_USER))
+            )
         connection.commit()
     finally:
         connection.close()
@@ -266,6 +273,86 @@ def _require_profile_ingestion_and_retrieval() -> None:
     ) == (("synthetic-document", "chunk_000001"),)
 
 
+def _require_exact_cleanup_privileges() -> None:
+    application_password = _required_environment(
+        "CALLMETRIC_POSTGRES_TLS_APPLICATION_PASSWORD"
+    )
+    connection = _connect(
+        user=APPLICATION_USER,
+        password=application_password,
+        root_certificate=_certificate_path(),
+    )
+    try:
+        with connection.cursor() as cursor:
+            for table in ("embedding_profiles", "vector_records"):
+                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                    cursor.execute(
+                        "SELECT has_table_privilege(current_user, %s, %s)",
+                        (f"callmetric_vector.{table}", privilege),
+                    )
+                    assert cursor.fetchall() == [(True,)]
+            cursor.execute(
+                "SELECT has_table_privilege("
+                "current_user, 'callmetric_vector.schema_migrations', 'DELETE')"
+            )
+            assert cursor.fetchall() == [(False,)]
+            cursor.execute(
+                "INSERT INTO callmetric_vector.embedding_profiles "
+                "(tenant_id, knowledge_base_id, model_id, vector_dimension, "
+                "normalize_embeddings, distance_metric) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    "tenant_alpha",
+                    "kb_smoke",
+                    "synthetic-cleanup-model",
+                    2,
+                    True,
+                    "cosine",
+                ),
+            )
+            cursor.execute(
+                "INSERT INTO callmetric_vector.vector_records "
+                "(tenant_id, knowledge_base_id, document_id, chunk_id, text, "
+                "vector_dimension, embedding, metadata_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    "tenant_alpha",
+                    "kb_smoke",
+                    "synthetic-cleanup-document",
+                    "chunk_000001",
+                    "Synthetic cleanup privilege evidence.",
+                    2,
+                    "[1,0]",
+                    "[]",
+                ),
+            )
+            cursor.execute(
+                "DELETE FROM callmetric_vector.vector_records "
+                "WHERE tenant_id = %s AND knowledge_base_id = %s",
+                ("tenant_alpha", "kb_smoke"),
+            )
+            cursor.execute(
+                "DELETE FROM callmetric_vector.embedding_profiles "
+                "WHERE tenant_id = %s AND knowledge_base_id = %s",
+                ("tenant_alpha", "kb_smoke"),
+            )
+            for table in ("vector_records", "embedding_profiles"):
+                query = sql.SQL(
+                    "SELECT count(*) FROM callmetric_vector.{} "
+                    "WHERE tenant_id = %s AND knowledge_base_id = %s"
+                ).format(sql.Identifier(table))
+                cursor.execute(query, ("tenant_alpha", "kb_smoke"))
+                assert cursor.fetchall() == [(0,)]
+                cursor.execute(query, ("tenant-tls-smoke", "kb-tls-smoke"))
+                assert cursor.fetchall() == [(1,)]
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def test_postgres_tls_smoke_end_to_end() -> None:
     if os.environ.get("CALLMETRIC_POSTGRES_TLS_SMOKE") != "1":
         pytest.skip("requires the opt-in PostgreSQL TLS smoke runner")
@@ -275,3 +362,4 @@ def test_postgres_tls_smoke_end_to_end() -> None:
     _create_application_role()
     _require_tls_for_application_role()
     _require_profile_ingestion_and_retrieval()
+    _require_exact_cleanup_privileges()
