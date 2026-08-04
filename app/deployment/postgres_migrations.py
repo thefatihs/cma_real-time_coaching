@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
@@ -17,17 +18,49 @@ from app.composition.postgres_rag import PsycopgConnect
 from app.vector_store.postgres.readiness import PostgreSQLSchemaReadinessChecker
 
 _APPLICATION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
-_MIGRATION_VERSION = "0001"
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-_MIGRATION_PATH = _REPOSITORY_ROOT / "migrations" / "postgres" / "0001_vector_store.sql"
-_MIGRATION_SHA256 = "deae3547544dac4d31c37b0b6e214cc1e54e5e2c164341323de8e1cf75c82aa7"
 _MIGRATION_LOCK_KEY = -4795186792673390552
 _EXPECTED_EXTENSION_VERSION = "0.8.5"
-_EXPECTED_TABLES = (
-    "embedding_profiles",
-    "schema_migrations",
-    "vector_records",
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredMigration:
+    version: str
+    relative_path: str
+    sha256: str
+    expected_tables_after: tuple[str, ...]
+
+
+_MIGRATIONS = (
+    _RegisteredMigration(
+        version="0001",
+        relative_path="migrations/postgres/0001_vector_store.sql",
+        sha256="deae3547544dac4d31c37b0b6e214cc1e54e5e2c164341323de8e1cf75c82aa7",
+        expected_tables_after=(
+            "embedding_profiles",
+            "schema_migrations",
+            "vector_records",
+        ),
+    ),
+    _RegisteredMigration(
+        version="0002",
+        relative_path="migrations/postgres/0002_document_registry.sql",
+        sha256="7312cd3675b08a3ba645d382d54426afa49542953f28ae23050e44ff7690b6fb",
+        expected_tables_after=(
+            "document_ingestion_jobs",
+            "documents",
+            "embedding_profiles",
+            "schema_migrations",
+            "vector_records",
+        ),
+    ),
 )
+
+# Compatibility aliases retained for callers and tests that verify immutable 0001.
+_MIGRATION_VERSION = _MIGRATIONS[0].version
+_MIGRATION_PATH = _REPOSITORY_ROOT / _MIGRATIONS[0].relative_path
+_MIGRATION_SHA256 = _MIGRATIONS[0].sha256
+_EXPECTED_TABLES = _MIGRATIONS[-1].expected_tables_after
 
 _LOCK_SQL = "SELECT pg_catalog.pg_advisory_lock(%s)"
 _EXTENSION_SQL = """
@@ -127,14 +160,14 @@ def apply_postgres_vector_migrations(
     settings: PostgreSQLMigrationSettings,
     psycopg_connect: PsycopgConnect,
 ) -> PostgreSQLMigrationResult:
-    """Apply the fixed migration or validate an identical prior application."""
+    """Apply ordered registered migrations or validate an identical application."""
     if not isinstance(settings, PostgreSQLMigrationSettings):
         raise PostgreSQLMigrationConfigurationError(
             "settings must be PostgreSQLMigrationSettings"
         )
     if not callable(psycopg_connect):
         raise PostgreSQLMigrationConfigurationError("psycopg_connect must be callable")
-    migration_sql = _load_registered_migration()
+    migration_sql = _load_registered_migrations()
     options = _connection_options(settings)
 
     def connect() -> Connection[Any]:
@@ -151,11 +184,16 @@ def apply_postgres_vector_migrations(
     try:
         if connection.autocommit is not False:
             raise ValueError("connection.autocommit must be exactly False")
-        state = _inspect_locked_state(connection)
+        applied_versions = _inspect_locked_state(connection)
         connection.rollback()
-        if state is PostgreSQLMigrationResult.APPLIED:
+        pending = tuple(
+            (migration, sql_text)
+            for migration, sql_text in zip(_MIGRATIONS, migration_sql, strict=True)
+            if migration.version not in applied_versions
+        )
+        for _migration, sql_text in pending:
             with connection.cursor() as cursor:
-                cursor.execute(cast(Any, migration_sql), prepare=False)
+                cursor.execute(cast(Any, sql_text), prepare=False)
             if connection.info.transaction_status is not TransactionStatus.IDLE:
                 raise ValueError(
                     "migration did not complete its transaction boundary",
@@ -169,7 +207,11 @@ def apply_postgres_vector_migrations(
         _raise_after_cleanup(connection, primary)
 
     connection.close()
-    return state
+    return (
+        PostgreSQLMigrationResult.APPLIED
+        if pending
+        else PostgreSQLMigrationResult.ALREADY_APPLIED
+    )
 
 
 def _connection_options(settings: PostgreSQLMigrationSettings) -> str:
@@ -193,7 +235,16 @@ def _timeout_milliseconds(seconds: object) -> int:
 
 
 def _load_registered_migration() -> str:
-    path = _MIGRATION_PATH.resolve()
+    """Load immutable 0001 for compatibility with existing focused tests."""
+    return _load_registered_migration_entry(_MIGRATIONS[0])
+
+
+def _load_registered_migrations() -> tuple[str, ...]:
+    return tuple(_load_registered_migration_entry(item) for item in _MIGRATIONS)
+
+
+def _load_registered_migration_entry(migration: _RegisteredMigration) -> str:
+    path = (_REPOSITORY_ROOT / migration.relative_path).resolve()
     repository_root = _REPOSITORY_ROOT.resolve()
     if path.parent != (repository_root / "migrations" / "postgres").resolve():
         raise PostgreSQLMigrationConfigurationError(
@@ -224,7 +275,7 @@ def _load_registered_migration() -> str:
             "registered migration contains a conflict marker"
         )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if digest != _MIGRATION_SHA256:
+    if digest != migration.sha256:
         raise PostgreSQLMigrationConfigurationError(
             "registered migration integrity check failed"
         )
@@ -233,7 +284,7 @@ def _load_registered_migration() -> str:
 
 def _inspect_locked_state(
     connection: Connection[Any],
-) -> PostgreSQLMigrationResult:
+) -> tuple[str, ...]:
     with connection.cursor() as cursor:
         cursor.execute(_LOCK_SQL, (_MIGRATION_LOCK_KEY,))
         _require_void_result(cursor.fetchall(), "migration advisory lock")
@@ -249,22 +300,24 @@ def _inspect_locked_state(
         cursor.execute(_SCHEMA_SQL, ("callmetric_vector",))
         schema_rows = _text_rows(cursor.fetchall(), "migration schema")
         if not schema_rows:
-            return PostgreSQLMigrationResult.APPLIED
+            return ()
         if schema_rows != ("callmetric_vector",):
             raise ValueError("migration schema state is malformed")
         if extension_rows != (_EXPECTED_EXTENSION_VERSION,):
             raise ValueError("vector extension is missing from applied schema")
 
-        cursor.execute(_TABLES_SQL, ("callmetric_vector",))
-        table_rows = _text_rows(cursor.fetchall(), "migration tables")
-        if table_rows != _EXPECTED_TABLES:
-            raise ValueError("migration table state is incomplete or unexpected")
-
         cursor.execute(_LEDGER_SQL)
         ledger_rows = _text_rows(cursor.fetchall(), "migration ledger")
-        if ledger_rows != (_MIGRATION_VERSION,):
+        registered_versions = tuple(item.version for item in _MIGRATIONS)
+        if not ledger_rows or ledger_rows != registered_versions[: len(ledger_rows)]:
             raise ValueError("migration ledger state is incompatible")
-        return PostgreSQLMigrationResult.ALREADY_APPLIED
+        expected_tables = _MIGRATIONS[len(ledger_rows) - 1].expected_tables_after
+
+        cursor.execute(_TABLES_SQL, ("callmetric_vector",))
+        table_rows = _text_rows(cursor.fetchall(), "migration tables")
+        if table_rows != expected_tables:
+            raise ValueError("migration table state is incomplete or unexpected")
+        return ledger_rows
 
 
 def _text_rows(value: object, field_name: str) -> tuple[str, ...]:

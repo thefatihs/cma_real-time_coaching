@@ -47,6 +47,24 @@ The model is not downloaded during dashboard startup.
 `trust_remote_code` remains false. Deterministic fake embeddings validate
 wiring only and do not constitute a real embedding smoke test.
 
+## Document-registry schema
+
+The forward-only PostgreSQL migrator uses a fixed, ordered, digest-pinned
+manifest. It applies `0001_vector_store.sql` before
+`0002_document_registry.sql`, records both versions in
+`callmetric_vector.schema_migrations`, rejects altered migration content, and
+performs no arbitrary migration-file discovery or downgrade execution.
+
+Migration `0002` adds tenant- and knowledge-base-scoped `documents` and
+`document_ingestion_jobs` tables. Document SHA-256 uniqueness is scoped to one
+tenant and knowledge base. Jobs have fixed states and phases, bounded progress
+and attempts, and are deleted automatically with their exact parent document.
+The migration does not alter, delete, rewrite, or add a document foreign key to
+legacy `vector_records`; the existing embedding profile and vector behavior is
+unchanged. These tables provide persistence only. Dashboard document upload,
+extraction, embedding workers, object storage, and document services are not
+implemented by this migration.
+
 ## External PostgreSQL requirement
 
 Real smoke testing requires an externally managed PostgreSQL/pgvector endpoint
@@ -81,11 +99,11 @@ names. Application and migration connections use `localhost`,
 `sslmode=verify-full`, and that run's private trust root. The test also proves
 that missing trust and a mismatched hostname fail closed.
 
-The TLS smoke applies migration `0001` and verifies an idempotent second
-application, schema readiness, exact profile registration, deterministic
-synthetic ingestion and tenant-scoped retrieval. Its synthetic embedding
-backend validates database wiring only; it is not a real embedding-model smoke
-test.
+The TLS smoke applies the ordered `0001` and `0002` migrations and verifies an
+idempotent second application, schema readiness, exact profile registration,
+deterministic synthetic ingestion and tenant-scoped retrieval. Its synthetic
+embedding backend validates database wiring only; it is not a real
+embedding-model smoke test.
 
 All passwords, DSNs, private keys, certificates and temporary paths are
 generated for one invocation and remain outside Git. The controller always

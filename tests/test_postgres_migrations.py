@@ -150,12 +150,28 @@ def _applied_responses() -> list[object]:
         [(None,)],
         [("0.8.5",)],
         [("callmetric_vector",)],
+        [("0001",), ("0002",)],
+        [
+            ("document_ingestion_jobs",),
+            ("documents",),
+            ("embedding_profiles",),
+            ("schema_migrations",),
+            ("vector_records",),
+        ],
+    ]
+
+
+def _version_one_responses() -> list[object]:
+    return [
+        [(None,)],
+        [("0.8.5",)],
+        [("callmetric_vector",)],
+        [("0001",)],
         [
             ("embedding_profiles",),
             ("schema_migrations",),
             ("vector_records",),
         ],
-        [("0001",)],
     ]
 
 
@@ -244,6 +260,17 @@ def test_registry_path_version_and_digest_are_fixed() -> None:
         "deae3547544dac4d31c37b0b6e214cc1e54e5e2c164341323de8e1cf75c82aa7"
     )
     assert migrations._MIGRATION_LOCK_KEY == -4795186792673390552  # noqa: SLF001
+    assert [item.version for item in migrations._MIGRATIONS] == [  # noqa: SLF001
+        "0001",
+        "0002",
+    ]
+    assert [item.relative_path for item in migrations._MIGRATIONS] == [  # noqa: SLF001
+        "migrations/postgres/0001_vector_store.sql",
+        "migrations/postgres/0002_document_registry.sql",
+    ]
+    assert migrations._MIGRATIONS[1].sha256 == (  # noqa: SLF001
+        "7312cd3675b08a3ba645d382d54426afa49542953f28ae23050e44ff7690b6fb"
+    )
 
 
 @pytest.mark.parametrize(
@@ -297,6 +324,22 @@ def test_crlf_canonicalization_preserves_registered_digest(
     )
 
     assert migrations._load_registered_migration() == original  # noqa: SLF001
+
+
+def test_document_registry_digest_mismatch_is_rejected() -> None:
+    registered = migrations._MIGRATIONS[1]  # noqa: SLF001
+    drifted = migrations._RegisteredMigration(  # noqa: SLF001
+        version=registered.version,
+        relative_path=registered.relative_path,
+        sha256="0" * 64,
+        expected_tables_after=registered.expected_tables_after,
+    )
+
+    with pytest.raises(
+        migrations.PostgreSQLMigrationConfigurationError,
+        match="integrity check failed",
+    ):
+        migrations._load_registered_migration_entry(drifted)  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -353,9 +396,11 @@ def test_fresh_state_executes_whole_file_after_rollback_then_readiness(
         (migrations._EXTENSION_SQL, ("vector",)),  # noqa: SLF001
         (migrations._SCHEMA_SQL, ("callmetric_vector",)),  # noqa: SLF001
     ]
-    script_call = migration_connection.calls[3]
-    assert script_call[1:] == ("prepare", False)
-    assert script_call[0] == migrations._load_registered_migration()  # noqa: SLF001
+    script_calls = migration_connection.calls[3:5]
+    assert all(call[1:] == ("prepare", False) for call in script_calls)
+    assert [call[0] for call in script_calls] == list(
+        migrations._load_registered_migrations()  # noqa: SLF001
+    )
     assert migration_connection.lifecycle.index("rollback") < len(
         migration_connection.calls
     )
@@ -397,12 +442,34 @@ def test_applied_state_skips_script_and_returns_already_applied(
 
     assert result is PostgreSQLMigrationResult.ALREADY_APPLIED
     assert all(
-        call[0] != migrations._load_registered_migration()
+        call[0] not in migrations._load_registered_migrations()  # noqa: SLF001
         for call in migration_connection.calls
-    )  # noqa: E501, SLF001
+    )
     assert migration_connection.rollback_calls == 1
     assert migration_connection.commit_calls == 0
     assert events == ["readiness-construction", "readiness"]
+
+
+def test_version_one_state_applies_only_document_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration_connection = FakeConnection(_version_one_responses())
+    readiness_connection = FakeConnection([])
+    connect = FakeConnect([migration_connection, readiness_connection])
+    _install_readiness(monkeypatch, [])
+
+    result = apply_postgres_vector_migrations(
+        settings=_settings(),
+        psycopg_connect=connect,
+    )
+
+    assert result is PostgreSQLMigrationResult.APPLIED
+    script_calls = [
+        call for call in migration_connection.calls if call[1:] == ("prepare", False)
+    ]
+    assert script_calls == [
+        (migrations._load_registered_migrations()[1], "prepare", False)  # noqa: SLF001
+    ]
 
 
 def test_exact_generated_options_are_passed_to_both_connections(
@@ -448,29 +515,20 @@ def test_timeout_milliseconds_rejects_nonvalidated_values(seconds: object) -> No
             [(None,)],
             [("0.8.5",)],
             [("callmetric_vector",)],
+            [("0001",)],
             [("embedding_profiles",), ("vector_records",)],
         ],
         [
             [(None,)],
             [("0.8.5",)],
             [("callmetric_vector",)],
-            [
-                ("embedding_profiles",),
-                ("schema_migrations",),
-                ("vector_records",),
-            ],
             [],
         ],
         [
             [(None,)],
             [("0.8.5",)],
             [("callmetric_vector",)],
-            [
-                ("embedding_profiles",),
-                ("schema_migrations",),
-                ("vector_records",),
-            ],
-            [("0001",), ("0002",)],
+            [("0001",), ("0003",)],
         ],
     ],
     ids=[

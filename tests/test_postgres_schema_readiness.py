@@ -30,19 +30,30 @@ def _required_constraint_rows() -> list[tuple[object, ...]]:
     ]
 
 
+def _required_index_rows() -> list[tuple[object, ...]]:
+    return [
+        (table, index)
+        for table, indexes in readiness._REQUIRED_INDEXES.items()  # noqa: SLF001
+        for index in sorted(indexes)
+    ]
+
+
 def _ready_responses() -> list[object]:
     responses: list[object] = [
         [(1,)],
         [("0.8.5",)],
         [("callmetric_vector",)],
         [
+            ("document_ingestion_jobs",),
+            ("documents",),
             ("embedding_profiles",),
             ("schema_migrations",),
             ("vector_records",),
         ],
-        [("0001",)],
+        [("0001",), ("0002",)],
         _required_column_rows(),
         _required_constraint_rows(),
+        _required_index_rows(),
     ]
     return responses
 
@@ -213,22 +224,45 @@ def test_success_uses_exact_fixed_order_then_rolls_back_and_closes() -> None:
             readiness._TABLES_SQL,  # noqa: SLF001
             (
                 "callmetric_vector",
-                ["embedding_profiles", "schema_migrations", "vector_records"],
+                [
+                    "document_ingestion_jobs",
+                    "documents",
+                    "embedding_profiles",
+                    "schema_migrations",
+                    "vector_records",
+                ],
             ),
         ),
-        (readiness._MIGRATION_SQL, ("0001",)),  # noqa: SLF001
+        (readiness._MIGRATION_SQL,),  # noqa: SLF001
         (
             readiness._COLUMNS_SQL,  # noqa: SLF001
             (
                 "callmetric_vector",
-                ["embedding_profiles", "vector_records"],
+                [
+                    "embedding_profiles",
+                    "documents",
+                    "document_ingestion_jobs",
+                    "vector_records",
+                ],
             ),
         ),
         (
             readiness._CONSTRAINTS_SQL,  # noqa: SLF001
             (
                 "callmetric_vector",
-                ["embedding_profiles", "vector_records"],
+                [
+                    "documents",
+                    "document_ingestion_jobs",
+                    "embedding_profiles",
+                    "vector_records",
+                ],
+            ),
+        ),
+        (
+            readiness._INDEXES_SQL,  # noqa: SLF001
+            (
+                "callmetric_vector",
+                ["documents", "document_ingestion_jobs"],
             ),
         ),
     ]
@@ -309,6 +343,16 @@ def test_exact_catalog_checks_fail_closed(
             _required_constraint_rows() + [_required_constraint_rows()[0]],
             "duplicate",
         ),
+        (7, [], "indexes"),
+        (
+            7,
+            [
+                row
+                for row in _required_index_rows()
+                if row != ("documents", "documents_scope_created_document_index")
+            ],
+            "indexes",
+        ),
     ],
     ids=[
         "no-columns",
@@ -317,6 +361,8 @@ def test_exact_catalog_checks_fail_closed(
         "no-constraints",
         "missing-constraint",
         "duplicate-constraint",
+        "no-indexes",
+        "missing-index",
     ],
 )
 def test_required_column_and_constraint_subsets_fail_closed(

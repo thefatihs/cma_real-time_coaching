@@ -283,7 +283,7 @@ def test_migration_extension_schema_ledger_and_tables(
         cursor.execute(
             "SELECT version FROM callmetric_vector.schema_migrations ORDER BY version"
         )
-        assert cursor.fetchall() == [("0001",)]
+        assert cursor.fetchall() == [("0001",), ("0002",)]
         cursor.execute(
             """
             SELECT table_name
@@ -293,6 +293,8 @@ def test_migration_extension_schema_ledger_and_tables(
             """
         )
         assert cursor.fetchall() == [
+            ("document_ingestion_jobs",),
+            ("documents",),
             ("embedding_profiles",),
             ("schema_migrations",),
             ("vector_records",),
@@ -309,6 +311,158 @@ def test_production_migration_serializes_and_is_idempotent(
         PostgreSQLMigrationResult.ALREADY_APPLIED.value,
         PostgreSQLMigrationResult.APPLIED.value,
     ]
+
+
+def test_document_registry_scope_constraints_cascade_and_legacy_vector_isolation(
+    settings: PostgreSQLTestSettings,
+) -> None:
+    scopes = (
+        _profile("registry-primary"),
+        _profile(
+            "registry-tenant",
+            tenant_id="tenant-registry-other",
+            knowledge_base_id="kb-registry-primary",
+        ),
+        _profile(
+            "registry-kb",
+            tenant_id="tenant-registry-primary",
+            knowledge_base_id="kb-registry-other",
+        ),
+    )
+    repository = _repository(settings)
+    for profile in scopes:
+        repository.register_profile(profile)
+
+    primary = scopes[0]
+    _store(settings, primary).upsert(
+        _record(
+            primary,
+            document_id="document-registry-primary",
+            chunk_id="chunk-existing",
+            text="Synthetic existing vector",
+        )
+    )
+    digest = "a" * 64
+    with _connect(settings) as connection, connection.cursor() as cursor:
+        for index, profile in enumerate(scopes, start=1):
+            cursor.execute(
+                """
+                INSERT INTO callmetric_vector.documents (
+                    tenant_id, knowledge_base_id, document_id,
+                    original_filename, media_type, byte_size, sha256_hex,
+                    storage_object_key
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    profile.tenant_id,
+                    profile.knowledge_base_id,
+                    (
+                        "document-registry-primary"
+                        if index == 1
+                        else f"document-registry-{index}"
+                    ),
+                    f"synthetic-{index}.txt",
+                    "text/plain",
+                    index,
+                    digest,
+                    f"registry/{index}",
+                ),
+            )
+        cursor.execute(
+            """
+            INSERT INTO callmetric_vector.document_ingestion_jobs (
+                tenant_id, knowledge_base_id, job_id, document_id,
+                state, phase
+            ) VALUES (%s, %s, %s, %s, 'QUEUED', 'VALIDATION')
+            """,
+            (
+                primary.tenant_id,
+                primary.knowledge_base_id,
+                "job-registry-primary",
+                "document-registry-primary",
+            ),
+        )
+
+    with (
+        _connect(settings) as connection,
+        pytest.raises(psycopg.errors.UniqueViolation),
+        connection.cursor() as cursor,
+    ):
+        cursor.execute(
+            """
+            INSERT INTO callmetric_vector.documents (
+                tenant_id, knowledge_base_id, document_id,
+                original_filename, media_type, byte_size, sha256_hex,
+                storage_object_key
+            ) VALUES (%s, %s, %s, 'duplicate.txt', 'text/plain', 1, %s, %s)
+            """,
+            (
+                primary.tenant_id,
+                primary.knowledge_base_id,
+                "document-registry-duplicate",
+                digest,
+                "registry/duplicate",
+            ),
+        )
+
+    with (
+        _connect(settings) as connection,
+        pytest.raises(psycopg.errors.ForeignKeyViolation),
+        connection.cursor() as cursor,
+    ):
+        cursor.execute(
+            """
+            INSERT INTO callmetric_vector.document_ingestion_jobs (
+                tenant_id, knowledge_base_id, job_id, document_id,
+                state, phase
+            ) VALUES (%s, %s, %s, %s, 'QUEUED', 'VALIDATION')
+            """,
+            (
+                scopes[1].tenant_id,
+                scopes[1].knowledge_base_id,
+                "job-cross-scope",
+                "document-registry-primary",
+            ),
+        )
+
+    with _connect(settings) as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """
+            DELETE FROM callmetric_vector.documents
+            WHERE tenant_id = %s AND knowledge_base_id = %s AND document_id = %s
+            """,
+            (
+                primary.tenant_id,
+                primary.knowledge_base_id,
+                "document-registry-primary",
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT count(*) FROM callmetric_vector.document_ingestion_jobs
+            WHERE tenant_id = %s AND knowledge_base_id = %s AND document_id = %s
+            """,
+            (
+                primary.tenant_id,
+                primary.knowledge_base_id,
+                "document-registry-primary",
+            ),
+        )
+        assert cursor.fetchone() == (0,)
+        cursor.execute(
+            """
+            SELECT text FROM callmetric_vector.vector_records
+            WHERE tenant_id = %s AND knowledge_base_id = %s
+              AND document_id = %s AND chunk_id = %s
+            """,
+            (
+                primary.tenant_id,
+                primary.knowledge_base_id,
+                "document-registry-primary",
+                "chunk-existing",
+            ),
+        )
+        assert cursor.fetchone() == ("Synthetic existing vector",)
 
 
 def test_schema_readiness_and_explicit_composed_profile_provisioning(
