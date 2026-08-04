@@ -34,6 +34,10 @@ class DocumentRegistryRepository(Protocol):
         self, *, tenant_id: str, knowledge_base_id: str
     ) -> tuple[DocumentRegistryEntry, ...]: ...
 
+    def list_storage_object_keys(
+        self, *, tenant_id: str, knowledge_base_id: str
+    ) -> tuple[str, ...]: ...
+
     def list_document_page(
         self,
         *,

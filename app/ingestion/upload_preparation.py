@@ -85,6 +85,37 @@ class PreparedUploadDocument:
         return self.ingestion_request.chunks
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedUploadEnvelope:
+    """Immutable, bounded upload bytes plus safe display metadata."""
+
+    original_filename: str
+    media_type: str
+    byte_size: int
+    sha256_hex: str
+    content: bytes
+
+
+def validate_upload_envelope(
+    *,
+    content: bytes,
+    original_filename: str,
+    declared_media_type: str,
+) -> ValidatedUploadEnvelope:
+    """Validate upload metadata and bytes without parsing document content."""
+    filename, media_type = _validated_filename_and_media_type(
+        original_filename, declared_media_type
+    )
+    upload_bytes = _validated_content(content)
+    return ValidatedUploadEnvelope(
+        original_filename=filename,
+        media_type=media_type,
+        byte_size=len(upload_bytes),
+        sha256_hex=hashlib.sha256(upload_bytes).hexdigest(),
+        content=upload_bytes,
+    )
+
+
 def prepare_upload_document(
     *,
     content: bytes,
@@ -96,15 +127,38 @@ def prepare_upload_document(
     max_chunk_characters: int = DEFAULT_UPLOAD_CHUNK_CHARACTERS,
 ) -> PreparedUploadDocument:
     """Validate, extract and deterministically chunk one in-memory document."""
+    envelope = validate_upload_envelope(
+        content=content,
+        original_filename=original_filename,
+        declared_media_type=declared_media_type,
+    )
+    return prepare_validated_upload_document(
+        envelope=envelope,
+        document_id=document_id,
+        tenant_id=tenant_id,
+        knowledge_base_id=knowledge_base_id,
+        max_chunk_characters=max_chunk_characters,
+    )
+
+
+def prepare_validated_upload_document(
+    *,
+    envelope: ValidatedUploadEnvelope,
+    document_id: str,
+    tenant_id: str,
+    knowledge_base_id: str,
+    max_chunk_characters: int = DEFAULT_UPLOAD_CHUNK_CHARACTERS,
+) -> PreparedUploadDocument:
+    """Extract and chunk a previously validated immutable upload envelope."""
+    if not isinstance(envelope, ValidatedUploadEnvelope):
+        raise UploadDocumentPreparationError(UploadDocumentFailure.INVALID_ENCODING)
     tenant = _trusted_identifier(tenant_id)
     knowledge_base = _trusted_identifier(knowledge_base_id)
     server_document_id = _trusted_identifier(document_id)
-    filename, media_type = _validated_filename_and_media_type(
-        original_filename,
-        declared_media_type,
-    )
-    upload_bytes = _validated_content(content)
-    digest = hashlib.sha256(upload_bytes).hexdigest()
+    filename = envelope.original_filename
+    media_type = envelope.media_type
+    upload_bytes = envelope.content
+    digest = envelope.sha256_hex
     chunk_size = _positive_chunk_limit(max_chunk_characters)
 
     base_metadata = (
@@ -140,7 +194,7 @@ def prepare_upload_document(
         document_id=server_document_id,
         original_filename=filename,
         media_type=media_type,
-        byte_size=len(upload_bytes),
+        byte_size=envelope.byte_size,
         sha256_hex=digest,
         ingestion_request=request,
     )

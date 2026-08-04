@@ -16,7 +16,9 @@ from app.ingestion.upload_preparation import (
     PreparedUploadDocument,
     UploadDocumentFailure,
     UploadDocumentPreparationError,
+    prepare_validated_upload_document,
     prepare_upload_document,
+    validate_upload_envelope,
 )
 
 
@@ -102,6 +104,26 @@ def test_public_api_is_keyword_only_and_result_retains_no_upload_bytes() -> None
     assert not hasattr(result, "path")
     assert result.ingestion_request.tenant_id == "tenant-trusted"
     assert result.ingestion_request.knowledge_base_id == "kb-trusted"
+
+
+def test_envelope_validation_and_full_preparation_are_equivalent() -> None:
+    content = b"Synthetic trusted text."
+    envelope = validate_upload_envelope(
+        content=content,
+        original_filename="guide.txt",
+        declared_media_type="text/plain",
+    )
+    assert envelope.content is content
+    assert envelope.byte_size == len(content)
+    assert envelope.sha256_hex == hashlib.sha256(content).hexdigest()
+
+    from_envelope = prepare_validated_upload_document(
+        envelope=envelope,
+        document_id="document-server-generated",
+        tenant_id="tenant-trusted",
+        knowledge_base_id="kb-trusted",
+    )
+    assert from_envelope == _prepare(content)
 
 
 @pytest.mark.parametrize(

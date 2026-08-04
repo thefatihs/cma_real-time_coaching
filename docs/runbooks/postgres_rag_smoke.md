@@ -104,9 +104,9 @@ foreign key cascade. After commit it returns the opaque object key to a future
 storage layer; this code performs no filesystem deletion. Embedding profiles and
 unrelated legacy vectors are untouched.
 
-Dashboard upload UI, HTTP APIs, background workers, and progress
-polling UI are not implemented by this change. The repository exposes scoped
-list and job-status operations for later server-side integration.
+Dashboard upload UI, HTTP APIs, and progress polling UI are not implemented by
+this change. The repository exposes scoped list and job-status operations plus
+an application-owned background manager for later server-side integration.
 
 ## Private persistent document storage prerequisites
 
@@ -132,12 +132,29 @@ Registry deletion commits before source deletion, so a later storage failure
 creates an orphan and never restores the database row. Duplicate registry
 resolution deletes only the new attempt's object.
 
-Orphan reconciliation is an explicit primitive, not a scheduler. It requires a
-complete trusted registry-key snapshot, deletes nothing for incomplete input,
-ignores unrelated names, applies a 300-to-604800-second grace period and removes
-at most 100 deterministic candidates per invocation. It returns counts only.
-Dashboard document UI, background ingestion execution and automatic orphan
-scheduling are not implemented yet.
+The background manager owns exactly one non-daemon worker and reserves one of
+1-to-8 configured capacity slots before validation or storage. Accepted bytes
+are released from queued memory after persistent storage succeeds; only opaque
+server metadata enters the bounded queue. Submission tokens are idempotent for
+the manager lifetime. Closing refuses new work, cooperatively cancels queued or
+running work, and a waiting close has a fixed upper bound. PostgreSQL remains
+authoritative for durable state and progress. Successful and failed source
+objects are retained for explicit retry; duplicate-attempt objects alone are
+removed immediately.
+
+Extraction, chunking, embedding, and vector finalization run only after the
+worker claims a queued job. The production composition accepts only
+`sentence-transformers/all-MiniLM-L6-v2` on CPU with 384 normalized dimensions
+and `local_files_only=true`. Construction opens no database connection and
+does not load the model; model loading occurs lazily only for accepted worker
+work and has no download fallback.
+
+Orphan reconciliation is explicit, never scheduled automatically. The composed
+runtime first obtains a complete tenant/knowledge-base registry-key snapshot;
+snapshot failure deletes nothing. Cleanup ignores unrelated names, applies the
+configured 300-to-604800-second grace period, removes at most 100 deterministic
+candidates, and returns safe counts only. Dashboard document UI and automatic
+orphan scheduling remain unimplemented.
 
 ## External PostgreSQL requirement
 

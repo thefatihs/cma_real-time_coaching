@@ -84,6 +84,12 @@ _ENTRY_BY_SHA = f"""
       AND documents.knowledge_base_id = %s
       AND documents.sha256_hex = %s
     """
+_STORAGE_KEYS = """
+    SELECT storage_object_key
+    FROM callmetric_vector.documents
+    WHERE tenant_id = %s AND knowledge_base_id = %s
+    ORDER BY storage_object_key
+    """
 _ENTRY_LIST = f"""
     SELECT {_ENTRY_COLUMNS}
     {_ENTRY_FROM}
@@ -255,6 +261,26 @@ class PsycopgDocumentRegistryRepository:
             return DocumentRegistryCreateResult(entry=entry, created=created)
 
         return self._run(DocumentOperationPhase.REGISTRY_CREATE, operation)
+
+    def list_storage_object_keys(
+        self, *, tenant_id: str, knowledge_base_id: str
+    ) -> tuple[str, ...]:
+        parameters = _scope(tenant_id, knowledge_base_id)
+
+        def operation(connection: Connection[Any]) -> tuple[str, ...]:
+            with connection.cursor() as cursor:
+                cursor.execute(_STORAGE_KEYS, parameters)
+                rows = cursor.fetchall()
+            if any(
+                not isinstance(row, tuple)
+                or len(row) != 1
+                or not isinstance(row[0], str)
+                for row in rows
+            ):
+                raise DocumentRegistryError(DocumentOperationPhase.LIST)
+            return tuple(row[0] for row in rows)
+
+        return self._run(DocumentOperationPhase.LIST, operation)
 
     def get_entry(
         self,

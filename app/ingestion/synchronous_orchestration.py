@@ -196,6 +196,104 @@ class SynchronousDocumentIngestionOrchestrator:
             vector_result=vector_result,
         )
 
+    def ingest_claimed(
+        self,
+        prepared: PreparedUploadDocument,
+        *,
+        entry: DocumentRegistryEntry,
+    ) -> SynchronousDocumentIngestionResult:
+        """Embed and atomically finalize a PROCESSING entry claimed by a worker."""
+        if (
+            entry.document.tenant_id != prepared.tenant_id
+            or entry.document.knowledge_base_id != prepared.knowledge_base_id
+            or entry.document.document_id != prepared.document_id
+            or entry.job.state is not DocumentIngestionState.PROCESSING
+        ):
+            raise DocumentRegistryError(DocumentOperationPhase.JOB_CLAIM)
+        self._cancel_if_requested(entry, DocumentIngestionPhase.EMBEDDING)
+        try:
+            output: object = self._document_embedder.embed_documents(
+                tenant_id=prepared.tenant_id,
+                knowledge_base_id=prepared.knowledge_base_id,
+                texts=tuple(chunk.text for chunk in prepared.chunks),
+            )
+            vectors = _validated_vectors(
+                output,
+                expected_rows=len(prepared.chunks),
+                expected_dimension=self._expected_vector_dimension,
+            )
+        except DocumentRegistryError:
+            raise
+        except Exception:
+            self._record_failure(entry, DocumentIngestionPhase.EMBEDDING)
+            raise DocumentRegistryError(DocumentOperationPhase.EMBEDDING) from None
+        batch = VectorBatchWriteRequest(
+            tenant_id=prepared.tenant_id,
+            knowledge_base_id=prepared.knowledge_base_id,
+            records=tuple(
+                VectorRecord(
+                    tenant_id=prepared.tenant_id,
+                    knowledge_base_id=prepared.knowledge_base_id,
+                    document_id=chunk.document_id,
+                    chunk_id=chunk.chunk_id,
+                    text=chunk.text,
+                    embedding=vector,
+                    metadata=chunk.metadata,
+                )
+                for chunk, vector in zip(prepared.chunks, vectors, strict=True)
+            ),
+        )
+
+        def write_vectors(
+            transaction: PostgreSQLVectorTransaction,
+        ) -> VectorBatchWriteResult:
+            try:
+                result = self._vector_writer.admit_batch_in_transaction(
+                    transaction, batch
+                )
+                _validate_vector_result(result, batch)
+                return result
+            except Exception:
+                raise DocumentRegistryError(
+                    DocumentOperationPhase.VECTOR_WRITE
+                ) from None
+
+        try:
+            vector_result = self._registry.finalize_success(
+                tenant_id=entry.document.tenant_id,
+                knowledge_base_id=entry.document.knowledge_base_id,
+                document_id=entry.document.document_id,
+                job_id=entry.job.job_id,
+                total_chunks=len(prepared.chunks),
+                vector_operation=write_vectors,
+                cancellation_requested=self._cancellation_requested,
+            )
+        except DocumentRegistryError as error:
+            if error.phase is DocumentOperationPhase.CANCEL:
+                self._cancel_if_requested(
+                    entry, DocumentIngestionPhase.VECTOR_WRITE, force=True
+                )
+            failure_phase = (
+                DocumentIngestionPhase.VECTOR_WRITE
+                if error.phase is DocumentOperationPhase.VECTOR_WRITE
+                else DocumentIngestionPhase.FINALIZE
+            )
+            self._record_failure(entry, failure_phase)
+            raise
+        except Exception:
+            self._record_failure(entry, DocumentIngestionPhase.FINALIZE)
+            raise DocumentRegistryError(DocumentOperationPhase.FINALIZE) from None
+        final_entry = self._registry.get_entry(
+            tenant_id=entry.document.tenant_id,
+            knowledge_base_id=entry.document.knowledge_base_id,
+            document_id=entry.document.document_id,
+        )
+        if final_entry is None or final_entry.readiness is not DocumentReadiness.READY:
+            raise DocumentRegistryError(DocumentOperationPhase.FINALIZE)
+        return SynchronousDocumentIngestionResult(
+            entry=final_entry, created=True, vector_result=vector_result
+        )
+
     def _cancel_if_requested(
         self,
         entry: DocumentRegistryEntry,
