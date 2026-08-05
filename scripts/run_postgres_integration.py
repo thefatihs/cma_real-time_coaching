@@ -34,23 +34,57 @@ class IntegrationRunError(RuntimeError):
     """An isolated PostgreSQL integration lifecycle step failed."""
 
 
+_REDACTION_PLACEHOLDER = "<redacted>"
+
+
+def _sanitize_output(text: str, sensitive_values: tuple[str, ...]) -> str:
+    sanitized = text
+    for value in sensitive_values:
+        if value:
+            sanitized = sanitized.replace(value, _REDACTION_PLACEHOLDER)
+    return sanitized
+
+
+def _emit_sanitized(
+    result: subprocess.CompletedProcess[str],
+    sensitive_values: tuple[str, ...],
+) -> None:
+    if result.stdout:
+        print(_sanitize_output(result.stdout, sensitive_values), end="")
+    if result.stderr:
+        print(
+            _sanitize_output(result.stderr, sensitive_values),
+            file=sys.stderr,
+            end="",
+        )
+
+
 def _run(
     arguments: list[str],
     *,
     input_text: str | None = None,
     environment: dict[str, str] | None = None,
     capture_output: bool = False,
+    sensitive_values: tuple[str, ...] = (PASSWORD,),
+    failure_phase: str = "subprocess",
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    result = subprocess.run(
         arguments,
-        check=True,
+        check=False,
         cwd=REPOSITORY_ROOT,
         env=environment,
         input=input_text,
         text=True,
-        capture_output=capture_output,
+        capture_output=True,
         shell=False,
     )
+    if not capture_output or result.returncode != 0:
+        _emit_sanitized(result, sensitive_values)
+    if result.returncode != 0:
+        raise IntegrationRunError(
+            f"PostgreSQL integration failed during {failure_phase}"
+        )
+    return result
 
 
 def _compose_arguments(
@@ -158,7 +192,11 @@ def _pytest_environment(port: int) -> dict[str, str]:
     return environment
 
 
-def _print_project_logs(docker: str, project_name: str) -> None:
+def _print_project_logs(
+    docker: str,
+    project_name: str,
+    sensitive_values: tuple[str, ...],
+) -> None:
     result = subprocess.run(
         _compose_arguments(docker, project_name, "logs", "--no-color"),
         check=False,
@@ -168,14 +206,26 @@ def _print_project_logs(docker: str, project_name: str) -> None:
         shell=False,
     )
     if result.stdout:
-        print(result.stdout, file=sys.stderr, end="")
+        print(
+            _sanitize_output(result.stdout, sensitive_values),
+            file=sys.stderr,
+            end="",
+        )
     if result.stderr:
-        print(result.stderr, file=sys.stderr, end="")
+        print(
+            _sanitize_output(result.stderr, sensitive_values),
+            file=sys.stderr,
+            end="",
+        )
     if result.returncode != 0:
         raise IntegrationRunError("failed to collect project-scoped Compose logs")
 
 
-def _cleanup(docker: str, project_name: str) -> None:
+def _cleanup(
+    docker: str,
+    project_name: str,
+    sensitive_values: tuple[str, ...],
+) -> None:
     _run(
         _compose_arguments(
             docker,
@@ -183,7 +233,9 @@ def _cleanup(docker: str, project_name: str) -> None:
             "down",
             "--volumes",
             "--remove-orphans",
-        )
+        ),
+        sensitive_values=sensitive_values,
+        failure_phase="cleanup",
     )
 
 
@@ -199,6 +251,7 @@ def run() -> None:
     project_name = f"callmetric-pgvector-{os.getpid()}-{secrets.token_hex(6)}"
     primary_error: BaseException | None = None
     cleanup_errors: list[Exception] = []
+    sensitive_values = (PASSWORD,)
     started = False
     try:
         _run([docker, "--version"])
@@ -210,6 +263,9 @@ def run() -> None:
         _run(_compose_arguments(docker, project_name, "up", "-d"))
         _wait_until_healthy(docker, project_name)
         port = _published_port(docker, project_name)
+        pytest_environment = _pytest_environment(port)
+        migration_dsn = pytest_environment["CALLMETRIC_POSTGRES_MIGRATION_DSN"]
+        sensitive_values = (PASSWORD, migration_dsn)
         _run(
             [
                 sys.executable,
@@ -219,18 +275,20 @@ def run() -> None:
                 "postgres_integration",
                 str(INTEGRATION_TEST),
             ],
-            environment=_pytest_environment(port),
+            environment=pytest_environment,
+            sensitive_values=sensitive_values,
+            failure_phase="pytest",
         )
     except BaseException as error:
         primary_error = error
         if started:
             try:
-                _print_project_logs(docker, project_name)
+                _print_project_logs(docker, project_name, sensitive_values)
             except Exception as logs_error:
                 cleanup_errors.append(logs_error)
     finally:
         try:
-            _cleanup(docker, project_name)
+            _cleanup(docker, project_name, sensitive_values)
         except Exception as cleanup_error:
             cleanup_errors.append(cleanup_error)
 
@@ -251,7 +309,8 @@ def main() -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as error:
-        print(f"PostgreSQL integration failed: {error}", file=sys.stderr)
+        message = _sanitize_output(str(error), (PASSWORD,))
+        print(f"PostgreSQL integration failed: {message}", file=sys.stderr)
         return 1
     return 0
 

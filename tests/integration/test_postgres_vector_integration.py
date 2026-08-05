@@ -283,7 +283,17 @@ def test_migration_extension_schema_ledger_and_tables(
         cursor.execute(
             "SELECT version FROM callmetric_vector.schema_migrations ORDER BY version"
         )
-        assert cursor.fetchall() == [("0001",), ("0002",)]
+        assert cursor.fetchall() == [("0001",), ("0002",), ("0003",)]
+        cursor.execute(
+            """
+            SELECT is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'callmetric_vector'
+              AND table_name = 'documents'
+              AND column_name = 'storage_object_key'
+            """
+        )
+        assert cursor.fetchall() == [("YES",)]
         cursor.execute(
             """
             SELECT table_name
