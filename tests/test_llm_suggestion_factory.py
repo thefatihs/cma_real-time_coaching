@@ -135,6 +135,18 @@ def test_exact_trusted_mapping_and_explicit_policy() -> None:
     assert suggestion.evidence_ids == []
 
 
+def test_grounded_creation_retains_only_internal_document_order() -> None:
+    grounded = factory().create_grounded(
+        event=transcript(),
+        orchestration_result=orchestration_result(),
+        current_seconds=99,
+    )
+
+    assert grounded is not None
+    assert grounded.citation_document_ids == ("document_1",)
+    assert grounded.event.evidence_ids == []
+
+
 def test_callbacks_are_called_exactly_once_on_success() -> None:
     id_callback = Callback("synthetic_id")
     clock_callback = Callback(NOW)

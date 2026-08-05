@@ -20,6 +20,7 @@ from app.coaching.coordinator import (
     CoachingCoordinator,
     CoachingCoordinatorResult,
     CoachingProcessingStatus,
+    CoachingSourcePresentation,
     SafeSuggestionDecision,
     StableCoachingOutcome,
 )
@@ -166,6 +167,7 @@ class SuggestionCardViewModel:
     transcript_revision: int | None
     is_new: bool
     lifecycle: CoachingSuggestionLifecycle = CoachingSuggestionLifecycle.CONFIRMED
+    sources: tuple[CoachingSourcePresentation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -662,6 +664,7 @@ def suggestion_card(
     event: CoachingSuggestionEvent,
     *,
     transcript_revision: int | None = None,
+    sources: tuple[CoachingSourcePresentation, ...] = (),
 ) -> SuggestionCardViewModel:
     return SuggestionCardViewModel(
         event.suggestion_id,
@@ -683,6 +686,7 @@ def suggestion_card(
         transcript_revision,
         True,
         event.lifecycle,
+        sources,
     )
 
 
@@ -1529,6 +1533,7 @@ def _consume_coaching_outcome(
         outcome.result,
         runtime.latest_event,
         apply_state_metadata=True,
+        sources=outcome.sources,
     )
 
 
@@ -1551,6 +1556,7 @@ def _apply_coaching_result(
     event: TranscriptEvent | None,
     *,
     apply_state_metadata: bool = False,
+    sources: tuple[CoachingSourcePresentation, ...] = (),
 ) -> None:
     classification = result.classification_event
     replaced_ids = set(result.replaced_suggestion_ids)
@@ -1626,6 +1632,7 @@ def _apply_coaching_result(
         card = suggestion_card(
             item,
             transcript_revision=result.transcript_revision,
+            sources=sources if item.source is CoachingSuggestionSource.LLM else (),
         )
         existing_index = next(
             (

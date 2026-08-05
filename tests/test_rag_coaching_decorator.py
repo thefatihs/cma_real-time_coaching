@@ -38,6 +38,15 @@ from app.integration import (
     OrchestrationRunner,
     RAGCoachingProcessorDecorator,
 )
+from app.ingestion.registry_models import (
+    DocumentOperationPhase,
+    DocumentRegistryEntry,
+    DocumentRegistryError,
+)
+from app.integration.citation_projection import (
+    GroundedCoachingSuggestion,
+    SafeCoachingCitationProjector,
+)
 from app.orchestration import (
     OrchestrationCitationReference,
     OrchestrationRequest,
@@ -253,6 +262,43 @@ class FakeSuggestionFactory:
         return self.result
 
 
+class GroundedFactory:
+    def __init__(self, result: CoachingSuggestionEvent) -> None:
+        self.result = result
+
+    def create_grounded(
+        self,
+        *,
+        event: TranscriptEvent,
+        orchestration_result: OrchestrationResult,
+        current_seconds: float,
+    ) -> GroundedCoachingSuggestion:
+        del event, orchestration_result, current_seconds
+        return GroundedCoachingSuggestion(self.result, ("document_1",))
+
+    def create(
+        self,
+        *,
+        event: TranscriptEvent,
+        orchestration_result: OrchestrationResult,
+        current_seconds: float,
+    ) -> CoachingSuggestionEvent:
+        del event, orchestration_result, current_seconds
+        return self.result
+
+
+class FailingCitationRepository:
+    def get_entries_by_document_ids(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        document_ids: tuple[str, ...],
+    ) -> tuple[DocumentRegistryEntry, ...]:
+        del tenant_id, knowledge_base_id, document_ids
+        raise DocumentRegistryError(DocumentOperationPhase.LIST)
+
+
 class AdmissionFailureCoordinator(CoachingCoordinator):
     snapshot_before_admission: CoachingStateSnapshot | None = None
 
@@ -425,6 +471,34 @@ def test_protocols_and_decorator_are_structurally_compatible() -> None:
     assert OrchestrationRunner is not None
 
 
+def test_registry_failure_preserves_admitted_suggestion_with_empty_sources() -> None:
+    event = transcript()
+    config = tenant_config()
+    subject_coordinator = coordinator(config, prepared_state(event))
+    manager = FakeBackgroundManager(orchestration_result(event))
+    suggestion = external_suggestion(event)
+    decorator = RAGCoachingProcessorDecorator(
+        subject_coordinator,
+        config,
+        manager,
+        GroundedFactory(suggestion),
+        ("product_information",),
+        SafeCoachingCitationProjector(FailingCitationRepository()),
+    )
+
+    decorator.process_safely(
+        event,
+        event.end_seconds,
+        classification_event=classification(event),
+        active_labels=("product_information",),
+    )
+    completed = decorator.drain_completed(current_seconds=event.end_seconds)
+
+    assert len(completed) == 1
+    assert completed[0].result is not None
+    assert completed[0].sources == ()
+
+
 def test_process_returns_base_before_completion_is_drained() -> None:
     decorator, subject_coordinator, runner, factory, event = decorator_dependencies(
         coordinator_type=TrackingCoordinator
@@ -486,6 +560,7 @@ def test_constructor_accepts_only_one_coordinator_and_internal_adapter_shares_it
         "background_manager",
         "suggestion_factory",
         "rag_llm_enabled_labels",
+        "citation_projector",
     )
     assert decorator._coordinator is subject_coordinator  # noqa: SLF001
     assert decorator._base_processor._coordinator is subject_coordinator  # noqa: SLF001

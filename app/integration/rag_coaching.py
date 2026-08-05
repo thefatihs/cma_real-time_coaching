@@ -20,6 +20,11 @@ from app.coaching.llm_decision_gate import (
     LLMCoachingDecisionGate,
 )
 from app.coaching.safe_processor import SafeCoachingProcessorAdapter
+from app.ingestion.registry_models import DocumentRegistryError
+from app.integration.citation_projection import (
+    GroundedCoachingSuggestion,
+    SafeCoachingCitationProjector,
+)
 from app.events.models import (
     ClassificationResultEvent,
     CoachingSuggestionEvent,
@@ -57,6 +62,17 @@ class CoachingSuggestionFactory(Protocol):
     ) -> CoachingSuggestionEvent | None: ...
 
 
+@runtime_checkable
+class GroundedCoachingSuggestionFactory(Protocol):
+    def create_grounded(
+        self,
+        *,
+        event: TranscriptEvent,
+        orchestration_result: OrchestrationResult,
+        current_seconds: float,
+    ) -> GroundedCoachingSuggestion | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class _PendingContext:
     event: TranscriptEvent
@@ -71,6 +87,7 @@ class RAGCoachingProcessorDecorator:
         background_manager: BoundedPostgreSQLRAGManager,
         suggestion_factory: CoachingSuggestionFactory,
         rag_llm_enabled_labels: tuple[str, ...],
+        citation_projector: SafeCoachingCitationProjector | None = None,
     ) -> None:
         if coordinator.call_state.tenant_id != tenant_config.context.tenant_id:
             raise ValueError("coordinator tenant_id does not match tenant config")
@@ -81,6 +98,7 @@ class RAGCoachingProcessorDecorator:
             raise ValueError("background_manager must be BoundedPostgreSQLRAGManager")
         self._background_manager = background_manager
         self._suggestion_factory = suggestion_factory
+        self._citation_projector = citation_projector
         self._rag_llm_enabled_labels = _validated_labels(rag_llm_enabled_labels)
         self._decision_gate = LLMCoachingDecisionGate()
         self._pending_contexts: dict[
@@ -234,14 +252,33 @@ class RAGCoachingProcessorDecorator:
                 context.event,
             ):
                 continue
-            suggestion = self._suggestion_factory.create(
-                event=context.event,
-                orchestration_result=orchestration_result,
-                current_seconds=context.current_seconds,
-            )
+            sources = ()
+            if isinstance(self._suggestion_factory, GroundedCoachingSuggestionFactory):
+                grounded = self._suggestion_factory.create_grounded(
+                    event=context.event,
+                    orchestration_result=orchestration_result,
+                    current_seconds=context.current_seconds,
+                )
+                suggestion = None if grounded is None else grounded.event
+                if grounded is not None and self._citation_projector is not None:
+                    try:
+                        sources = self._citation_projector.project(
+                            tenant_id=context.event.tenant_id,
+                            knowledge_base_id=(
+                                self._tenant_config.rag.knowledge_base_id or ""
+                            ),
+                            citation_document_ids=grounded.citation_document_ids,
+                        )
+                    except DocumentRegistryError:
+                        sources = ()
+            else:
+                suggestion = self._suggestion_factory.create(
+                    event=context.event,
+                    orchestration_result=orchestration_result,
+                    current_seconds=context.current_seconds,
+                )
             if suggestion is None or not _suggestion_scope_matches(
-                suggestion,
-                context.event,
+                suggestion, context.event
             ):
                 continue
             snapshot = self._coordinator.snapshot_coaching_state()
@@ -259,6 +296,7 @@ class RAGCoachingProcessorDecorator:
                     status=CoachingProcessingStatus.PROCESSED,
                     transcript_revision=identity.transcript_revision,
                     result=external_result,
+                    sources=sources,
                 )
             )
         return tuple(outcomes)

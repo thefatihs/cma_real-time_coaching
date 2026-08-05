@@ -77,6 +77,13 @@ _ENTRY_BY_ID = f"""
       AND documents.document_id = %s
     """
 _ENTRY_BY_ID_FOR_UPDATE = _ENTRY_BY_ID + " FOR UPDATE OF documents, jobs"
+_ENTRIES_BY_IDS = f"""
+    SELECT {_ENTRY_COLUMNS}
+    {_ENTRY_FROM}
+    WHERE documents.tenant_id = %s
+      AND documents.knowledge_base_id = %s
+      AND documents.document_id = ANY(%s)
+    """
 _ENTRY_BY_SHA = f"""
     SELECT {_ENTRY_COLUMNS}
     {_ENTRY_FROM}
@@ -318,6 +325,50 @@ class PsycopgDocumentRegistryRepository:
                 return _fetch_one_entry(cursor, _ENTRY_BY_ID, parameters)
 
         return self._run(DocumentOperationPhase.REGISTRY_CREATE, operation)
+
+    def get_entries_by_document_ids(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        document_ids: tuple[str, ...],
+    ) -> tuple[DocumentRegistryEntry, ...]:
+        tenant, knowledge_base = _scope(
+            tenant_id, knowledge_base_id, DocumentOperationPhase.LIST
+        )
+        if (
+            not isinstance(document_ids, tuple)
+            or not document_ids
+            or len(document_ids) > 20
+        ):
+            raise DocumentRegistryError(DocumentOperationPhase.LIST)
+        validated_ids = tuple(
+            _identifier(document_id, DocumentOperationPhase.LIST)
+            for document_id in document_ids
+        )
+        if len(set(validated_ids)) != len(validated_ids):
+            raise DocumentRegistryError(DocumentOperationPhase.LIST)
+
+        def operation(connection: Connection[Any]) -> tuple[DocumentRegistryEntry, ...]:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    _ENTRIES_BY_IDS,
+                    (tenant, knowledge_base, list(validated_ids)),
+                )
+                rows = cursor.fetchall()
+            entries = tuple(
+                _entry_from_row(row, DocumentOperationPhase.LIST) for row in rows
+            )
+            by_id = {entry.document.document_id: entry for entry in entries}
+            if len(by_id) != len(entries):
+                raise DocumentRegistryError(DocumentOperationPhase.LIST)
+            return tuple(
+                by_id[document_id]
+                for document_id in validated_ids
+                if document_id in by_id
+            )
+
+        return self._run(DocumentOperationPhase.LIST, operation)
 
     def get_job(
         self,

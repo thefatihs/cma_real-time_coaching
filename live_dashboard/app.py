@@ -494,6 +494,11 @@ def _render_representative_view(
                 if card.related_label:
                     details.append(f"Etiket: {card.related_label}")
                 st.caption(" · ".join(details))
+                for source_index, source in enumerate(card.sources, start=1):
+                    st.caption(
+                        f"Kaynak {source_index}: {source.original_filename} "
+                        f"({source.media_label})"
+                    )
                 for column, value in zip(
                     st.columns(3),
                     ("Görüldü", "Uygulandı", "Uygun değil"),

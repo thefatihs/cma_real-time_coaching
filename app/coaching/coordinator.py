@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 import logging
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, ValidationError
 
@@ -98,12 +99,41 @@ class CoachingProcessingStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class CoachingSourcePresentation:
+    original_filename: str
+    media_label: str
+
+    def __post_init__(self) -> None:
+        if (
+            not self.original_filename
+            or self.original_filename != self.original_filename.strip()
+            or len(self.original_filename) > 255
+            or self.original_filename in {".", ".."}
+            or any(
+                character in self.original_filename for character in ("/", "\\", ":")
+            )
+            or any(
+                unicodedata.category(character).startswith("C")
+                for character in self.original_filename
+            )
+        ):
+            raise ValueError("source filename is invalid")
+        if self.media_label not in {"PDF", "TXT", "Markdown"}:
+            raise ValueError("source media label is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class StableCoachingOutcome:
     status: CoachingProcessingStatus
     transcript_revision: int
     result: CoachingCoordinatorResult | None = None
     error_type: str | None = None
     error_code: str | None = None
+    sources: tuple[CoachingSourcePresentation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.sources) > 5:
+            raise ValueError("coaching sources exceed the allowed limit")
 
 
 SuggestionFingerprint = tuple[str, str, str, tuple[str, ...]]

@@ -165,6 +165,7 @@ def test_bundle_is_frozen_and_slotted() -> None:
         "policy",
         "suggestion_id_factory",
         "utc_datetime_factory",
+        "citation_projector",
     )
     with pytest.raises(FrozenInstanceError):
         subject.policy = policy()  # type: ignore[misc]

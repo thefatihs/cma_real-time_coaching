@@ -18,6 +18,7 @@ from app.events.models import (
     CoachingSuggestionLifecycle,
     SuggestionPriority,
 )
+from app.coaching.coordinator import CoachingSourcePresentation
 from app.streaming.pipeline import StreamingASRPipeline
 from app.streaming.window_transcriber import WindowTranscriptionResult
 from live_dashboard.demo_data import tenant_demos
@@ -318,6 +319,38 @@ def test_representative_renderer_handles_empty_history(
     app = _load_dashboard_app(monkeypatch, recorder)
 
     app._render_representative(state.runtime, tabs, _scope())
+
+
+def test_representative_renderer_shows_bounded_safe_turkish_source_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(
+        tenant_demos()["tenant_alpha"],
+        "synthetic-call",
+    )
+    tabs = dashboard_tabs(state.runtime, state)
+    card = replace(
+        _history_card(),
+        sources=(
+            CoachingSourcePresentation("guide.pdf", "PDF"),
+            CoachingSourcePresentation("notes.md", "Markdown"),
+        ),
+    )
+    representative = replace(tabs.representative, active_suggestions=(card,))
+
+    app._render_representative(
+        state.runtime,
+        replace(tabs, representative=representative),
+        _scope(),
+    )
+
+    assert "Kaynak 1: guide.pdf (PDF)" in recorder.captions
+    assert "Kaynak 2: notes.md (Markdown)" in recorder.captions
+    rendered = " ".join([*recorder.captions, *recorder.writes])
+    assert "document_id" not in rendered
+    assert "chunk_id" not in rendered
 
 
 def test_representative_renderer_shows_bounded_speaker_aggregates(

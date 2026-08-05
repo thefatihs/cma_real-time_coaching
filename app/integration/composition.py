@@ -12,6 +12,7 @@ from app.composition.postgres_rag_background import (
 from app.integration.llm_suggestion_factory import (
     DeterministicLLMCoachingSuggestionFactory,
 )
+from app.integration.citation_projection import SafeCoachingCitationProjector
 from app.integration.policy import RAGCoachingIntegrationPolicy
 from app.integration.rag_coaching import (
     RAGCoachingProcessorDecorator,
@@ -25,6 +26,7 @@ class RAGCoachingIntegrationDependencies:
     policy: RAGCoachingIntegrationPolicy
     suggestion_id_factory: Callable[[], str]
     utc_datetime_factory: Callable[[], datetime]
+    citation_projector: SafeCoachingCitationProjector | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -73,4 +75,5 @@ def compose_rag_coaching_processor(
         background_manager=integration.background_manager,
         suggestion_factory=suggestion_factory,
         rag_llm_enabled_labels=integration.policy.rag_llm_enabled_labels,
+        citation_projector=integration.citation_projector,
     )

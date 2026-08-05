@@ -164,6 +164,40 @@ def test_duplicate_sha_returns_existing_identity_without_job_insert() -> None:
     assert connection.cursor_value.executions[1][1] == ("tenant-a", "kb-a", "a" * 64)
 
 
+def test_batch_lookup_is_single_transaction_exact_scope_and_requested_order() -> None:
+    connection = FakeConnection([[row(document_id="doc-b"), row(document_id="doc-a")]])
+
+    entries = repository(connection).get_entries_by_document_ids(
+        tenant_id="tenant-a",
+        knowledge_base_id="kb-a",
+        document_ids=("doc-a", "missing", "doc-b"),
+    )
+
+    assert tuple(entry.document.document_id for entry in entries) == ("doc-a", "doc-b")
+    assert connection.commits == connection.closes == 1
+    assert len(connection.cursor_value.executions) == 1
+    query, parameters = connection.cursor_value.executions[0]
+    assert "documents.document_id = ANY(%s)" in query
+    assert parameters == ("tenant-a", "kb-a", ["doc-a", "missing", "doc-b"])
+
+
+@pytest.mark.parametrize(
+    "document_ids",
+    [(), ("doc-a", "doc-a"), tuple(f"doc-{index}" for index in range(21))],
+)
+def test_batch_lookup_rejects_empty_duplicate_or_over_limit_ids(
+    document_ids: tuple[str, ...],
+) -> None:
+    connection = FakeConnection([])
+    with pytest.raises(DocumentRegistryError):
+        repository(connection).get_entries_by_document_ids(
+            tenant_id="tenant-a",
+            knowledge_base_id="kb-a",
+            document_ids=document_ids,
+        )
+    assert connection.cursor_value.executions == []
+
+
 def test_exact_delete_orders_vector_before_parent_and_returns_opaque_key() -> None:
     connection = FakeConnection([[row()]])
     result = repository(connection).delete_document(

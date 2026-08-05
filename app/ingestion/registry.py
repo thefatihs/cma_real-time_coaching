@@ -26,6 +26,14 @@ class DocumentRegistryRepository(Protocol):
         self, *, tenant_id: str, knowledge_base_id: str, document_id: str
     ) -> DocumentRegistryEntry | None: ...
 
+    def get_entries_by_document_ids(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        document_ids: tuple[str, ...],
+    ) -> tuple[DocumentRegistryEntry, ...]: ...
+
     def get_job(
         self, *, tenant_id: str, knowledge_base_id: str, job_id: str
     ) -> DocumentIngestionJob | None: ...

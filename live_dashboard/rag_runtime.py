@@ -209,6 +209,8 @@ def _activate_optional_integration(
         from app.vector_store.postgres.readiness import (
             PostgreSQLSchemaReadinessChecker,
         )
+        from app.ingestion.postgres_registry import PsycopgDocumentRegistryRepository
+        from app.integration.citation_projection import SafeCoachingCitationProjector
         from psycopg import connect as psycopg_connect
 
         vllm_settings_factory = cast(
@@ -255,6 +257,11 @@ def _activate_optional_integration(
             policy=policy,
             suggestion_id_factory=lambda: uuid4().hex,
             utc_datetime_factory=lambda: datetime.now(UTC),
+            citation_projector=SafeCoachingCitationProjector(
+                PsycopgDocumentRegistryRepository(
+                    connection_factory=readiness_connection_factory
+                )
+            ),
         )
     except Exception:
         if manager is not None:

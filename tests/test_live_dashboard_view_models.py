@@ -9,6 +9,7 @@ from app.classification.streaming import (
     StableClassificationOutcome,
 )
 from app.coaching.coordinator import (
+    CoachingSourcePresentation,
     CoachingCoordinatorResult,
     CoachingProcessingStatus,
     SafeSuggestionDecision,
@@ -807,6 +808,19 @@ def test_suggestion_card_shows_priority_action_and_provenance(
     )
     assert card.transcript_revision == 2
     assert card.is_new
+
+
+def test_suggestion_card_carries_only_bounded_safe_sources() -> None:
+    outcome = fake_pipeline_result().coaching_outcomes[0].result
+    assert outcome is not None
+    sources = (
+        CoachingSourcePresentation("guide.pdf", "PDF"),
+        CoachingSourcePresentation("notes.md", "Markdown"),
+    )
+    card = suggestion_card(outcome.displayed_suggestions[0], sources=sources)
+
+    assert card.sources is sources
+    assert card.evidence_ids == ()
 
 
 def test_simultaneous_suggestions_keep_their_own_label_metadata() -> None:

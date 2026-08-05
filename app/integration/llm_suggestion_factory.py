@@ -15,6 +15,7 @@ from app.events.models import (
     TranscriptEvent,
 )
 from app.orchestration import OrchestrationResult
+from app.integration.citation_projection import GroundedCoachingSuggestion
 
 
 class DeterministicLLMCoachingSuggestionFactory:
@@ -53,6 +54,20 @@ class DeterministicLLMCoachingSuggestionFactory:
         orchestration_result: OrchestrationResult,
         current_seconds: float,
     ) -> CoachingSuggestionEvent | None:
+        grounded = self.create_grounded(
+            event=event,
+            orchestration_result=orchestration_result,
+            current_seconds=current_seconds,
+        )
+        return None if grounded is None else grounded.event
+
+    def create_grounded(
+        self,
+        *,
+        event: TranscriptEvent,
+        orchestration_result: OrchestrationResult,
+        current_seconds: float,
+    ) -> GroundedCoachingSuggestion | None:
         if current_seconds < 0:
             raise ValueError("current_seconds cannot be negative")
         if (
@@ -95,7 +110,7 @@ class DeterministicLLMCoachingSuggestionFactory:
                 "utc_datetime_factory must return a timezone-aware UTC datetime"
             )
 
-        return CoachingSuggestionEvent(
+        suggestion_event = CoachingSuggestionEvent(
             tenant_id=event.tenant_id,
             call_id=event.call_id,
             suggestion_id=validated_id,
@@ -109,6 +124,17 @@ class DeterministicLLMCoachingSuggestionFactory:
             evidence_ids=[],
             expires_after_seconds=self._expires_after_seconds,
             created_at_utc=created_at_utc,
+        )
+        grounded_identities = {
+            citation.identity for citation in gate_result.suggestion.citations
+        }
+        return GroundedCoachingSuggestion(
+            event=suggestion_event,
+            citation_document_ids=tuple(
+                citation.document_id
+                for citation in orchestration_result.citations
+                if (citation.document_id, citation.chunk_id) in grounded_identities
+            ),
         )
 
 
