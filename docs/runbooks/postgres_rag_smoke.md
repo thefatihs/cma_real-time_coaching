@@ -43,9 +43,22 @@ using the existing scripts. Pre-stage the embedding model under ignored
 `local_artifacts/`; use `local_files_only=true`, a CPU device, normalization
 matching the profile, and an actual 384-dimensional model output.
 
+The canonical embedding identity remains
+`sentence-transformers/all-MiniLM-L6-v2` in `model_id`, profile persistence and
+compatibility checks. `model_name_or_path` may retain that canonical identifier
+for a pre-populated offline Hugging Face cache, or it may be an operator-supplied
+absolute snapshot directory beneath ignored `local_artifacts/`. The local path
+option must identify immutable revision
+`1110a243fdf4706b3f48f1d95db1a4f5529b4d41` and match the deterministic
+`minilm-1110a243.sha256` manifest. Validation rejects missing, changed,
+symlink-escaping or non-canonical artifacts before model construction. Never
+commit or display the machine-specific absolute path.
+
 The model is not downloaded during dashboard startup.
 `trust_remote_code` remains false. Deterministic fake embeddings validate
 wiring only and do not constitute a real embedding smoke test.
+The approved MiniLM model is English-oriented; this smoke verifies technical
+384-dimensional ingestion and retrieval, not Turkish retrieval quality.
 
 ## Document-registry schema
 
