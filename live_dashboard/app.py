@@ -99,6 +99,10 @@ from live_dashboard.view_models import (  # noqa: E402
     DashboardTabsViewModel,
     LocalExecutionState,
     StatusCardViewModel,
+    UploadedASRFailureReason,
+    UploadedASRProfileName,
+    UploadedASRReadiness,
+    UploadedASRRuntimeMetadata,
     UploadedAudioSession,
     apply_feedback,
     advance_runtime,
@@ -133,6 +137,7 @@ _RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
 _LOCAL_MIC_CALL_ACTIVE_SESSION_KEY = "local_mic_call_active"
 _LOCAL_MIC_FINISH_PENDING_SESSION_KEY = "local_mic_finish_pending"
 _LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY = "CALLMETRIC_LOCAL_MIC_ASR_PROFILE"
+_UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY = "CALLMETRIC_UPLOADED_ASR_PROFILE"
 _LOCAL_MIC_ASR_CPU_THREADS = 4
 _LOCAL_MIC_ASR_ROLLING_WINDOW_SECONDS = 6.0
 _LOCAL_MIC_ASR_STABLE_REGION_SECONDS = 2.0
@@ -167,6 +172,18 @@ _EXECUTION_STAGE_TEXT = {
     DashboardExecutionStage.MICROPHONE_OVERLOADED: ("Ses kuyruğu kapasitesi aşıldı"),
     DashboardExecutionStage.STARTING: "Analiz başlatılıyor",
     DashboardExecutionStage.FILE_PREPARING: "Ses dosyası hazırlanıyor",
+    DashboardExecutionStage.UPLOADED_MODEL_PREPARING: (
+        "Yüklenen ses için konuşma modeli hazırlanıyor"
+    ),
+    DashboardExecutionStage.UPLOADED_MODEL_WARMING_UP: (
+        "Yüklenen ses için konuşma modeli ısınıyor"
+    ),
+    DashboardExecutionStage.UPLOADED_MODEL_READY: (
+        "Yüklenen ses için konuşma modeli hazır"
+    ),
+    DashboardExecutionStage.UPLOADED_MODEL_PREPARATION_FAILED: (
+        "Yüklenen ses için konuşma modeli hazırlanamadı"
+    ),
     DashboardExecutionStage.ENGINE_RUNNING: "Analiz motoru çalışıyor",
     DashboardExecutionStage.CHUNK_PROCESSING: "Ses parçaları işleniyor",
     DashboardExecutionStage.COMPLETED: "Analiz tamamlandı",
@@ -196,6 +213,20 @@ class _LocalMicrophoneCUDAReadiness:
     supported_compute_types: frozenset[str]
 
 
+@dataclass(frozen=True, slots=True)
+class _UploadedASRProfile:
+    name: UploadedASRProfileName
+    model_name: str
+    device: str
+    compute_type: str
+
+
+class _UploadedASRPreparationError(Exception):
+    def __init__(self, runtime: UploadedASRRuntimeMetadata) -> None:
+        super().__init__(runtime.failure_reason.value)
+        self.runtime = runtime
+
+
 _LOCAL_MIC_ASR_FAILURE_TEXT = {
     LocalMicrophoneASRFailureReason.NONE: "",
     LocalMicrophoneASRFailureReason.INVALID_PROFILE: (
@@ -220,6 +251,33 @@ _LOCAL_MIC_ASR_FAILURE_TEXT = {
     ),
     LocalMicrophoneASRFailureReason.PIPELINE_FAILED: (
         "Canlı ASR hattı güvenli biçimde çalıştırılamadı."
+    ),
+}
+
+_UPLOADED_ASR_FAILURE_TEXT = {
+    UploadedASRFailureReason.NONE: "",
+    UploadedASRFailureReason.INVALID_PROFILE: (
+        "Geçersiz yüklenen ses ASR profili. cpu-large-v3 veya gpu-large-v3 seçin."
+    ),
+    UploadedASRFailureReason.CUDA_CHECK_FAILED: (
+        "CUDA hazırlığı doğrulanamadı. NVIDIA sürücüsünü ve CUDA çalışma "
+        "zamanını kontrol edin."
+    ),
+    UploadedASRFailureReason.CUDA_UNAVAILABLE: (
+        "CUDA görünür değil. gpu-large-v3 için CUDA erişimli bir GPU gereklidir."
+    ),
+    UploadedASRFailureReason.FLOAT16_UNSUPPORTED: (
+        "GPU float16 hesaplamayı desteklemiyor; gpu-large-v3 başlatılamadı."
+    ),
+    UploadedASRFailureReason.MODEL_LOAD_FAILED: (
+        "large-v3 modeli yüklenemedi. Model önbelleğini, GPU belleğini ve CUDA "
+        "kurulumunu kontrol edin."
+    ),
+    UploadedASRFailureReason.WARMUP_FAILED: (
+        "ASR modeli ısınma çıkarımını tamamlayamadı; yüklenen ses işlenmedi."
+    ),
+    UploadedASRFailureReason.PIPELINE_FAILED: (
+        "Yüklenen ses ASR hattı güvenli biçimde çalıştırılamadı."
     ),
 }
 
@@ -331,6 +389,183 @@ def _create_local_microphone_asr_engine(
     )
 
 
+def _uploaded_asr_profile(
+    config: TenantASRConfig,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> _UploadedASRProfile:
+    source = os.environ if environment is None else environment
+    raw_name = source.get(
+        _UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY,
+        UploadedASRProfileName.CPU_LARGE_V3.value,
+    )
+    try:
+        profile_name = UploadedASRProfileName(raw_name)
+    except ValueError:
+        raise ValueError("invalid_uploaded_asr_profile") from None
+    if profile_name is UploadedASRProfileName.GPU_LARGE_V3:
+        return _UploadedASRProfile(
+            name=profile_name,
+            model_name="large-v3",
+            device="cuda",
+            compute_type="float16",
+        )
+    return _UploadedASRProfile(
+        name=profile_name,
+        model_name="large-v3",
+        device="cpu",
+        compute_type="int8",
+    )
+
+
+def _inspect_uploaded_asr_cuda() -> _LocalMicrophoneCUDAReadiness:
+    return _inspect_local_microphone_cuda()
+
+
+def _create_uploaded_asr_engine(
+    config: TenantASRConfig,
+    profile: _UploadedASRProfile,
+) -> FasterWhisperEngine:
+    return FasterWhisperEngine(
+        profile.model_name,
+        device=profile.device,
+        compute_type=profile.compute_type,
+        language=config.language,
+        beam_size=config.beam_size,
+        vad_filter=config.vad_filter,
+        condition_on_previous_text=config.condition_on_previous_text,
+        initial_prompt=config.initial_prompt,
+    )
+
+
+def _release_uploaded_asr_engine(engine: object | None) -> None:
+    release = None if engine is None else getattr(engine, "release_model", None)
+    if callable(release):
+        release()
+
+
+def _uploaded_asr_runtime(
+    config: TenantASRConfig,
+    profile: _UploadedASRProfile | None,
+    *,
+    readiness: UploadedASRReadiness,
+    failure_reason: UploadedASRFailureReason = UploadedASRFailureReason.NONE,
+    cuda_available: bool | None = None,
+) -> UploadedASRRuntimeMetadata:
+    return UploadedASRRuntimeMetadata(
+        profile_name=None if profile is None else profile.name,
+        model_name=config.model_name if profile is None else profile.model_name,
+        device="" if profile is None else profile.device,
+        compute_type="" if profile is None else profile.compute_type,
+        language=config.language,
+        beam_size=config.beam_size,
+        vad_filter=config.vad_filter,
+        condition_on_previous_text=config.condition_on_previous_text,
+        readiness=readiness,
+        failure_reason=failure_reason,
+        cuda_available=cuda_available,
+        fallback_occurred=False,
+    )
+
+
+def _prepare_uploaded_asr_engine(
+    config: TenantASRConfig,
+    *,
+    publish_runtime: Callable[[UploadedASRRuntimeMetadata], None],
+    environment: Mapping[str, str] | None = None,
+) -> tuple[FasterWhisperEngine, UploadedASRRuntimeMetadata]:
+    """Prepare one exact uploaded-audio engine without admitting audio chunks."""
+    try:
+        profile = _uploaded_asr_profile(config, environment=environment)
+    except ValueError:
+        failed = _uploaded_asr_runtime(
+            config,
+            None,
+            readiness=UploadedASRReadiness.FAILED,
+            failure_reason=UploadedASRFailureReason.INVALID_PROFILE,
+        )
+        publish_runtime(failed)
+        raise _UploadedASRPreparationError(failed) from None
+
+    runtime = _uploaded_asr_runtime(
+        config,
+        profile,
+        readiness=UploadedASRReadiness.PREPARING_MODEL,
+    )
+    publish_runtime(runtime)
+    cuda_readiness: _LocalMicrophoneCUDAReadiness | None = None
+    if profile.name is UploadedASRProfileName.GPU_LARGE_V3:
+        try:
+            cuda_readiness = _inspect_uploaded_asr_cuda()
+        except Exception:
+            failed = replace(
+                runtime,
+                readiness=UploadedASRReadiness.FAILED,
+                failure_reason=UploadedASRFailureReason.CUDA_CHECK_FAILED,
+            )
+            publish_runtime(failed)
+            raise _UploadedASRPreparationError(failed) from None
+        runtime = replace(runtime, cuda_available=cuda_readiness.available)
+        publish_runtime(runtime)
+        if not cuda_readiness.available:
+            failed = replace(
+                runtime,
+                readiness=UploadedASRReadiness.FAILED,
+                failure_reason=UploadedASRFailureReason.CUDA_UNAVAILABLE,
+            )
+            publish_runtime(failed)
+            raise _UploadedASRPreparationError(failed)
+        if profile.compute_type not in cuda_readiness.supported_compute_types:
+            failed = replace(
+                runtime,
+                readiness=UploadedASRReadiness.FAILED,
+                failure_reason=UploadedASRFailureReason.FLOAT16_UNSUPPORTED,
+            )
+            publish_runtime(failed)
+            raise _UploadedASRPreparationError(failed)
+
+    engine: FasterWhisperEngine | None = None
+    try:
+        try:
+            engine = _create_uploaded_asr_engine(config, profile)
+            if profile.name is UploadedASRProfileName.GPU_LARGE_V3:
+                model_loading_seconds = engine.load_model()
+                runtime = replace(
+                    runtime,
+                    model_loading_seconds=model_loading_seconds,
+                    readiness=UploadedASRReadiness.WARMING_UP,
+                )
+                publish_runtime(runtime)
+        except Exception:
+            failed = replace(
+                runtime,
+                readiness=UploadedASRReadiness.FAILED,
+                failure_reason=UploadedASRFailureReason.MODEL_LOAD_FAILED,
+            )
+            publish_runtime(failed)
+            raise _UploadedASRPreparationError(failed) from None
+
+        if profile.name is UploadedASRProfileName.GPU_LARGE_V3:
+            try:
+                warmup_seconds = engine.warm_up()
+            except Exception:
+                failed = replace(
+                    runtime,
+                    readiness=UploadedASRReadiness.FAILED,
+                    failure_reason=UploadedASRFailureReason.WARMUP_FAILED,
+                )
+                publish_runtime(failed)
+                raise _UploadedASRPreparationError(failed) from None
+            runtime = replace(runtime, warmup_seconds=warmup_seconds)
+
+        runtime = replace(runtime, readiness=UploadedASRReadiness.READY_TO_PROCESS)
+        publish_runtime(runtime)
+        return engine, runtime
+    except _UploadedASRPreparationError:
+        _release_uploaded_asr_engine(engine)
+        raise
+
+
 def _release_local_microphone_asr_engine(engine: object | None) -> None:
     release = None if engine is None else getattr(engine, "release_model", None)
     if callable(release):
@@ -413,9 +648,11 @@ def _make_pipeline(
     selection: DashboardServiceSelection,
     availability: ArtifactAvailability,
     execution_resource: DashboardExecutionResource,
+    *,
+    engine: FasterWhisperEngine | None = None,
 ) -> StreamingASRPipeline:
     config = runtime.tenant.config
-    engine = _load_asr_model(
+    selected_engine = engine or _load_asr_model(
         config.asr.model_name,
         config.asr.language,
         config.asr.beam_size,
@@ -425,7 +662,7 @@ def _make_pipeline(
     )
     return build_live_pipeline(
         runtime,
-        WindowTranscriber(engine),
+        WindowTranscriber(selected_engine),
         selection=selection,
         availability=availability,
         classifier_provider=_load_runtime_classifier,
@@ -942,6 +1179,43 @@ def _local_microphone_asr_runtime_cards(
         if value is not None:
             suffix = "x" if label == "Gerçek zaman katsayısı" else " sn"
             values.append(StatusCardViewModel(label, f"{value:.2f}{suffix}"))
+    return tuple(values)
+
+
+def _uploaded_asr_runtime_cards(
+    runtime: UploadedASRRuntimeMetadata,
+) -> tuple[StatusCardViewModel, ...]:
+    cuda_text = (
+        "Kontrol edilmedi"
+        if runtime.cuda_available is None
+        else ("Evet" if runtime.cuda_available else "Hayır")
+    )
+    profile_text = (
+        "Geçersiz" if runtime.profile_name is None else runtime.profile_name.value
+    )
+    values: list[StatusCardViewModel] = [
+        StatusCardViewModel("Yüklenen ses ASR profili", profile_text),
+        StatusCardViewModel("Model", runtime.model_name),
+        StatusCardViewModel("Aygıt", runtime.device or "Başlatılmadı"),
+        StatusCardViewModel("Hesaplama", runtime.compute_type or "Başlatılmadı"),
+        StatusCardViewModel("Dil", runtime.language),
+        StatusCardViewModel("Beam", str(runtime.beam_size)),
+        StatusCardViewModel("VAD", "Açık" if runtime.vad_filter else "Kapalı"),
+        StatusCardViewModel("CUDA kullanılabilir", cuda_text),
+        StatusCardViewModel(
+            "Geri dönüş",
+            "Evet" if runtime.fallback_occurred else "Hayır",
+        ),
+    ]
+    for label, value in (
+        ("Model yükleme", runtime.model_loading_seconds),
+        ("Model ısınma", runtime.warmup_seconds),
+        ("Son ASR çıkarımı", runtime.latest_inference_seconds),
+        ("Gerçek zaman katsayısı", runtime.latest_real_time_factor),
+    ):
+        suffix = "x" if label == "Gerçek zaman katsayısı" else " sn"
+        rendered = "Henüz ölçülmedi" if value is None else f"{value:.2f}{suffix}"
+        values.append(StatusCardViewModel(label, rendered))
     return tuple(values)
 
 
@@ -1970,6 +2244,11 @@ def _render_execution_status(snapshot: DashboardExecutionSnapshot) -> None:
             StatusCardViewModel("Anlık revizyon", str(snapshot.revision)),
         )
     )
+    uploaded_runtime = snapshot.uploaded_asr_runtime
+    if uploaded_runtime is not None and not microphone_mode:
+        _metric_rows(_uploaded_asr_runtime_cards(uploaded_runtime))
+        if uploaded_runtime.failure_reason is not UploadedASRFailureReason.NONE:
+            st.error(_UPLOADED_ASR_FAILURE_TEXT[uploaded_runtime.failure_reason])
     if (
         snapshot.lifecycle_status is DashboardExecutionStatus.RUNNING
         and snapshot.processed_chunks
@@ -2194,6 +2473,10 @@ with st.sidebar:
                     realtime = (
                         execution_mode is DashboardExecutionMode.REALTIME_SIMULATION
                     )
+                    uploaded_asr_runtime: list[UploadedASRRuntimeMetadata | None] = [
+                        None
+                    ]
+                    uploaded_asr_engine: list[FasterWhisperEngine | None] = [None]
 
                     def process_uploaded_audio(
                         cancellation: Event,
@@ -2214,15 +2497,50 @@ with st.sidebar:
                                     execution_mode=execution_mode,
                                     execution_stage=stage,
                                     audio_metadata=selected_metadata,
+                                    uploaded_asr_runtime=uploaded_asr_runtime[0],
                                 )
                             )
 
+                        def publish_runtime(
+                            runtime_metadata: UploadedASRRuntimeMetadata,
+                        ) -> None:
+                            uploaded_asr_runtime[0] = runtime_metadata
+                            stage = {
+                                UploadedASRReadiness.PREPARING_MODEL: (
+                                    DashboardExecutionStage.UPLOADED_MODEL_PREPARING
+                                ),
+                                UploadedASRReadiness.WARMING_UP: (
+                                    DashboardExecutionStage.UPLOADED_MODEL_WARMING_UP
+                                ),
+                                UploadedASRReadiness.READY_TO_PROCESS: (
+                                    DashboardExecutionStage.UPLOADED_MODEL_READY
+                                ),
+                                UploadedASRReadiness.FAILED: (
+                                    DashboardExecutionStage.UPLOADED_MODEL_PREPARATION_FAILED
+                                ),
+                            }.get(
+                                runtime_metadata.readiness,
+                                DashboardExecutionStage.ENGINE_RUNNING,
+                            )
+                            publish_stage(stage)
+
                         publish_stage(DashboardExecutionStage.FILE_PREPARING)
+                        prepared_engine, prepared_runtime = (
+                            _prepare_uploaded_asr_engine(
+                                local.runtime.tenant.config.asr,
+                                publish_runtime=publish_runtime,
+                            )
+                        )
+                        uploaded_asr_engine[0] = prepared_engine
+                        uploaded_asr_runtime[0] = prepared_runtime
+                        if cancellation.is_set():
+                            raise RuntimeError("dashboard_execution_cancelled")
                         pipeline = _make_pipeline(
                             local.runtime,
                             service_selection,
                             artifact_availability,
                             execution_resource,
+                            engine=uploaded_asr_engine[0],
                         )
                         pipeline.configure_provisional_coaching(
                             ProvisionalClassificationPolicy(enabled=True)
@@ -2237,6 +2555,21 @@ with st.sidebar:
                         def show_step(step: StreamingASRStep) -> None:
                             if cancellation.is_set():
                                 raise RuntimeError("dashboard_execution_cancelled")
+                            if uploaded_asr_runtime[0] is not None:
+                                window_duration = step.window_duration_seconds
+                                uploaded_asr_runtime[0] = replace(
+                                    uploaded_asr_runtime[0],
+                                    readiness=UploadedASRReadiness.PROCESSING,
+                                    latest_inference_seconds=(
+                                        step.transcription_time_seconds
+                                    ),
+                                    latest_real_time_factor=(
+                                        step.transcription_time_seconds
+                                        / window_duration
+                                        if window_duration > 0
+                                        else None
+                                    ),
+                                )
                             publish_stage(DashboardExecutionStage.CHUNK_PROCESSING)
                             if wait_for_live_cadence(
                                 step,
@@ -2250,7 +2583,7 @@ with st.sidebar:
                         if selected_upload is not None:
                             upload_name, content = selected_upload
                             with temporary_uploaded_audio(upload_name, content) as path:
-                                execute_local_once(
+                                succeeded = execute_local_once(
                                     local,
                                     pipeline,
                                     path,
@@ -2262,7 +2595,7 @@ with st.sidebar:
                             path = Path(selected_path).expanduser()
                             if not path.is_file():
                                 raise ValueError("Ses dosyası bulunamadı")
-                            execute_local_once(
+                            succeeded = execute_local_once(
                                 local,
                                 pipeline,
                                 path,
@@ -2270,6 +2603,8 @@ with st.sidebar:
                                 show_plan,
                                 retain_pipeline_history=False,
                             )
+                        if not succeeded:
+                            raise RuntimeError("uploaded_audio_pipeline_failed")
                         execution_resource.drain_completed(
                             current_seconds=local.audio_duration_seconds or 0.0,
                         )
@@ -2281,6 +2616,7 @@ with st.sidebar:
                             execution_mode=execution_mode,
                             execution_stage=DashboardExecutionStage.COMPLETED,
                             audio_metadata=selected_metadata,
+                            uploaded_asr_runtime=uploaded_asr_runtime[0],
                         )
 
                     def run_uploaded_audio(
@@ -2289,8 +2625,59 @@ with st.sidebar:
                     ) -> DashboardExecutionSnapshot:
                         try:
                             return process_uploaded_audio(cancellation, publish)
+                        except _UploadedASRPreparationError as error:
+                            uploaded_asr_runtime[0] = error.runtime
+                            cancelled = cancellation.is_set()
+                            local.status = "cancelled" if cancelled else "error"
+                            terminal_stage = (
+                                DashboardExecutionStage.CANCELLED
+                                if cancelled
+                                else (
+                                    DashboardExecutionStage.UPLOADED_MODEL_PREPARATION_FAILED
+                                )
+                            )
+                            local.stage = _EXECUTION_STAGE_TEXT[terminal_stage]
+                            local.error_message = (
+                                None
+                                if cancelled
+                                else _UPLOADED_ASR_FAILURE_TEXT[
+                                    error.runtime.failure_reason
+                                ]
+                            )
+                            return execution_snapshot(
+                                local,
+                                revision=(
+                                    (
+                                        execution_resource.latest_snapshot.revision
+                                        if execution_resource.latest_snapshot
+                                        is not None
+                                        else 0
+                                    )
+                                    + 1
+                                ),
+                                lifecycle_status=(
+                                    DashboardExecutionStatus.CANCELLED
+                                    if cancelled
+                                    else DashboardExecutionStatus.FAILED
+                                ),
+                                execution_mode=execution_mode,
+                                execution_stage=terminal_stage,
+                                audio_metadata=selected_metadata,
+                                failure_reason=(
+                                    None if cancelled else "processing_failed"
+                                ),
+                                uploaded_asr_runtime=uploaded_asr_runtime[0],
+                            )
                         except Exception:
                             cancelled = cancellation.is_set()
+                            if uploaded_asr_runtime[0] is not None and not cancelled:
+                                uploaded_asr_runtime[0] = replace(
+                                    uploaded_asr_runtime[0],
+                                    readiness=UploadedASRReadiness.FAILED,
+                                    failure_reason=(
+                                        UploadedASRFailureReason.PIPELINE_FAILED
+                                    ),
+                                )
                             local.status = "cancelled" if cancelled else "error"
                             terminal_stage = (
                                 DashboardExecutionStage.CANCELLED
@@ -2325,7 +2712,11 @@ with st.sidebar:
                                 failure_reason=(
                                     None if cancelled else "processing_failed"
                                 ),
+                                uploaded_asr_runtime=uploaded_asr_runtime[0],
                             )
+                        finally:
+                            _release_uploaded_asr_engine(uploaded_asr_engine[0])
+                            uploaded_asr_engine[0] = None
 
                     if execution_resource.start_worker(initial, run_uploaded_audio):
                         st.rerun()

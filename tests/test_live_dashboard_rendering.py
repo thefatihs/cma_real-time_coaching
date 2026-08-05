@@ -660,6 +660,374 @@ def test_uploaded_audio_asr_factory_remains_cpu_int8(
     assert captured["beam_size"] == 5
 
 
+def test_uploaded_audio_profile_defaults_to_current_cpu_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    config = tenant_demos()["tenant_alpha"].config.asr
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            captured.update(model_name=model_name, **kwargs)
+
+    monkeypatch.setattr(app, "FasterWhisperEngine", FakeEngine)
+    profile = app._uploaded_asr_profile(config, environment={})
+    engine, runtime = app._prepare_uploaded_asr_engine(
+        config,
+        environment={},
+        publish_runtime=lambda _runtime: None,
+    )
+
+    assert profile.name is app.UploadedASRProfileName.CPU_LARGE_V3
+    assert captured == {
+        "model_name": "large-v3",
+        "device": "cpu",
+        "compute_type": "int8",
+        "language": "tr",
+        "beam_size": 5,
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+        "initial_prompt": None,
+    }
+    assert engine is not None
+    assert runtime.readiness is app.UploadedASRReadiness.READY_TO_PROCESS
+    assert runtime.model_loading_seconds is None
+    assert runtime.warmup_seconds is None
+    assert not runtime.fallback_occurred
+
+
+def test_uploaded_gpu_profile_prepares_exact_model_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    config = tenant_demos()["tenant_alpha"].config.asr
+    calls: dict[str, object] = {"loads": 0, "warmups": 0}
+    published: list[Any] = []
+
+    class FakeEngine:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            calls.update(model_name=model_name, **kwargs)
+
+        def load_model(self) -> float:
+            calls["loads"] = cast(int, calls["loads"]) + 1
+            return 4.0
+
+        def warm_up(self) -> float:
+            calls["warmups"] = cast(int, calls["warmups"]) + 1
+            return 1.5
+
+        def release_model(self) -> bool:
+            return True
+
+    monkeypatch.setattr(app, "FasterWhisperEngine", FakeEngine)
+    monkeypatch.setattr(
+        app,
+        "_inspect_uploaded_asr_cuda",
+        lambda: app._LocalMicrophoneCUDAReadiness(
+            available=True,
+            supported_compute_types=frozenset({"float16"}),
+        ),
+    )
+
+    engine, runtime = app._prepare_uploaded_asr_engine(
+        config,
+        environment={app._UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY: "gpu-large-v3"},
+        publish_runtime=published.append,
+    )
+
+    assert engine is not None
+    assert calls == {
+        "loads": 1,
+        "warmups": 1,
+        "model_name": "large-v3",
+        "device": "cuda",
+        "compute_type": "float16",
+        "language": "tr",
+        "beam_size": 5,
+        "vad_filter": True,
+        "condition_on_previous_text": False,
+        "initial_prompt": None,
+    }
+    assert runtime.profile_name is app.UploadedASRProfileName.GPU_LARGE_V3
+    assert runtime.readiness is app.UploadedASRReadiness.READY_TO_PROCESS
+    assert runtime.cuda_available
+    assert runtime.model_loading_seconds == pytest.approx(4.0)
+    assert runtime.warmup_seconds == pytest.approx(1.5)
+    assert not runtime.fallback_occurred
+    assert [item.readiness for item in published][-2:] == [
+        app.UploadedASRReadiness.WARMING_UP,
+        app.UploadedASRReadiness.READY_TO_PROCESS,
+    ]
+
+
+def test_uploaded_and_microphone_profile_environment_keys_are_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    config = state.runtime.tenant.config.asr
+
+    uploaded = app._uploaded_asr_profile(
+        config,
+        environment={app._LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY: "gpu-large-v3"},
+    )
+    microphone = app._local_microphone_asr_profile(
+        state.runtime,
+        environment={app._UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY: "gpu-large-v3"},
+    )
+
+    assert uploaded.name is app.UploadedASRProfileName.CPU_LARGE_V3
+    assert microphone.name is app.LocalMicrophoneASRProfileName.CPU_TINY
+
+
+@pytest.mark.parametrize(
+    ("cuda_available", "supported", "expected_reason"),
+    [
+        (False, frozenset(), "CUDA_UNAVAILABLE"),
+        (True, frozenset({"int8"}), "FLOAT16_UNSUPPORTED"),
+    ],
+)
+def test_uploaded_gpu_readiness_fails_before_engine_or_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_available: bool,
+    supported: frozenset[str],
+    expected_reason: str,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    config = tenant_demos()["tenant_alpha"].config.asr
+    published: list[Any] = []
+
+    monkeypatch.setattr(
+        app,
+        "_inspect_uploaded_asr_cuda",
+        lambda: app._LocalMicrophoneCUDAReadiness(
+            available=cuda_available,
+            supported_compute_types=supported,
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "_create_uploaded_asr_engine",
+        lambda *_args: pytest.fail("engine must not be constructed"),
+    )
+
+    with pytest.raises(app._UploadedASRPreparationError) as raised:
+        app._prepare_uploaded_asr_engine(
+            config,
+            environment={app._UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY: "gpu-large-v3"},
+            publish_runtime=published.append,
+        )
+
+    assert raised.value.runtime.failure_reason.value == expected_reason
+    assert published[-1].readiness is app.UploadedASRReadiness.FAILED
+    assert not published[-1].fallback_occurred
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "expected_reason"),
+    [("load", "MODEL_LOAD_FAILED"), ("warmup", "WARMUP_FAILED")],
+)
+def test_uploaded_gpu_preparation_failure_releases_engine_once(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    expected_reason: str,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    config = tenant_demos()["tenant_alpha"].config.asr
+    calls = {"released": 0}
+
+    class FakeEngine:
+        def load_model(self) -> float:
+            if failure_stage == "load":
+                raise RuntimeError("synthetic")
+            return 2.0
+
+        def warm_up(self) -> float:
+            if failure_stage == "warmup":
+                raise RuntimeError("synthetic")
+            return 1.0
+
+        def release_model(self) -> bool:
+            calls["released"] += 1
+            return True
+
+    monkeypatch.setattr(
+        app,
+        "_inspect_uploaded_asr_cuda",
+        lambda: app._LocalMicrophoneCUDAReadiness(
+            available=True,
+            supported_compute_types=frozenset({"float16"}),
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "_create_uploaded_asr_engine",
+        lambda *_args: FakeEngine(),
+    )
+
+    with pytest.raises(app._UploadedASRPreparationError) as raised:
+        app._prepare_uploaded_asr_engine(
+            config,
+            environment={app._UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY: "gpu-large-v3"},
+            publish_runtime=lambda _runtime: None,
+        )
+
+    assert raised.value.runtime.failure_reason.value == expected_reason
+    assert calls["released"] == 1
+
+
+def test_uploaded_model_preparation_failure_terminates_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "upload-call")
+    resource = app._execution_resource(state.runtime)
+    initial = execution_snapshot(
+        state,
+        revision=0,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        execution_stage=DashboardExecutionStage.STARTING,
+    )
+    calls = {"released": 0}
+
+    class FakeEngine:
+        def load_model(self) -> float:
+            return 1.0
+
+        def warm_up(self) -> float:
+            raise RuntimeError("synthetic")
+
+        def release_model(self) -> bool:
+            calls["released"] += 1
+            return True
+
+    monkeypatch.setattr(
+        app,
+        "_inspect_uploaded_asr_cuda",
+        lambda: app._LocalMicrophoneCUDAReadiness(
+            available=True,
+            supported_compute_types=frozenset({"float16"}),
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "_create_uploaded_asr_engine",
+        lambda *_args: FakeEngine(),
+    )
+
+    def task(_cancellation: Event, _publish: Any) -> Any:
+        try:
+            app._prepare_uploaded_asr_engine(
+                state.runtime.tenant.config.asr,
+                environment={app._UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY: "gpu-large-v3"},
+                publish_runtime=lambda _runtime: None,
+            )
+        except app._UploadedASRPreparationError as error:
+            return replace(
+                initial,
+                revision=1,
+                lifecycle_status=DashboardExecutionStatus.FAILED,
+                execution_stage=(
+                    DashboardExecutionStage.UPLOADED_MODEL_PREPARATION_FAILED
+                ),
+                failure_reason="processing_failed",
+                uploaded_asr_runtime=error.runtime,
+            )
+        raise AssertionError("preparation should fail")
+
+    assert resource.start_worker(initial, task)
+    resource.join_worker()
+
+    assert not resource.worker_active
+    assert resource.latest_snapshot is not None
+    assert resource.latest_snapshot.lifecycle_status is DashboardExecutionStatus.FAILED
+    assert calls["released"] == 1
+    resource.close()
+    assert calls["released"] == 1
+
+
+def test_unknown_uploaded_profile_fails_closed_with_fixed_turkish_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    config = tenant_demos()["tenant_alpha"].config.asr
+
+    with pytest.raises(app._UploadedASRPreparationError) as raised:
+        app._prepare_uploaded_asr_engine(
+            config,
+            environment={app._UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY: "unknown"},
+            publish_runtime=lambda _runtime: None,
+        )
+
+    assert (
+        raised.value.runtime.failure_reason
+        is app.UploadedASRFailureReason.INVALID_PROFILE
+    )
+    assert (
+        app._UPLOADED_ASR_FAILURE_TEXT[raised.value.runtime.failure_reason]
+        == "Geçersiz yüklenen ses ASR profili. "
+        "cpu-large-v3 veya gpu-large-v3 seçin."
+    )
+
+
+def test_uploaded_runtime_cards_show_actual_safe_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    runtime = app.UploadedASRRuntimeMetadata(
+        profile_name=app.UploadedASRProfileName.GPU_LARGE_V3,
+        model_name="large-v3",
+        device="cuda",
+        compute_type="float16",
+        language="tr",
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        readiness=app.UploadedASRReadiness.PROCESSING,
+        cuda_available=True,
+        model_loading_seconds=4.0,
+        warmup_seconds=1.0,
+        latest_inference_seconds=0.5,
+        latest_real_time_factor=0.25,
+    )
+
+    cards = {
+        card.label: card.value for card in app._uploaded_asr_runtime_cards(runtime)
+    }
+
+    assert cards == {
+        "Yüklenen ses ASR profili": "gpu-large-v3",
+        "Model": "large-v3",
+        "Aygıt": "cuda",
+        "Hesaplama": "float16",
+        "Dil": "tr",
+        "Beam": "5",
+        "VAD": "Açık",
+        "CUDA kullanılabilir": "Evet",
+        "Geri dönüş": "Hayır",
+        "Model yükleme": "4.00 sn",
+        "Model ısınma": "1.00 sn",
+        "Son ASR çıkarımı": "0.50 sn",
+        "Gerçek zaman katsayısı": "0.25x",
+    }
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "upload-call")
+    snapshot = execution_snapshot(
+        state,
+        revision=1,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        execution_stage=DashboardExecutionStage.CHUNK_PROCESSING,
+        uploaded_asr_runtime=runtime,
+    )
+
+    app._render_execution_status(snapshot)
+
+    assert ("Yüklenen ses ASR profili", "gpu-large-v3") in recorder.metrics
+    assert ("Geri dönüş", "Hayır") in recorder.metrics
+
+
 def test_unknown_local_microphone_profile_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1800,10 +2168,15 @@ def test_uploaded_start_handoff_is_visible_and_survives_rerun(
     resources: list[Any] = []
     pacing_modes: list[bool] = []
     generator_calls = 0
+    engine_calls = {"constructed": 0, "released": 0}
 
     class FakeEngine:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            pass
+            engine_calls["constructed"] += 1
+
+        def release_model(self) -> bool:
+            engine_calls["released"] += 1
+            return True
 
     class FakeTranscriber:
         def transcribe(self, window: Any) -> WindowTranscriptionResult:
@@ -1901,6 +2274,7 @@ def test_uploaded_start_handoff_is_visible_and_survives_rerun(
     )
     assert resources == [resource]
     assert not resource.closed
+    assert engine_calls == {"constructed": 1, "released": 0}
     assert expected_realtime in pacing_modes
     assert any(metric.value == "1/2 parça" for metric in test.metric)
     assert test.button[0].disabled
@@ -1911,7 +2285,9 @@ def test_uploaded_start_handoff_is_visible_and_survives_rerun(
 
     release.set()
     resource.join_worker()
+    assert engine_calls == {"constructed": 1, "released": 1}
     resource.close()
+    assert engine_calls == {"constructed": 1, "released": 1}
 
 
 def test_uploaded_start_without_file_remains_fail_closed() -> None:

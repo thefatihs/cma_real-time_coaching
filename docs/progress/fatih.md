@@ -281,3 +281,21 @@ This log uses local chronological numbering and records only Fatih-owned work.
   documented Ubuntu/POSIX vLLM controller failures.
 - Next planned step: run manual `gpu-large-v3` acceptance on a CUDA machine and
   verify displayed load, warm-up, inference, and real-time-factor diagnostics.
+
+## Uploaded-audio GPU ASR profile
+
+- Added independent `CALLMETRIC_UPLOADED_ASR_PROFILE` selection with the
+  unchanged `cpu-large-v3` default and an exact, no-fallback
+  `gpu-large-v3` CUDA/float16 option.
+- GPU upload processing now verifies CTranslate2 CUDA/float16 support, loads
+  `large-v3`, and completes a synthetic warm-up before audio chunk generation.
+  Immutable snapshots expose only bounded runtime settings and timing metadata.
+- Changed files: Fatih-owned dashboard app/view models, focused dashboard
+  tests, and this progress file.
+- Tests: focused upload/ASR/dashboard/streaming 229 passed; PyAV/media 128
+  passed; full Windows suite 2508 passed and 17 skipped, with only the 19
+  documented POSIX vLLM controller failures.
+- Ruff, format, lock, dependency, conflict-marker, and diff checks passed.
+  Pyright remains limited to the three documented POSIX portability findings.
+- Next planned step: manually verify both upload and microphone GPU profiles on
+  the CUDA target while confirming displayed preparation and inference timing.

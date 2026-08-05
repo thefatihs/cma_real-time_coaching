@@ -145,11 +145,61 @@ class DashboardExecutionStage(str, Enum):
     MICROPHONE_OVERLOADED = "MICROPHONE_OVERLOADED"
     STARTING = "STARTING"
     FILE_PREPARING = "FILE_PREPARING"
+    UPLOADED_MODEL_PREPARING = "UPLOADED_MODEL_PREPARING"
+    UPLOADED_MODEL_WARMING_UP = "UPLOADED_MODEL_WARMING_UP"
+    UPLOADED_MODEL_READY = "UPLOADED_MODEL_READY"
+    UPLOADED_MODEL_PREPARATION_FAILED = "UPLOADED_MODEL_PREPARATION_FAILED"
     ENGINE_RUNNING = "ENGINE_RUNNING"
     CHUNK_PROCESSING = "CHUNK_PROCESSING"
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+
+
+class UploadedASRProfileName(str, Enum):
+    CPU_LARGE_V3 = "cpu-large-v3"
+    GPU_LARGE_V3 = "gpu-large-v3"
+
+
+class UploadedASRReadiness(str, Enum):
+    PREPARING_MODEL = "PREPARING_MODEL"
+    WARMING_UP = "WARMING_UP"
+    READY_TO_PROCESS = "READY_TO_PROCESS"
+    PROCESSING = "PROCESSING"
+    FAILED = "FAILED"
+
+
+class UploadedASRFailureReason(str, Enum):
+    NONE = "NONE"
+    INVALID_PROFILE = "INVALID_PROFILE"
+    CUDA_CHECK_FAILED = "CUDA_CHECK_FAILED"
+    CUDA_UNAVAILABLE = "CUDA_UNAVAILABLE"
+    FLOAT16_UNSUPPORTED = "FLOAT16_UNSUPPORTED"
+    MODEL_LOAD_FAILED = "MODEL_LOAD_FAILED"
+    WARMUP_FAILED = "WARMUP_FAILED"
+    PIPELINE_FAILED = "PIPELINE_FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class UploadedASRRuntimeMetadata:
+    """Bounded privacy-safe runtime facts for uploaded-audio ASR."""
+
+    profile_name: UploadedASRProfileName | None
+    model_name: str
+    device: str
+    compute_type: str
+    language: str
+    beam_size: int
+    vad_filter: bool
+    condition_on_previous_text: bool
+    readiness: UploadedASRReadiness
+    failure_reason: UploadedASRFailureReason = UploadedASRFailureReason.NONE
+    cuda_available: bool | None = None
+    model_loading_seconds: float | None = None
+    warmup_seconds: float | None = None
+    latest_inference_seconds: float | None = None
+    latest_real_time_factor: float | None = None
+    fallback_occurred: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +382,7 @@ class DashboardExecutionSnapshot:
     latency: LatencyViewModel | None
     failure_reason: str | None
     tabs: DashboardTabsViewModel
+    uploaded_asr_runtime: UploadedASRRuntimeMetadata | None = None
 
 
 @dataclass(slots=True)
@@ -1316,6 +1367,7 @@ def execution_snapshot(
     execution_stage: DashboardExecutionStage | None = None,
     audio_metadata: SafeUploadMetadata | None = None,
     failure_reason: str | None = None,
+    uploaded_asr_runtime: UploadedASRRuntimeMetadata | None = None,
 ) -> DashboardExecutionSnapshot:
     """Freeze one bounded latest-value projection without retaining audio."""
     if revision < 0:
@@ -1382,6 +1434,7 @@ def execution_snapshot(
         latency=technical.latency,
         failure_reason=failure_reason,
         tabs=bounded_tabs,
+        uploaded_asr_runtime=uploaded_asr_runtime,
     )
 
 

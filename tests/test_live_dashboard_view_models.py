@@ -37,6 +37,9 @@ from live_dashboard.uploaded_audio import (
 )
 from live_dashboard.view_models import (
     DashboardExecutionStatus,
+    UploadedASRProfileName,
+    UploadedASRReadiness,
+    UploadedASRRuntimeMetadata,
     advance_runtime,
     apply_feedback,
     consume_live_step,
@@ -630,6 +633,33 @@ def test_execution_snapshot_is_bounded_immutable_and_exposes_current_progress() 
     assert len(snapshot.tabs.technical.asr_chart) <= 64
     with pytest.raises((AttributeError, TypeError)):
         snapshot.revision = 4  # type: ignore[misc]
+
+
+def test_execution_snapshot_retains_immutable_uploaded_asr_runtime_metadata() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    runtime = UploadedASRRuntimeMetadata(
+        profile_name=UploadedASRProfileName.GPU_LARGE_V3,
+        model_name="large-v3",
+        device="cuda",
+        compute_type="float16",
+        language="tr",
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        readiness=UploadedASRReadiness.READY_TO_PROCESS,
+        cuda_available=True,
+    )
+
+    snapshot = execution_snapshot(
+        state,
+        revision=1,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+        uploaded_asr_runtime=runtime,
+    )
+
+    assert snapshot.uploaded_asr_runtime is runtime
+    with pytest.raises((AttributeError, TypeError)):
+        runtime.device = "cpu"  # type: ignore[misc]
 
 
 def test_live_step_updates_latest_only_state_with_exact_scope() -> None:
