@@ -259,6 +259,26 @@ def test_reconcile_is_fail_closed_and_preserves_unrelated_files(tmp_path: Path) 
     assert unrelated.read_text(encoding="utf-8") == "unrelated"
 
 
+def test_reconcile_ignores_ephemeral_document_without_storage_key(
+    tmp_path: Path,
+) -> None:
+    subject = storage(tmp_path, key_factory=lambda: "a" * 32)
+    legacy_key = subject.write(b"legacy")
+    root = tmp_path / "private-storage"
+    unrelated = root / "operator-note.txt"
+    unrelated.write_text("unrelated", encoding="utf-8")
+    os.utime(root / legacy_key, (1, 1))
+
+    result = subject.reconcile_orphans(
+        RegistryStorageKeySnapshot(frozenset({legacy_key, None}), complete=True),
+        grace_seconds=300,
+    )
+
+    assert result == OrphanReconciliationResult(1, 0, 0, 1)
+    assert (root / legacy_key).is_file()
+    assert unrelated.read_text(encoding="utf-8") == "unrelated"
+
+
 def test_reconcile_honors_grace_and_deterministic_batch_bound(tmp_path: Path) -> None:
     values = iter(f"{index:032x}" for index in range(MAX_RECONCILE_BATCH_SIZE + 2))
     subject = storage(tmp_path, key_factory=lambda: next(values), clock=lambda: 1_000.0)
@@ -323,7 +343,9 @@ def test_storage_precedes_registry_and_duplicate_cleanup(tmp_path: Path) -> None
             self, request: DocumentRegistryCreateRequest
         ) -> DocumentRegistryCreateResult:
             order.append("registry")
-            assert (tmp_path / "private-storage" / request.storage_object_key).is_file()
+            key = request.storage_object_key
+            assert key is not None
+            assert (tmp_path / "private-storage" / key).is_file()
             return duplicate
 
     def request_factory(key: str) -> DocumentRegistryCreateRequest:
@@ -382,3 +404,31 @@ def test_database_delete_precedes_source_delete(tmp_path: Path) -> None:
         document_id="doc-a",
     )
     assert order == ["database", "storage"]
+
+
+def test_ephemeral_database_delete_never_calls_persistent_storage(
+    tmp_path: Path,
+) -> None:
+    class Repository:
+        def delete_document(self, **scope: str) -> DocumentDeletionResult:
+            return DocumentDeletionResult(storage_object_key=None)
+
+    class RecordingStorage(PersistentDocumentStorage):
+        def delete(self, key: str) -> StorageDeleteOutcome:
+            raise AssertionError("ephemeral document has no storage object")
+
+    storage(tmp_path)
+    subject = RecordingStorage(
+        root=tmp_path / "private-storage",
+        repository_root=tmp_path / "repository",
+        user_profile=tmp_path / "profile",
+        privacy_validator=AcceptPrivacy(),
+    )
+
+    assert delete_document_then_source(
+        Repository(),  # type: ignore[arg-type]
+        subject,
+        tenant_id="tenant-a",
+        knowledge_base_id="kb-a",
+        document_id="doc-a",
+    )

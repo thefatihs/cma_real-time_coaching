@@ -38,6 +38,10 @@ class DocumentRegistryRepository(Protocol):
         self, *, tenant_id: str, knowledge_base_id: str
     ) -> tuple[str, ...]: ...
 
+    def fail_interrupted_jobs(
+        self, *, tenant_id: str, knowledge_base_id: str
+    ) -> int: ...
+
     def list_document_page(
         self,
         *,

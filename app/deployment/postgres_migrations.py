@@ -54,6 +54,18 @@ _MIGRATIONS = (
             "vector_records",
         ),
     ),
+    _RegisteredMigration(
+        version="0003",
+        relative_path="migrations/postgres/0003_ephemeral_document_sources.sql",
+        sha256="0e62fa50728d6ccde59188f92fb98a4fa9d882f4fbd77228f589468844bd0d86",
+        expected_tables_after=(
+            "document_ingestion_jobs",
+            "documents",
+            "embedding_profiles",
+            "schema_migrations",
+            "vector_records",
+        ),
+    ),
 )
 
 # Compatibility aliases retained for callers and tests that verify immutable 0001.

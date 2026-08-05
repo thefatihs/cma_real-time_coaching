@@ -49,6 +49,16 @@ def test_create_request_accepts_only_scoped_lowercase_digest() -> None:
         create_request(media_type="application/octet-stream")
 
 
+def test_fresh_document_accepts_no_persistent_source_key() -> None:
+    assert create_request(storage_object_key=None).storage_object_key is None
+
+
+def test_legacy_nonnull_source_key_remains_validated() -> None:
+    assert create_request().storage_object_key == "documents/server-object-1"
+    with pytest.raises(ValidationError):
+        create_request(storage_object_key="../client-path")
+
+
 @pytest.mark.parametrize(
     "phase",
     (

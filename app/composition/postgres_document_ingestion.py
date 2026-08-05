@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.composition.postgres_rag import (
@@ -16,13 +14,6 @@ from app.composition.postgres_rag import (
 )
 from app.embeddings.sentence_transformers import BackendFactory
 from app.ingestion.document_background import BoundedDocumentIngestionManager
-from app.ingestion.persistent_storage import (
-    MAX_ORPHAN_GRACE_SECONDS,
-    MIN_ORPHAN_GRACE_SECONDS,
-    OrphanReconciliationResult,
-    PersistentDocumentStorage,
-    RegistryStorageKeySnapshot,
-)
 from app.ingestion.postgres_registry import PsycopgDocumentRegistryRepository
 
 MINILM_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -34,17 +25,8 @@ class PostgreSQLDocumentIngestionSettings(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    storage_root: Path
     max_workers: int = 1
     capacity: int = 1
-    orphan_grace_seconds: int = 86_400
-
-    @field_validator("storage_root")
-    @classmethod
-    def validate_storage_root(cls, value: Path) -> Path:
-        if not value.is_absolute():
-            raise ValueError("storage_root must be absolute")
-        return value
 
     @field_validator("max_workers", mode="before")
     @classmethod
@@ -60,16 +42,6 @@ class PostgreSQLDocumentIngestionSettings(BaseModel):
             raise ValueError("capacity must be between 1 and 8")
         return value
 
-    @field_validator("orphan_grace_seconds", mode="before")
-    @classmethod
-    def validate_orphan_grace(cls, value: object) -> int:
-        if (
-            type(value) is not int
-            or not MIN_ORPHAN_GRACE_SECONDS <= value <= MAX_ORPHAN_GRACE_SECONDS
-        ):
-            raise ValueError("orphan_grace_seconds is outside the allowed range")
-        return value
-
 
 @dataclass(frozen=True, slots=True)
 class PostgreSQLDocumentIngestionRuntime:
@@ -77,26 +49,9 @@ class PostgreSQLDocumentIngestionRuntime:
 
     manager: BoundedDocumentIngestionManager
     registry: PsycopgDocumentRegistryRepository
-    storage: PersistentDocumentStorage
     postgres_rag: PostgreSQLRAGComposition
     tenant_id: str
     knowledge_base_id: str
-    orphan_grace_seconds: int
-
-    def reconcile_orphans(self) -> OrphanReconciliationResult:
-        """Take a complete scoped snapshot before a bounded fail-closed cleanup."""
-        try:
-            keys = self.registry.list_storage_object_keys(
-                tenant_id=self.tenant_id,
-                knowledge_base_id=self.knowledge_base_id,
-            )
-        except Exception:
-            return OrphanReconciliationResult(0, 0, 0, 0)
-        return self.storage.reconcile_orphans(
-            RegistryStorageKeySnapshot(keys=frozenset(keys), complete=True),
-            grace_seconds=self.orphan_grace_seconds,
-            batch_size=100,
-        )
 
     def close(self, *, wait: bool = False) -> None:
         self.manager.close(wait=wait)
@@ -129,7 +84,6 @@ def compose_postgres_document_ingestion(
         )
 
     registry = PsycopgDocumentRegistryRepository(connection_factory=connection_factory)
-    storage = PersistentDocumentStorage(root=ingestion_settings.storage_root)
 
     def verify_registered_profile() -> None:
         stored = postgres_rag.profile_repository.get_profile(
@@ -144,7 +98,6 @@ def compose_postgres_document_ingestion(
         knowledge_base_id=knowledge_base_settings.knowledge_base_id,
         capacity=ingestion_settings.capacity,
         registry=registry,
-        storage=storage,
         document_embedder=postgres_rag.embedder,
         vector_writer=postgres_rag.vector_store,
         expected_vector_dimension=MINILM_DIMENSION,
@@ -153,11 +106,9 @@ def compose_postgres_document_ingestion(
     return PostgreSQLDocumentIngestionRuntime(
         manager=manager,
         registry=registry,
-        storage=storage,
         postgres_rag=postgres_rag,
         tenant_id=knowledge_base_settings.tenant_id,
         knowledge_base_id=knowledge_base_settings.knowledge_base_id,
-        orphan_grace_seconds=ingestion_settings.orphan_grace_seconds,
     )
 
 

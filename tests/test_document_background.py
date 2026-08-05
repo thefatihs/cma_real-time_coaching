@@ -106,6 +106,11 @@ class _Registry:
         self.calls: list[str] = []
         self.cancelled = Event()
         self.finished = Event()
+        self.recovery_scopes: list[dict[str, str]] = []
+
+    def fail_interrupted_jobs(self, **scope: str) -> int:
+        self.recovery_scopes.append(scope)
+        return 0
 
     def create_or_get(self, request: Any) -> DocumentRegistryCreateResult:
         self.calls.append("registry")
@@ -205,7 +210,6 @@ def _manager(
         knowledge_base_id="kb-trusted",
         capacity=capacity,
         registry=registry,  # type: ignore[arg-type]
-        storage=storage,  # type: ignore[arg-type]
         document_embedder=embedder or _Embedder(),  # type: ignore[arg-type]
         vector_writer=writer or _Writer(),  # type: ignore[arg-type]
         close_timeout_seconds=0.5,
@@ -221,22 +225,29 @@ def _submit(manager: BoundedDocumentIngestionManager, token: str = "token-1"):
     )
 
 
-def test_storage_precedes_registry_and_success_retains_source() -> None:
+def test_construction_recovers_interrupted_jobs_once_in_exact_scope() -> None:
+    registry = _Registry()
+    manager = _manager(registry, _Storage())
+    try:
+        assert registry.recovery_scopes == [
+            {"tenant_id": "tenant-trusted", "knowledge_base_id": "kb-trusted"}
+        ]
+    finally:
+        manager.close(wait=True)
+
+
+def test_success_uses_no_persistent_storage_and_releases_source() -> None:
     storage = _Storage()
     registry = _Registry()
-    original_create = registry.create_or_get
-
-    def checked_create(request: Any) -> DocumentRegistryCreateResult:
-        assert request.storage_object_key in storage.objects
-        return original_create(request)
-
-    registry.create_or_get = checked_create  # type: ignore[method-assign]
     manager = _manager(registry, storage)
     try:
         result = _submit(manager)
         assert result.status is DocumentSubmissionStatus.ACCEPTED
         assert registry.finished.wait(timeout=2)
-        assert storage.objects
+        assert not storage.objects
+        assert storage.write_calls == 0
+        assert manager.retained_source_bytes == 0
+        assert registry.request.storage_object_key is None
         assert registry.calls[:4] == ["registry", "claim", "EXTRACTION", "CHUNKING"]
     finally:
         manager.close(wait=True)
@@ -250,7 +261,8 @@ def test_duplicate_removes_only_new_object_and_queues_nothing() -> None:
         first = _submit(manager)
         second = _submit(manager)
         assert first is second
-        assert storage.deleted == ["obj_" + "0" * 63 + "1"]
+        assert storage.deleted == []
+        assert storage.write_calls == 0
         assert "claim" not in registry.calls
         assert manager.worker_count == 1
     finally:
@@ -303,18 +315,26 @@ def test_public_result_contains_no_internal_or_source_values() -> None:
         manager.close(wait=True)
 
 
-def test_storage_failure_creates_no_registry_row() -> None:
+def test_rejected_submission_retains_no_source() -> None:
     registry = _Registry()
-    manager = _manager(registry, _FailingStorage())
+    storage = _FailingStorage()
+    manager = _manager(registry, storage)
     try:
-        result = _submit(manager)
-        assert result.failure is DocumentBackgroundFailure.STORAGE
+        result = manager.submit(
+            submission_token="token-invalid",
+            content=b"",
+            original_filename="guide.txt",
+            declared_media_type="text/plain",
+        )
+        assert result.failure is DocumentBackgroundFailure.SUBMISSION
         assert registry.calls == []
+        assert manager.retained_source_bytes == 0
+        assert storage.write_calls == 0
     finally:
         manager.close(wait=True)
 
 
-def test_registry_failure_retains_only_bounded_reconcilable_object() -> None:
+def test_registry_failure_retains_no_source() -> None:
     storage = _Storage()
     registry = _Registry()
 
@@ -326,8 +346,9 @@ def test_registry_failure_retains_only_bounded_reconcilable_object() -> None:
     try:
         result = _submit(manager)
         assert result.failure is DocumentBackgroundFailure.REGISTRY_CREATE
-        assert len(storage.objects) == 1
+        assert storage.objects == {}
         assert storage.deleted == []
+        assert manager.retained_source_bytes == 0
         assert "synthetic" not in repr(result)
     finally:
         manager.close(wait=True)
@@ -348,7 +369,11 @@ def test_running_cancellation_after_embedding_prevents_vector_commit() -> None:
         gate.set()
         assert registry.finished.wait(timeout=2)
         assert writer.calls == 0
-        assert storage.objects
+        assert storage.objects == {}
+        deadline = monotonic() + 2
+        while manager.retained_source_bytes and monotonic() < deadline:
+            sleep(0.01)
+        assert manager.retained_source_bytes == 0
     finally:
         gate.set()
         manager.close(wait=True)

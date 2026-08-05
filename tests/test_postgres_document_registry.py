@@ -23,6 +23,7 @@ def row(
     total_chunks: int = 1,
     document_id: str = "doc-a",
     now: datetime | None = None,
+    storage_object_key: str | None = "objects/server-1",
 ) -> tuple[object, ...]:
     now = datetime.now(UTC) if now is None else now
     started = now if state != "QUEUED" else None
@@ -34,7 +35,7 @@ def row(
         "guide.txt",
         "text/plain",
         10,
-        "objects/server-1",
+        storage_object_key,
         now,
         now if ready else None,
         "job-a",
@@ -144,6 +145,16 @@ def test_create_document_and_job_commit_atomically_with_exact_scope() -> None:
     )
 
 
+def test_create_fresh_document_persists_null_source_key() -> None:
+    connection = FakeConnection([[("doc-a",)], [row(storage_object_key=None)]])
+    result = repository(connection).create_or_get(request(storage_object_key=None))
+
+    assert result.entry.document.storage_object_key is None
+    parameters = connection.cursor_value.executions[0][1]
+    assert isinstance(parameters, tuple)
+    assert parameters[-1] is None
+
+
 def test_duplicate_sha_returns_existing_identity_without_job_insert() -> None:
     connection = FakeConnection([[], [row()]])
     result = repository(connection).create_or_get(request(document_id="doc-other"))
@@ -176,6 +187,32 @@ def test_cross_scope_delete_is_non_disclosing_and_changes_nothing() -> None:
     )
     assert result is None
     assert len(connection.cursor_value.executions) == 1
+
+
+def test_delete_supports_fresh_document_without_source_key() -> None:
+    connection = FakeConnection([[row(storage_object_key=None)]])
+
+    result = repository(connection).delete_document(
+        tenant_id="tenant-a", knowledge_base_id="kb-a", document_id="doc-a"
+    )
+
+    assert result is not None and result.storage_object_key is None
+
+
+def test_interrupted_job_recovery_is_exact_scoped_and_terminal_safe() -> None:
+    connection = FakeConnection([])
+    connection.cursor_value.rowcount = 2
+
+    changed = repository(connection).fail_interrupted_jobs(
+        tenant_id="tenant-a", knowledge_base_id="kb-a"
+    )
+
+    assert changed == 2
+    query, parameters = connection.cursor_value.executions[0]
+    assert "state IN ('QUEUED', 'PROCESSING')" in query
+    assert "state = 'FAILED'" in query
+    assert "phase = 'FINALIZE'" in query
+    assert parameters == ("tenant-a", "kb-a")
 
 
 def test_connection_failure_is_fixed_and_secret_free() -> None:

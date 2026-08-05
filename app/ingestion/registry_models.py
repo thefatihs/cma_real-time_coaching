@@ -57,6 +57,7 @@ class DocumentOperationPhase(str, Enum):
     PROGRESS = "PROGRESS"
     CANCEL = "CANCEL"
     LIST = "LIST"
+    RECOVERY = "RECOVERY"
 
 
 _OPERATION_FAILURE_MESSAGES = {
@@ -84,7 +85,7 @@ class DocumentRegistryCreateRequest(BaseModel):
     media_type: str
     byte_size: int
     sha256_hex: str
-    storage_object_key: str
+    storage_object_key: str | None = None
     total_chunks: int
     initial_phase: DocumentIngestionPhase = DocumentIngestionPhase.EMBEDDING
 
@@ -117,8 +118,8 @@ class DocumentRegistryCreateRequest(BaseModel):
 
     @field_validator("storage_object_key")
     @classmethod
-    def validate_storage_key(cls, value: str) -> str:
-        return validate_storage_object_key(value)
+    def validate_storage_key(cls, value: str | None) -> str | None:
+        return None if value is None else validate_storage_object_key(value)
 
     @field_validator("total_chunks")
     @classmethod
@@ -151,7 +152,7 @@ class DocumentRegistryRecord(BaseModel):
     original_filename: str
     media_type: str
     byte_size: int
-    storage_object_key: str
+    storage_object_key: str | None
     created_at_utc: datetime
     ready_at_utc: datetime | None = None
 
@@ -177,8 +178,8 @@ class DocumentRegistryRecord(BaseModel):
 
     @field_validator("storage_object_key")
     @classmethod
-    def validate_storage_key(cls, value: str) -> str:
-        return validate_storage_object_key(value)
+    def validate_storage_key(cls, value: str | None) -> str | None:
+        return None if value is None else validate_storage_object_key(value)
 
     @model_validator(mode="after")
     def validate_timestamp_order(self) -> DocumentRegistryRecord:
@@ -340,12 +341,12 @@ class DocumentListPage:
 class DocumentDeletionResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    storage_object_key: str
+    storage_object_key: str | None
 
     @field_validator("storage_object_key")
     @classmethod
-    def validate_storage_key(cls, value: str) -> str:
-        return validate_storage_object_key(value)
+    def validate_storage_key(cls, value: str | None) -> str | None:
+        return None if value is None else validate_storage_object_key(value)
 
 
 def derive_document_readiness(

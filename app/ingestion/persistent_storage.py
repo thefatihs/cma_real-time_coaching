@@ -74,7 +74,7 @@ class StorageDeleteOutcome(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class RegistryStorageKeySnapshot:
-    keys: frozenset[str]
+    keys: frozenset[str | None]
     complete: bool
 
 
@@ -343,7 +343,9 @@ class PersistentDocumentStorage:
         if not snapshot.complete:
             return OrphanReconciliationResult(0, 0, 0, 0)
         try:
-            owned = frozenset(_validated_key(key) for key in snapshot.keys)
+            owned = frozenset(
+                _validated_key(key) for key in snapshot.keys if key is not None
+            )
             now = float(self._clock())
             if not isfinite(now):
                 raise ValueError
@@ -457,7 +459,8 @@ def delete_document_then_source(
     )
     if result is None:
         return False
-    storage.delete(result.storage_object_key)
+    if result.storage_object_key is not None:
+        storage.delete(result.storage_object_key)
     return True
 
 

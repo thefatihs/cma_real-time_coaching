@@ -51,7 +51,8 @@ wiring only and do not constitute a real embedding smoke test.
 
 The forward-only PostgreSQL migrator uses a fixed, ordered, digest-pinned
 manifest. It applies `0001_vector_store.sql` before
-`0002_document_registry.sql`, records both versions in
+`0002_document_registry.sql` and `0003_ephemeral_document_sources.sql`, records
+all three versions in
 `callmetric_vector.schema_migrations`, rejects altered migration content, and
 performs no arbitrary migration-file discovery or downgrade execution.
 
@@ -64,6 +65,10 @@ legacy `vector_records`; the existing embedding profile and vector behavior is
 unchanged. These tables provide persistence only. Dashboard document upload,
 extraction, embedding workers, object storage, and document services are not
 implemented by this migration.
+
+Migration `0003` only makes `documents.storage_object_key` nullable so new
+documents can follow the ephemeral-source policy. Existing non-null keys remain
+valid legacy metadata; neither migration nor readiness rewrites them.
 
 ## Phase-one document preparation
 
@@ -82,7 +87,8 @@ create embeddings or perform storage operations.
 
 The document-registry repository accepts validated domain models only. Every
 operation is scoped by trusted `tenant_id` and `knowledge_base_id`; document and
-job IDs and opaque storage object keys are server-owned inputs. Creation inserts
+job IDs are server-owned inputs. New documents use a null storage object key.
+Creation inserts
 the document and its `QUEUED` job atomically. SHA-256 duplicates are resolved by
 the database uniqueness constraint within that exact scope, without a
 check-before-insert race. A ready duplicate returns its existing document/job
@@ -100,47 +106,33 @@ are stored as failure text.
 
 Exact deletion locks one scoped document, deletes only its tenant/knowledge-base
 and document-matched vector rows, then deletes the registry row and lets the job
-foreign key cascade. After commit it returns the opaque object key to a future
-storage layer; this code performs no filesystem deletion. Embedding profiles and
-unrelated legacy vectors are untouched.
+foreign key cascade. Fresh documents have no storage object to clean up. Legacy
+non-null keys remain operator-owned metadata; dashboard deletion performs no
+filesystem operation. Embedding profiles and unrelated legacy vectors are
+untouched.
 
-Dashboard upload UI, HTTP APIs, and progress polling UI are not implemented by
-this change. The repository exposes scoped list and job-status operations plus
-an application-owned background manager for later server-side integration.
+The Streamlit dashboard exposes a tenant-scoped `Bilgi Tabanı` tab before a
+call starts. It supports PDF, UTF-8 TXT and Markdown uploads up to 10 MiB,
+authoritative bounded job progress, a maximum 50-item document list,
+cancellation, and confirmed exact-document deletion. Tenant and knowledge-base
+scope are never editable upload fields.
 
-## Private persistent document storage prerequisites
-
-The backend storage primitive requires an operator-created absolute directory
-outside this repository. It never creates the configured root or changes its
-ACL. The root, every path component and every managed object must be a regular
-non-link object without a symlink, junction or Windows reparse point. Filesystem
-roots, the user-profile root, broad shared roots, this repository and its
-descendants are rejected.
-
-On POSIX, the effective user must own the directory and its mode must be `0700`
-or stricter. On Windows, owner and DACL checks use security APIs rather than
-localized command output: the running account must own and control the root and
-no unrelated principal may have writable access. Validation failure is closed
-and emits only a fixed storage category. Operators remain responsible for
-creating and maintaining this owner-only directory before application startup.
-
-Accepted source bytes are stored under random server-owned direct-child keys;
-filenames, tenant/knowledge-base identifiers, digests and content never form a
-path. Writes are bounded to 10 MiB, flushed and synced before exclusive atomic
-publication. Successful ingestion retains the source for retry or audit.
-Registry deletion commits before source deletion, so a later storage failure
-creates an orphan and never restores the database row. Duplicate registry
-resolution deletes only the new attempt's object.
+## Ephemeral document source policy
 
 The background manager owns exactly one non-daemon worker and reserves one of
-1-to-8 configured capacity slots before validation or storage. Accepted bytes
-are released from queued memory after persistent storage succeeds; only opaque
-server metadata enters the bounded queue. Submission tokens are idempotent for
-the manager lifetime. Closing refuses new work, cooperatively cancels queued or
-running work, and a waiting close has a fixed upper bound. PostgreSQL remains
-authoritative for durable state and progress. Successful and failed source
-objects are retained for explicit retry; duplicate-attempt objects alone are
-removed immediately.
+1-to-8 configured capacity slots before validation. Each accepted, validated
+upload is held only in its bounded in-memory work envelope until that work
+succeeds, fails, is cancelled, or is released during close. Source bytes are
+never written to a repository or server storage path. Submission tokens are
+idempotent for the manager lifetime, and duplicate documents do not retain a
+second envelope. PostgreSQL remains authoritative for durable registry, job,
+chunk, ordered metadata, and embedding state.
+
+Because source bytes do not survive process exit, startup marks only that exact
+tenant and knowledge base's interrupted `QUEUED` or `PROCESSING` jobs as
+`FAILED` with the fixed `FINALIZE` phase. Terminal jobs and other scopes are
+unchanged. Retrying after interruption requires re-uploading the source;
+scope-local SHA-256 uniqueness resolves it to the existing registry identity.
 
 Extraction, chunking, embedding, and vector finalization run only after the
 worker claims a queued job. The production composition accepts only
@@ -149,12 +141,29 @@ and `local_files_only=true`. Construction opens no database connection and
 does not load the model; model loading occurs lazily only for accepted worker
 work and has no download fallback.
 
-Orphan reconciliation is explicit, never scheduled automatically. The composed
-runtime first obtains a complete tenant/knowledge-base registry-key snapshot;
-snapshot failure deletes nothing. Cleanup ignores unrelated names, applies the
-configured 300-to-604800-second grace period, removes at most 100 deterministic
-candidates, and returns safe counts only. Dashboard document UI and automatic
-orphan scheduling remain unimplemented.
+## Dashboard document configuration
+
+No document storage root or orphan reconciliation is configured or required.
+Configure both bounded execution values together; missing, partial, or invalid
+configuration leaves the document tab unavailable while base coaching remains
+operational:
+
+```text
+CALLMETRIC_DASHBOARD_DOCUMENT_MAX_WORKERS=1
+CALLMETRIC_DASHBOARD_DOCUMENT_CAPACITY=<1..8>
+```
+
+The tab displays only filenames, media labels, formatted sizes, fixed progress
+or readiness states, and UTC creation times. It never displays content,
+digests, storage keys, paths, tenant/knowledge-base values, or internal IDs.
+Deletion requires a short-lived one-use confirmation, refuses active ingestion,
+and commits exact-scope vector/job/registry deletion. It performs no storage
+cleanup and makes no orphan-reconciliation claim.
+
+`Belge hazır`, retrieved context used, and LLM generation used are three
+different facts. Document readiness alone must not be reported as retrieval or
+generation. PostgreSQL and vLLM remain externally managed services; the
+dashboard does not start, stop, migrate, or reconfigure them.
 
 ## External PostgreSQL requirement
 
@@ -190,7 +199,7 @@ names. Application and migration connections use `localhost`,
 `sslmode=verify-full`, and that run's private trust root. The test also proves
 that missing trust and a mismatched hostname fail closed.
 
-The TLS smoke applies the ordered `0001` and `0002` migrations and verifies an
+The TLS smoke applies ordered migrations through `0003` and verifies an
 idempotent second application, schema readiness, exact profile registration,
 deterministic synthetic ingestion and tenant-scoped retrieval. Its synthetic
 embedding backend validates database wiring only; it is not a real

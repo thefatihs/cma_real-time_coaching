@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 from time import perf_counter
+from uuid import uuid4
 
 import streamlit as st
 
@@ -23,7 +24,15 @@ from app.streaming.pipeline import (  # noqa: E402
     StreamingASRStep,
 )
 from app.streaming.window_transcriber import WindowTranscriber  # noqa: E402
+from app.tenancy.models import TenantConfig  # noqa: E402
 from live_dashboard.demo_data import scenario_for, tenant_demos  # noqa: E402
+from live_dashboard.document_runtime import (  # noqa: E402
+    DashboardDocumentResource,
+    DashboardDocumentResourceRegistry,
+    DashboardDocumentRuntimeController,
+    document_resource_identity,
+)
+from live_dashboard.document_section import render_document_section  # noqa: E402
 from live_dashboard.runtime_wiring import (  # noqa: E402
     ArtifactAvailability,
     DashboardExecutionIdentity,
@@ -100,6 +109,8 @@ _EXECUTION_RESOURCE_CAPACITY = 8
 _EXECUTION_RESOURCE_SESSION_KEY = "dashboard_execution_resource_key"
 _RAG_RUNTIME_STATUS_SESSION_KEY = "dashboard_rag_runtime_status"
 _RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
+_DOCUMENT_RESOURCE_SESSION_KEY = "dashboard_document_resource_key"
+_DOCUMENT_OWNER_SESSION_KEY = "dashboard_document_owner_token"
 _EXECUTION_STAGE_TEXT = {
     DashboardExecutionStage.STARTING: "Analiz başlatılıyor",
     DashboardExecutionStage.FILE_PREPARING: "Ses dosyası hazırlanıyor",
@@ -160,6 +171,48 @@ def _rag_runtime_controller(
     return DashboardRAGRuntimeController(
         registry=_execution_resource_registry(capacity),
     )
+
+
+@st.cache_resource(show_spinner=False)
+def _document_resource_registry() -> DashboardDocumentResourceRegistry:
+    return DashboardDocumentResourceRegistry()
+
+
+@st.cache_resource(show_spinner=False)
+def _document_runtime_controller() -> DashboardDocumentRuntimeController:
+    return DashboardDocumentRuntimeController(registry=_document_resource_registry())
+
+
+def _document_resource(tenant_config: TenantConfig) -> DashboardDocumentResource:
+    owner_token = st.session_state.setdefault(_DOCUMENT_OWNER_SESSION_KEY, uuid4().hex)
+    if not isinstance(owner_token, str):
+        raise ValueError("dashboard document owner token is invalid")
+    controller = _document_runtime_controller()
+    expected_key = document_resource_identity(
+        tenant_config=tenant_config, owner_token=owner_token
+    ).opaque_key
+    previous_key = st.session_state.get(_DOCUMENT_RESOURCE_SESSION_KEY)
+    if previous_key is not None and previous_key != expected_key:
+        if isinstance(previous_key, str):
+            controller.close_and_remove(previous_key)
+    resource = controller.activate(
+        tenant_config=tenant_config,
+        owner_token=owner_token,
+    )
+    st.session_state[_DOCUMENT_RESOURCE_SESSION_KEY] = resource.opaque_key
+    return resource
+
+
+def _close_document_resource() -> None:
+    key = st.session_state.pop(_DOCUMENT_RESOURCE_SESSION_KEY, None)
+    if isinstance(key, str):
+        _document_runtime_controller().close_and_remove(key)
+    for safe_key in (
+        "document_upload_generation",
+        "document_submission_token",
+        "document_delete_confirmation_token",
+    ):
+        st.session_state.pop(safe_key, None)
 
 
 def _execution_resource(runtime: DashboardRuntime) -> DashboardExecutionResource:
@@ -697,6 +750,7 @@ def _render_dashboard(
     metadata: SafeUploadMetadata | None,
     scope: UIScopeIdentity,
     rag_runtime_status: object = _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
+    document_resource: DashboardDocumentResource | None = None,
 ) -> None:
     view = dashboard_tabs(runtime, local_state, metadata)
     _render_dashboard_view(
@@ -705,6 +759,7 @@ def _render_dashboard(
         view=view,
         scope=scope,
         rag_runtime_status=rag_runtime_status,
+        document_resource=document_resource,
     )
 
 
@@ -716,13 +771,14 @@ def _render_dashboard_view(
     scope: UIScopeIdentity,
     rag_runtime_status: object = _RAG_RUNTIME_STATUS_NOT_AVAILABLE,
     execution: DashboardExecutionSnapshot | None = None,
+    document_resource: DashboardDocumentResource | None = None,
 ) -> None:
     if execution is not None:
         _render_execution_status(execution)
     if rag_runtime_status is not _RAG_RUNTIME_STATUS_NOT_AVAILABLE:
         st.caption(rag_runtime_status_text(rag_runtime_status))
-    representative, technical, result = st.tabs(
-        ("Temsilci Görünümü", "Teknik İzleme", "Görüşme Sonucu")
+    representative, technical, result, knowledge = st.tabs(
+        ("Temsilci Görünümü", "Teknik İzleme", "Görüşme Sonucu", "Bilgi Tabanı")
     )
     with representative:
         _render_representative_view(
@@ -735,6 +791,27 @@ def _render_dashboard_view(
         _render_technical(view, scope)
     with result:
         _render_result_view(call_id, view)
+    with knowledge:
+        if document_resource is None:
+            st.info("Bilgi tabanı yapılandırılmadı")
+        else:
+            initial_document_view = document_resource.view()
+            document_polling = (
+                0.75
+                if initial_document_view.progress is not None
+                and initial_document_view.progress.active
+                else None
+            )
+
+            @st.fragment(run_every=document_polling)
+            def document_area() -> None:
+                render_document_section(
+                    st,
+                    resource=document_resource,
+                    session_state=st.session_state,
+                )
+
+            document_area()
 
 
 def _render_execution_status(snapshot: DashboardExecutionSnapshot) -> None:
@@ -924,6 +1001,7 @@ with st.sidebar:
             advance_runtime(_synthetic_runtime())
         if st.button("Sıfırla", use_container_width=True):
             _close_execution_resource()
+            _close_document_resource()
             st.session_state.pop("synthetic_signature", None)
             st.session_state.playing = False
             st.session_state.suggestion_feedback = {}
@@ -1138,6 +1216,7 @@ with st.sidebar:
                 retained.cancel()
         if st.button("Sıfırla", use_container_width=True):
             _close_execution_resource()
+            _close_document_resource()
             if source_mode == "Dosya yükle":
                 upload_session.reset()
             else:
@@ -1145,6 +1224,7 @@ with st.sidebar:
             st.session_state.pop("safe_audio_metadata", None)
             st.session_state.suggestion_feedback = {}
 
+active_document_resource = _document_resource(demos[tenant_id].config)
 st.title("Canlı Koçluk Paneli")
 st.caption("Temsilci desteği ve güvenli teknik izleme")
 if ui_scope is None:
@@ -1165,7 +1245,13 @@ if mode == "Sentetik Demo":
             advance_runtime(current)
             if current.complete:
                 st.session_state.playing = False
-        _render_dashboard(current, None, None, active_ui_scope)
+        _render_dashboard(
+            current,
+            None,
+            None,
+            active_ui_scope,
+            document_resource=active_document_resource,
+        )
 
     live_area()
 else:
@@ -1199,6 +1285,7 @@ else:
                 safe_metadata,
                 active_ui_scope,
                 rag_status,
+                document_resource=active_document_resource,
             )
             return
         _render_dashboard_view(
@@ -1208,6 +1295,7 @@ else:
             scope=active_ui_scope,
             rag_runtime_status=rag_status,
             execution=snapshot,
+            document_resource=active_document_resource,
         )
 
     local_live_area()

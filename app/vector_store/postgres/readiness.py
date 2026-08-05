@@ -10,7 +10,7 @@ PostgreSQLReadinessConnectionFactory = Callable[[], Connection[Any]]
 _SCHEMA_NAME = "callmetric_vector"
 _EXTENSION_NAME = "vector"
 _REQUIRED_EXTENSION_VERSION = "0.8.5"
-_REQUIRED_MIGRATION_VERSIONS = ("0001", "0002")
+_REQUIRED_MIGRATION_VERSIONS = ("0001", "0002", "0003")
 _REQUIRED_MIGRATION_VERSION = _REQUIRED_MIGRATION_VERSIONS[-1]
 _REQUIRED_TABLES = (
     "document_ingestion_jobs",
@@ -176,6 +176,11 @@ _COLUMNS_SQL = """
     WHERE table_schema = %s AND table_name = ANY(%s)
     ORDER BY table_name, ordinal_position
     """
+_NULLABILITY_SQL = """
+    SELECT is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = %s AND table_name = %s AND column_name = %s
+    """
 _CONSTRAINTS_SQL = """
     SELECT table_name, constraint_name
     FROM information_schema.table_constraints
@@ -252,6 +257,13 @@ class PostgreSQLSchemaReadinessChecker:
                     cursor.fetchall(),
                     required=_REQUIRED_COLUMNS,
                     check_name="PostgreSQL columns",
+                )
+                _execute_and_expect_exact_rows(
+                    cursor,
+                    _NULLABILITY_SQL,
+                    (_SCHEMA_NAME, "documents", "storage_object_key"),
+                    expected=(("YES",),),
+                    check_name="document source nullability",
                 )
                 cursor.execute(
                     _CONSTRAINTS_SQL,

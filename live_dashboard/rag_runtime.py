@@ -12,6 +12,7 @@ from threading import Lock
 from typing import Any, cast
 from uuid import uuid4
 
+from app.composition.postgres_rag import KnowledgeBaseRAGProviderSettings
 from app.integration import RAGCoachingIntegrationDependencies
 from app.integration.policy import RAGCoachingIntegrationPolicy
 from app.tenancy.models import TenantConfig
@@ -260,6 +261,27 @@ def _activate_optional_integration(
             manager.close(wait=False)
         return DashboardRAGRuntimeStatus.UNAVAILABLE, None
     return DashboardRAGRuntimeStatus.READY, integration
+
+
+def validated_dashboard_rag_provider_settings(
+    *,
+    tenant_config: TenantConfig,
+    environment: Mapping[str, str],
+) -> KnowledgeBaseRAGProviderSettings:
+    """Load provider settings and enforce the dashboard's trusted tenant/KB scope."""
+    if not isinstance(tenant_config, TenantConfig):
+        raise ValueError("tenant_config must be TenantConfig")
+    raw_path = environment.get(_ACTIVATION_ENVIRONMENT_KEYS[0])
+    if raw_path is None:
+        raise ValueError("dashboard RAG provider settings are missing")
+    provider_settings = KnowledgeBaseRAGProviderSettings.model_validate(
+        _load_exact_json(raw_path, expected_keys=_PROVIDER_KEYS)
+    )
+    if provider_settings.tenant_id != tenant_config.context.tenant_id:
+        raise ValueError("provider tenant scope does not match dashboard scope")
+    if provider_settings.knowledge_base_id != tenant_config.rag.knowledge_base_id:
+        raise ValueError("provider knowledge-base scope does not match dashboard scope")
+    return provider_settings
 
 
 def _load_exact_json(

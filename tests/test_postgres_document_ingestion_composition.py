@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +10,6 @@ from pydantic import SecretStr, ValidationError
 import app.composition.postgres_document_ingestion as subject
 from app.composition.postgres_document_ingestion import (
     MINILM_MODEL,
-    PostgreSQLDocumentIngestionRuntime,
     PostgreSQLDocumentIngestionSettings,
     compose_postgres_document_ingestion,
 )
@@ -19,7 +17,6 @@ from app.composition.postgres_rag import (
     KnowledgeBaseRAGProviderSettings,
     PostgreSQLVectorStoreSettings,
 )
-from app.ingestion.persistent_storage import OrphanReconciliationResult
 
 
 def _postgres() -> PostgreSQLVectorStoreSettings:
@@ -61,9 +58,7 @@ def test_composition_rejects_non_minilm_profile(field: str, value: object) -> No
         compose_postgres_document_ingestion(
             postgres_settings=_postgres(),
             knowledge_base_settings=_provider(**{field: value}),
-            ingestion_settings=PostgreSQLDocumentIngestionSettings(
-                storage_root=Path("C:/synthetic-private")
-            ),
+            ingestion_settings=PostgreSQLDocumentIngestionSettings(),
             psycopg_connect=lambda **kwargs: (_ for _ in ()).throw(
                 AssertionError("connection forbidden")
             ),
@@ -72,17 +67,9 @@ def test_composition_rejects_non_minilm_profile(field: str, value: object) -> No
 
 def test_settings_are_strict_and_bounded() -> None:
     with pytest.raises(ValidationError):
-        PostgreSQLDocumentIngestionSettings(
-            storage_root=Path("relative"), max_workers=2
-        )
+        PostgreSQLDocumentIngestionSettings(max_workers=2)
     with pytest.raises(ValidationError):
-        PostgreSQLDocumentIngestionSettings(
-            storage_root=Path("C:/synthetic-private"), capacity=9
-        )
-    with pytest.raises(ValidationError):
-        PostgreSQLDocumentIngestionSettings(
-            storage_root=Path("C:/synthetic-private"), orphan_grace_seconds=299
-        )
+        PostgreSQLDocumentIngestionSettings(capacity=9)
 
 
 def test_composition_does_not_connect_or_load_model_before_work(
@@ -95,11 +82,6 @@ def test_composition_does_not_connect_or_load_model_before_work(
         "compose_profile_bound_postgres_rag",
         lambda **kwargs: fake_rag,
     )
-    monkeypatch.setattr(
-        subject,
-        "PersistentDocumentStorage",
-        lambda **kwargs: SimpleNamespace(),
-    )
     fake_manager = SimpleNamespace(close=lambda **kwargs: None)
     monkeypatch.setattr(
         subject,
@@ -110,9 +92,7 @@ def test_composition_does_not_connect_or_load_model_before_work(
     runtime = compose_postgres_document_ingestion(
         postgres_settings=_postgres(),
         knowledge_base_settings=_provider(),
-        ingestion_settings=PostgreSQLDocumentIngestionSettings(
-            storage_root=Path("C:/synthetic-private"), capacity=3
-        ),
+        ingestion_settings=PostgreSQLDocumentIngestionSettings(capacity=3),
         psycopg_connect=lambda **kwargs: events.append("connect"),  # type: ignore[arg-type]
         embedding_backend_factory=lambda config: events.append("model"),  # type: ignore[arg-type]
     )
@@ -120,22 +100,7 @@ def test_composition_does_not_connect_or_load_model_before_work(
     assert events == []
 
 
-def test_reconciliation_snapshot_failure_deletes_nothing() -> None:
-    class Registry:
-        def list_storage_object_keys(self, **scope: str) -> tuple[str, ...]:
-            raise RuntimeError("synthetic database failure")
-
-    class Storage:
-        def reconcile_orphans(self, *args: object, **kwargs: object) -> object:
-            raise AssertionError("deletion must not be attempted")
-
-    runtime = PostgreSQLDocumentIngestionRuntime(
-        manager=SimpleNamespace(close=lambda **kwargs: None),  # type: ignore[arg-type]
-        registry=Registry(),  # type: ignore[arg-type]
-        storage=Storage(),  # type: ignore[arg-type]
-        postgres_rag=SimpleNamespace(),  # type: ignore[arg-type]
-        tenant_id="tenant-trusted",
-        knowledge_base_id="kb-trusted",
-        orphan_grace_seconds=300,
-    )
-    assert runtime.reconcile_orphans() == OrphanReconciliationResult(0, 0, 0, 0)
+def test_runtime_exposes_no_persistent_storage_or_reconciliation() -> None:
+    fields = PostgreSQLDocumentIngestionSettings.model_fields
+    assert set(fields) == {"max_workers", "capacity"}
+    assert not hasattr(subject.PostgreSQLDocumentIngestionRuntime, "reconcile_orphans")

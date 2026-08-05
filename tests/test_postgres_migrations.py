@@ -150,7 +150,7 @@ def _applied_responses() -> list[object]:
         [(None,)],
         [("0.8.5",)],
         [("callmetric_vector",)],
-        [("0001",), ("0002",)],
+        [("0001",), ("0002",), ("0003",)],
         [
             ("document_ingestion_jobs",),
             ("documents",),
@@ -263,13 +263,18 @@ def test_registry_path_version_and_digest_are_fixed() -> None:
     assert [item.version for item in migrations._MIGRATIONS] == [  # noqa: SLF001
         "0001",
         "0002",
+        "0003",
     ]
     assert [item.relative_path for item in migrations._MIGRATIONS] == [  # noqa: SLF001
         "migrations/postgres/0001_vector_store.sql",
         "migrations/postgres/0002_document_registry.sql",
+        "migrations/postgres/0003_ephemeral_document_sources.sql",
     ]
     assert migrations._MIGRATIONS[1].sha256 == (  # noqa: SLF001
         "7312cd3675b08a3ba645d382d54426afa49542953f28ae23050e44ff7690b6fb"
+    )
+    assert migrations._MIGRATIONS[2].sha256 == (  # noqa: SLF001
+        "0e62fa50728d6ccde59188f92fb98a4fa9d882f4fbd77228f589468844bd0d86"
     )
 
 
@@ -396,7 +401,7 @@ def test_fresh_state_executes_whole_file_after_rollback_then_readiness(
         (migrations._EXTENSION_SQL, ("vector",)),  # noqa: SLF001
         (migrations._SCHEMA_SQL, ("callmetric_vector",)),  # noqa: SLF001
     ]
-    script_calls = migration_connection.calls[3:5]
+    script_calls = migration_connection.calls[3:6]
     assert all(call[1:] == ("prepare", False) for call in script_calls)
     assert [call[0] for call in script_calls] == list(
         migrations._load_registered_migrations()  # noqa: SLF001
@@ -450,7 +455,7 @@ def test_applied_state_skips_script_and_returns_already_applied(
     assert events == ["readiness-construction", "readiness"]
 
 
-def test_version_one_state_applies_only_document_registry(
+def test_version_one_state_applies_remaining_migrations_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     migration_connection = FakeConnection(_version_one_responses())
@@ -468,7 +473,8 @@ def test_version_one_state_applies_only_document_registry(
         call for call in migration_connection.calls if call[1:] == ("prepare", False)
     ]
     assert script_calls == [
-        (migrations._load_registered_migrations()[1], "prepare", False)  # noqa: SLF001
+        (script, "prepare", False)
+        for script in migrations._load_registered_migrations()[1:]  # noqa: SLF001
     ]
 
 

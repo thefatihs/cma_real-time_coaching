@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from queue import Empty, Full, Queue
-from threading import Lock, Semaphore, Thread
-from time import monotonic
+from threading import Condition, Lock, Semaphore, Thread
 from uuid import uuid4
 
 from app.embeddings import DocumentEmbedder
-from app.ingestion.persistent_storage import PersistentDocumentStorage
 from app.ingestion.registry import (
     DocumentRegistryRepository,
     TransactionAwareVectorBatchWriter,
@@ -70,9 +68,7 @@ class _Work:
     token: str
     document_id: str
     job_id: str
-    storage_object_key: str
-    original_filename: str
-    media_type: str
+    envelope: ValidatedUploadEnvelope
 
 
 class BoundedDocumentIngestionManager:
@@ -85,7 +81,6 @@ class BoundedDocumentIngestionManager:
         knowledge_base_id: str,
         capacity: int,
         registry: DocumentRegistryRepository,
-        storage: PersistentDocumentStorage,
         document_embedder: DocumentEmbedder,
         vector_writer: TransactionAwareVectorBatchWriter,
         expected_vector_dimension: int = 384,
@@ -104,21 +99,27 @@ class BoundedDocumentIngestionManager:
         self._tenant_id = tenant_id
         self._knowledge_base_id = knowledge_base_id
         self._registry = registry
-        self._storage = storage
         self._embedder = document_embedder
         self._vector_writer = vector_writer
         self._expected_dimension = expected_vector_dimension
         self._max_chunk_characters = max_chunk_characters
         self._close_timeout = close_timeout_seconds
         self._availability_check = availability_check
-        self._queue: Queue[_Work | None] = Queue(maxsize=capacity)
+        self._queue: deque[_Work] = deque()
         self._capacity = Semaphore(capacity)
         self._lock = Lock()
+        self._condition = Condition(self._lock)
         self._submission_lock = Lock()
         self._closed = False
         self._results: dict[str, DocumentSubmissionResult] = {}
         self._cancelled: set[str] = set()
         self._work_by_token: dict[str, _Work] = {}
+        recovered = self._registry.fail_interrupted_jobs(
+            tenant_id=self._tenant_id,
+            knowledge_base_id=self._knowledge_base_id,
+        )
+        if type(recovered) is not int or recovered < 0:
+            raise ValueError("interrupted document recovery is invalid")
         self._worker = Thread(
             target=self._run, name="document-ingestion-worker", daemon=False
         )
@@ -208,24 +209,13 @@ class BoundedDocumentIngestionManager:
             )
         document_id = uuid4().hex
         job_id = uuid4().hex
-        try:
-            storage_key = self._storage.write(envelope.content)
-        except Exception:
-            self._capacity.release()
-            return self._remember(
-                submission_token,
-                DocumentSubmissionResult(
-                    DocumentSubmissionStatus.UNAVAILABLE,
-                    DocumentBackgroundFailure.STORAGE,
-                ),
-            )
         request = _registry_request(
             envelope,
             tenant_id=self._tenant_id,
             knowledge_base_id=self._knowledge_base_id,
             document_id=document_id,
             job_id=job_id,
-            storage_object_key=storage_key,
+            storage_object_key=None,
         )
         try:
             created = self._registry.create_or_get(request)
@@ -239,10 +229,6 @@ class BoundedDocumentIngestionManager:
                 ),
             )
         if not created.created:
-            try:
-                self._storage.delete(storage_key)
-            except Exception:
-                pass
             self._capacity.release()
             return self._remember(
                 submission_token,
@@ -252,25 +238,14 @@ class BoundedDocumentIngestionManager:
             token=submission_token,
             document_id=document_id,
             job_id=job_id,
-            storage_object_key=storage_key,
-            original_filename=envelope.original_filename,
-            media_type=envelope.media_type,
+            envelope=envelope,
         )
-        with self._lock:
+        with self._condition:
             if self._closed:
                 self._cancelled.add(submission_token)
             self._work_by_token[submission_token] = work
-        try:
-            self._queue.put_nowait(work)
-        except Full:
-            self._capacity.release()
-            return self._remember(
-                submission_token,
-                DocumentSubmissionResult(
-                    DocumentSubmissionStatus.UNAVAILABLE,
-                    DocumentBackgroundFailure.UNAVAILABLE,
-                ),
-            )
+            self._queue.append(work)
+            self._condition.notify()
         return self._remember(
             submission_token,
             DocumentSubmissionResult(DocumentSubmissionStatus.ACCEPTED),
@@ -283,7 +258,7 @@ class BoundedDocumentIngestionManager:
                 return False
             self._cancelled.add(submission_token)
         try:
-            return self._registry.mark_cancelled(
+            changed = self._registry.mark_cancelled(
                 tenant_id=self._tenant_id,
                 knowledge_base_id=self._knowledge_base_id,
                 job_id=work.job_id,
@@ -291,6 +266,17 @@ class BoundedDocumentIngestionManager:
             )
         except Exception:
             return False
+        if not changed:
+            return False
+        with self._condition:
+            queued = next(
+                (item for item in self._queue if item.token == submission_token), None
+            )
+            if queued is not None:
+                self._queue.remove(queued)
+                self._work_by_token.pop(submission_token, None)
+                self._capacity.release()
+        return True
 
     def close(self, *, wait: bool = False) -> None:
         with self._submission_lock:
@@ -306,16 +292,21 @@ class BoundedDocumentIngestionManager:
                 self._worker.join(timeout=self._close_timeout)
             return
         self._cancel_queued()
-        try:
-            self._queue.put_nowait(None)
-        except Full:
-            pass
+        with self._condition:
+            self._condition.notify_all()
         if wait:
             self._worker.join(timeout=self._close_timeout)
 
     @property
     def worker_count(self) -> int:
         return 1 if self._worker.is_alive() else 0
+
+    @property
+    def retained_source_bytes(self) -> int:
+        with self._lock:
+            return sum(
+                len(work.envelope.content) for work in self._work_by_token.values()
+            )
 
     def _remember(
         self, token: str, result: DocumentSubmissionResult
@@ -342,17 +333,19 @@ class BoundedDocumentIngestionManager:
 
     def _run(self) -> None:
         while True:
-            work = self._queue.get()
-            try:
-                if work is None:
+            with self._condition:
+                while not self._queue and not self._closed:
+                    self._condition.wait()
+                if not self._queue and self._closed:
                     return
+                work = self._queue.popleft()
+            try:
                 self._process(work)
             finally:
-                self._queue.task_done()
-                if work is not None:
-                    with self._lock:
-                        self._work_by_token.pop(work.token, None)
-                    self._capacity.release()
+                with self._lock:
+                    self._work_by_token.pop(work.token, None)
+                    self._cancelled.discard(work.token)
+                self._capacity.release()
 
     def _process(self, work: _Work) -> None:
         if self._is_cancelled(work.token):
@@ -365,14 +358,8 @@ class BoundedDocumentIngestionManager:
             if self._is_cancelled(work.token):
                 self._cancel_entry(work, DocumentIngestionPhase.EXTRACTION)
                 return
-            content = self._storage.read(work.storage_object_key)
-            envelope = validate_upload_envelope(
-                content=content,
-                original_filename=work.original_filename,
-                declared_media_type=work.media_type,
-            )
             prepared = prepare_validated_upload_document(
-                envelope=envelope,
+                envelope=work.envelope,
                 document_id=work.document_id,
                 tenant_id=self._tenant_id,
                 knowledge_base_id=self._knowledge_base_id,
@@ -446,22 +433,18 @@ class BoundedDocumentIngestionManager:
         )
 
     def _cancel_queued(self) -> None:
-        deadline = monotonic() + self._close_timeout
-        while monotonic() < deadline:
+        with self._condition:
+            queued = tuple(self._queue)
+            self._queue.clear()
+        for item in queued:
             try:
-                item = self._queue.get_nowait()
-            except Empty:
-                return
-            try:
-                if item is not None:
-                    self._cancel_entry(item, DocumentIngestionPhase.EXTRACTION)
-                    with self._lock:
-                        self._work_by_token.pop(item.token, None)
-                    self._capacity.release()
+                self._cancel_entry(item, DocumentIngestionPhase.EXTRACTION)
             except Exception:
                 pass
-            finally:
-                self._queue.task_done()
+            with self._lock:
+                self._work_by_token.pop(item.token, None)
+                self._cancelled.discard(item.token)
+            self._capacity.release()
 
 
 def _registry_request(
@@ -471,7 +454,7 @@ def _registry_request(
     knowledge_base_id: str,
     document_id: str,
     job_id: str,
-    storage_object_key: str,
+    storage_object_key: str | None,
 ) -> DocumentRegistryCreateRequest:
     return DocumentRegistryCreateRequest(
         tenant_id=tenant_id,

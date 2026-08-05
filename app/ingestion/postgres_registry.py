@@ -88,6 +88,7 @@ _STORAGE_KEYS = """
     SELECT storage_object_key
     FROM callmetric_vector.documents
     WHERE tenant_id = %s AND knowledge_base_id = %s
+      AND storage_object_key IS NOT NULL
     ORDER BY storage_object_key
     """
 _ENTRY_LIST = f"""
@@ -157,6 +158,14 @@ _JOB_CANCEL = """
         updated_at_utc = CURRENT_TIMESTAMP,
         finished_at_utc = CURRENT_TIMESTAMP
     WHERE tenant_id = %s AND knowledge_base_id = %s AND job_id = %s
+      AND state IN ('QUEUED', 'PROCESSING')
+    """
+_JOB_RECOVER_INTERRUPTED = """
+    UPDATE callmetric_vector.document_ingestion_jobs
+    SET state = 'FAILED', phase = 'FINALIZE',
+        updated_at_utc = CURRENT_TIMESTAMP,
+        finished_at_utc = CURRENT_TIMESTAMP
+    WHERE tenant_id = %s AND knowledge_base_id = %s
       AND state IN ('QUEUED', 'PROCESSING')
     """
 _JOB_SUCCEED = """
@@ -281,6 +290,19 @@ class PsycopgDocumentRegistryRepository:
             return tuple(row[0] for row in rows)
 
         return self._run(DocumentOperationPhase.LIST, operation)
+
+    def fail_interrupted_jobs(self, *, tenant_id: str, knowledge_base_id: str) -> int:
+        parameters = _scope(tenant_id, knowledge_base_id)
+
+        def operation(connection: Connection[Any]) -> int:
+            with connection.cursor() as cursor:
+                cursor.execute(_JOB_RECOVER_INTERRUPTED, parameters)
+                changed = cursor.rowcount
+            if type(changed) is not int or changed < 0:
+                raise DocumentRegistryError(DocumentOperationPhase.RECOVERY)
+            return changed
+
+        return self._run(DocumentOperationPhase.RECOVERY, operation)
 
     def get_entry(
         self,

@@ -9,6 +9,9 @@ MIGRATION_PATH = (
     / "postgres"
     / "0002_document_registry.sql"
 )
+EPHEMERAL_MIGRATION_PATH = MIGRATION_PATH.with_name(
+    "0003_ephemeral_document_sources.sql"
+)
 
 
 def _migration_sql() -> str:
@@ -76,3 +79,15 @@ def test_requested_indexes_and_additive_only_behavior_are_explicit() -> None:
     assert "UPDATE CALLMETRIC_VECTOR.VECTOR_RECORDS" not in upper_sql
     assert "ALTER TABLE CALLMETRIC_VECTOR.VECTOR_RECORDS" not in upper_sql
     assert "REFERENCES CALLMETRIC_VECTOR.VECTOR_RECORDS" not in upper_sql
+
+
+def test_ephemeral_source_migration_only_relaxes_source_key_nullability() -> None:
+    sql = EPHEMERAL_MIGRATION_PATH.read_text(encoding="utf-8").replace("\r\n", "\n")
+    upper_sql = sql.upper()
+
+    assert "ALTER TABLE callmetric_vector.documents" in sql
+    assert "ALTER COLUMN storage_object_key DROP NOT NULL" in sql
+    assert "VALUES ('0003')" in sql
+    assert "DELETE FROM" not in upper_sql
+    assert "UPDATE CALLMETRIC_VECTOR.DOCUMENTS" not in upper_sql
+    assert "ALTER TABLE CALLMETRIC_VECTOR.VECTOR_RECORDS" not in upper_sql

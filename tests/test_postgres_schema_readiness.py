@@ -50,8 +50,9 @@ def _ready_responses() -> list[object]:
             ("schema_migrations",),
             ("vector_records",),
         ],
-        [("0001",), ("0002",)],
+        [("0001",), ("0002",), ("0003",)],
         _required_column_rows(),
+        [("YES",)],
         _required_constraint_rows(),
         _required_index_rows(),
     ]
@@ -247,6 +248,10 @@ def test_success_uses_exact_fixed_order_then_rolls_back_and_closes() -> None:
             ),
         ),
         (
+            readiness._NULLABILITY_SQL,  # noqa: SLF001
+            ("callmetric_vector", "documents", "storage_object_key"),
+        ),
+        (
             readiness._CONSTRAINTS_SQL,  # noqa: SLF001
             (
                 "callmetric_vector",
@@ -328,9 +333,11 @@ def test_exact_catalog_checks_fail_closed(
             "columns",
         ),
         (5, _required_column_rows() + [_required_column_rows()[0]], "duplicate"),
-        (6, [], "constraints"),
+        (6, [], "document source nullability"),
+        (6, [("NO",)], "document source nullability"),
+        (7, [], "constraints"),
         (
-            6,
+            7,
             [
                 row
                 for row in _required_constraint_rows()
@@ -339,13 +346,13 @@ def test_exact_catalog_checks_fail_closed(
             "constraints",
         ),
         (
-            6,
+            7,
             _required_constraint_rows() + [_required_constraint_rows()[0]],
             "duplicate",
         ),
-        (7, [], "indexes"),
+        (8, [], "indexes"),
         (
-            7,
+            8,
             [
                 row
                 for row in _required_index_rows()
@@ -358,6 +365,8 @@ def test_exact_catalog_checks_fail_closed(
         "no-columns",
         "missing-column",
         "duplicate-column",
+        "missing-nullability",
+        "wrong-nullability",
         "no-constraints",
         "missing-constraint",
         "duplicate-constraint",
@@ -518,6 +527,7 @@ def test_queries_are_fixed_read_only_and_contain_no_sensitive_values() -> None:
         readiness._TABLES_SQL,  # noqa: SLF001
         readiness._MIGRATION_SQL,  # noqa: SLF001
         readiness._COLUMNS_SQL,  # noqa: SLF001
+        readiness._NULLABILITY_SQL,  # noqa: SLF001
         readiness._CONSTRAINTS_SQL,  # noqa: SLF001
     )
     combined = " ".join(queries).lower()
