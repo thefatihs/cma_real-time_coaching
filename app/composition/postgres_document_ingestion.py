@@ -15,6 +15,9 @@ from app.composition.postgres_rag import (
 from app.embeddings.sentence_transformers import BackendFactory
 from app.ingestion.document_background import BoundedDocumentIngestionManager
 from app.ingestion.postgres_registry import PsycopgDocumentRegistryRepository
+from app.vector_store.postgres.connection_factory import (
+    PgvectorPsycopgConnectionFactory,
+)
 
 MINILM_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MINILM_DIMENSION = 384
@@ -74,7 +77,7 @@ def compose_postgres_document_ingestion(
         embedding_backend_factory=embedding_backend_factory,
     )
 
-    def connection_factory():
+    def base_connection_factory():
         return psycopg_connect(
             conninfo=postgres_settings.dsn.get_secret_value(),
             connect_timeout=postgres_settings.connect_timeout_seconds,
@@ -83,7 +86,11 @@ def compose_postgres_document_ingestion(
             autocommit=False,
         )
 
-    registry = PsycopgDocumentRegistryRepository(connection_factory=connection_factory)
+    registry = PsycopgDocumentRegistryRepository(
+        connection_factory=PgvectorPsycopgConnectionFactory(
+            base_connection_factory=base_connection_factory,
+        )
+    )
 
     def verify_registered_profile() -> None:
         stored = postgres_rag.profile_repository.get_profile(

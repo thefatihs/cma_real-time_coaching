@@ -24,6 +24,15 @@ from app.vector_store.embedding_profile import (  # noqa: E402
     EmbeddingDistanceMetric,
     KnowledgeBaseEmbeddingProfile,
 )
+from app.composition.postgres_document_ingestion import (  # noqa: E402
+    MINILM_MODEL,
+    PostgreSQLDocumentIngestionSettings,
+    compose_postgres_document_ingestion,
+)
+from app.composition.postgres_rag import (  # noqa: E402
+    KnowledgeBaseRAGProviderSettings,
+    PostgreSQLVectorStoreSettings,
+)
 from app.deployment import (  # noqa: E402
     PostgreSQLMigrationResult,
     PostgreSQLMigrationSettings,
@@ -54,6 +63,13 @@ from app.vector_store.postgres.runner import (  # noqa: E402
 )
 from app.vector_store.postgres.transaction import (  # noqa: E402
     PsycopgPostgreSQLVectorTransaction,
+)
+from app.ingestion.document_background import (  # noqa: E402
+    DocumentSubmissionStatus,
+)
+from app.ingestion.registry_models import (  # noqa: E402
+    DocumentIngestionState,
+    DocumentReadiness,
 )
 
 pytestmark = pytest.mark.postgres_integration
@@ -256,6 +272,39 @@ def _store(
     return ProfileBoundPostgreSQLVectorStore(
         expected_profile=profile,
         transaction_runner=_runner(settings),
+    )
+
+
+class _Deterministic384Backend:
+    def encode(self, texts: list[str], *, normalize_embeddings: bool) -> object:
+        assert normalize_embeddings is True
+        return [[1.0] + [0.0] * 383 for _ in texts]
+
+
+def _document_runtime_settings(
+    settings: PostgreSQLTestSettings,
+) -> PostgreSQLVectorStoreSettings:
+    return PostgreSQLVectorStoreSettings(
+        dsn=SecretStr(
+            f"postgresql://{settings.user}:{settings.password}@"
+            f"{settings.host}:{settings.port}/{settings.database}"
+        ),
+        connect_timeout_seconds=settings.connect_timeout,
+        ssl_mode="require",
+        application_name="callmetric-document-integration",
+    )
+
+
+def _document_provider(scope: str) -> KnowledgeBaseRAGProviderSettings:
+    return KnowledgeBaseRAGProviderSettings(
+        tenant_id=f"tenant-{scope}",
+        knowledge_base_id=f"kb-{scope}",
+        model_id=MINILM_MODEL,
+        model_name_or_path=MINILM_MODEL,
+        vector_dimension=384,
+        normalize_embeddings=True,
+        device="cpu",
+        local_files_only=True,
     )
 
 
@@ -838,6 +887,149 @@ def test_callback_write_then_exception_rolls_back(
         )
         is None
     )
+
+
+def test_background_document_manager_real_pgvector_lifecycle(
+    settings: PostgreSQLTestSettings,
+) -> None:
+    postgres_settings = _document_runtime_settings(settings)
+    primary_provider = _document_provider("document-manager-primary")
+    isolated_provider = _document_provider("document-manager-isolated")
+
+    def connect(**kwargs: object) -> Connection[Any]:
+        return _production_connect(settings, **kwargs)
+
+    primary = compose_postgres_document_ingestion(
+        postgres_settings=postgres_settings,
+        knowledge_base_settings=primary_provider,
+        ingestion_settings=PostgreSQLDocumentIngestionSettings(),
+        psycopg_connect=connect,
+        embedding_backend_factory=lambda config: _Deterministic384Backend(),
+    )
+    isolated = compose_postgres_document_ingestion(
+        postgres_settings=postgres_settings,
+        knowledge_base_settings=isolated_provider,
+        ingestion_settings=PostgreSQLDocumentIngestionSettings(),
+        psycopg_connect=connect,
+        embedding_backend_factory=lambda config: _Deterministic384Backend(),
+    )
+
+    def await_ready(runtime: Any) -> Any:
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            entries = runtime.registry.list_documents(
+                tenant_id=runtime.tenant_id,
+                knowledge_base_id=runtime.knowledge_base_id,
+            )
+            if entries and entries[0].job.state in {
+                DocumentIngestionState.SUCCEEDED,
+                DocumentIngestionState.FAILED,
+                DocumentIngestionState.CANCELLED,
+            }:
+                assert entries[0].readiness is DocumentReadiness.READY
+                return entries[0]
+            time.sleep(0.05)
+        pytest.fail("document ingestion did not reach a terminal state")
+
+    try:
+        assert (
+            primary.postgres_rag.profile_repository.register_profile(
+                primary.postgres_rag.profile
+            )
+            == primary.postgres_rag.profile
+        )
+        assert (
+            isolated.postgres_rag.profile_repository.register_profile(
+                isolated.postgres_rag.profile
+            )
+            == isolated.postgres_rag.profile
+        )
+
+        primary_submission = primary.manager.submit(
+            submission_token="primary-document-submission",
+            content=b"Synthetic primary document for real PostgreSQL.",
+            original_filename="primary.txt",
+            declared_media_type="text/plain",
+        )
+        isolated_submission = isolated.manager.submit(
+            submission_token="isolated-document-submission",
+            content=b"Synthetic isolated document for real PostgreSQL.",
+            original_filename="isolated.md",
+            declared_media_type="text/markdown",
+        )
+        assert primary_submission.status is DocumentSubmissionStatus.ACCEPTED
+        assert isolated_submission.status is DocumentSubmissionStatus.ACCEPTED
+        primary_entry = await_ready(primary)
+        isolated_entry = await_ready(isolated)
+        assert primary_entry.document.storage_object_key is None
+        assert isolated_entry.document.storage_object_key is None
+        assert primary_entry.job.total_chunks == 1
+        assert isolated_entry.job.total_chunks == 1
+
+        retrieved = primary.postgres_rag.retriever.retrieve(
+            tenant_id=primary.tenant_id,
+            knowledge_base_id=primary.knowledge_base_id,
+            query="Synthetic deterministic query.",
+            top_k=5,
+        )
+        assert len(retrieved.documents) == 1
+        assert retrieved.documents[0].document_id == (
+            primary_entry.document.document_id
+        )
+        assert retrieved.documents[0].chunk_id == "chunk_000001"
+        assert (
+            isolated.postgres_rag.retriever.retrieve(
+                tenant_id=isolated.tenant_id,
+                knowledge_base_id=isolated.knowledge_base_id,
+                query="Synthetic deterministic query.",
+                top_k=5,
+            )
+            .documents[0]
+            .document_id
+            == isolated_entry.document.document_id
+        )
+
+        deleted = primary.registry.delete_document(
+            tenant_id=primary.tenant_id,
+            knowledge_base_id=primary.knowledge_base_id,
+            document_id=primary_entry.document.document_id,
+        )
+        assert deleted is not None
+        assert deleted.storage_object_key is None
+        assert (
+            primary.registry.list_documents(
+                tenant_id=primary.tenant_id,
+                knowledge_base_id=primary.knowledge_base_id,
+            )
+            == ()
+        )
+        assert (
+            isolated.registry.get_entry(
+                tenant_id=isolated.tenant_id,
+                knowledge_base_id=isolated.knowledge_base_id,
+                document_id=isolated_entry.document.document_id,
+            )
+            == isolated_entry
+        )
+        assert (
+            primary.postgres_rag.profile_repository.get_profile(
+                tenant_id=primary.tenant_id,
+                knowledge_base_id=primary.knowledge_base_id,
+            )
+            == primary.postgres_rag.profile
+        )
+        assert (
+            primary.postgres_rag.retriever.retrieve(
+                tenant_id=primary.tenant_id,
+                knowledge_base_id=primary.knowledge_base_id,
+                query="Synthetic deterministic query.",
+                top_k=5,
+            ).documents
+            == ()
+        )
+    finally:
+        primary.close(wait=True)
+        isolated.close(wait=True)
 
 
 def test_same_scope_advisory_lock_blocks_then_releases(
