@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 import logging
+from math import isfinite
 import re
 from time import monotonic
 from typing import Protocol
@@ -149,7 +150,9 @@ class StableTranscriptClassificationStage:
         self._processed_partial_chunk_keys: list[int] = []
         self._last_partial_text = ""
         self._last_partial_word_count = 0
-        self._last_partial_evaluation_seconds: float | None = None
+        self._last_partial_wall_evaluation_seconds: float | None = None
+        self._last_partial_media_evaluation_seconds: float | None = None
+        self._last_partial_media_progress_seconds: float | None = None
 
     def configure_provisional_policy(
         self,
@@ -160,10 +163,16 @@ class StableTranscriptClassificationStage:
         self._provisional_policy = policy
         if monotonic_clock is not None:
             self._monotonic_clock = monotonic_clock
+        self.reset_provisional_source()
+
+    def reset_provisional_source(self) -> None:
+        """Reset bounded PARTIAL cadence state for one new uploaded source."""
         self._processed_partial_chunk_keys.clear()
         self._last_partial_text = ""
         self._last_partial_word_count = 0
-        self._last_partial_evaluation_seconds = None
+        self._last_partial_wall_evaluation_seconds = None
+        self._last_partial_media_evaluation_seconds = None
+        self._last_partial_media_progress_seconds = None
 
     def process(
         self,
@@ -175,12 +184,14 @@ class StableTranscriptClassificationStage:
         stable_delta: str | None = None,
         preceding_stable_transcript: str = "",
         allow_provisional: bool = True,
+        media_progress_seconds: float | None = None,
     ) -> StableClassificationOutcome:
         if event.kind is TranscriptKind.PARTIAL:
             return self._process_partial(
                 event,
                 preceding_stable_transcript=preceding_stable_transcript,
                 allow_provisional=allow_provisional,
+                media_progress_seconds=media_progress_seconds,
             )
         if not stable_changed:
             return self._outcome(
@@ -326,6 +337,7 @@ class StableTranscriptClassificationStage:
         *,
         preceding_stable_transcript: str,
         allow_provisional: bool,
+        media_progress_seconds: float | None,
     ) -> StableClassificationOutcome:
         policy = self._provisional_policy
         if not policy.enabled or not allow_provisional or self._classifier is None:
@@ -349,20 +361,13 @@ class StableTranscriptClassificationStage:
             and len(words) - self._last_partial_word_count < policy.minimum_growth_words
         ):
             return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
-        now = self._monotonic_clock()
-        if now < 0:
-            raise ValueError("monotonic clock cannot be negative")
-        if (
-            self._last_partial_evaluation_seconds is not None
-            and now - self._last_partial_evaluation_seconds
-            < policy.minimum_interval_seconds
-        ):
+        cadence_seconds = self._accepted_cadence_seconds(media_progress_seconds)
+        if cadence_seconds is None:
             return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
         self._processed_partial_chunk_keys.append(chunk_key)
         del self._processed_partial_chunk_keys[:-64]
         self._last_partial_text = normalized
         self._last_partial_word_count = len(words)
-        self._last_partial_evaluation_seconds = now
         classification_text, preceding_count, sentence_count = _bounded_context(
             preceding_stable_transcript,
             event.text,
@@ -458,6 +463,39 @@ class StableTranscriptClassificationStage:
                 delta_word_count=len(words),
                 provisional=True,
             )
+
+    def _accepted_cadence_seconds(
+        self,
+        media_progress_seconds: float | None,
+    ) -> float | None:
+        interval = self._provisional_policy.minimum_interval_seconds
+        if media_progress_seconds is None:
+            now = self._monotonic_clock()
+            if now < 0:
+                raise ValueError("monotonic clock cannot be negative")
+            previous = self._last_partial_wall_evaluation_seconds
+            if previous is not None and now - previous < interval:
+                return None
+            self._last_partial_wall_evaluation_seconds = now
+            return now
+
+        if not isfinite(media_progress_seconds) or media_progress_seconds < 0:
+            return None
+        previous_progress = self._last_partial_media_progress_seconds
+        if (
+            previous_progress is not None
+            and media_progress_seconds <= previous_progress
+        ):
+            return None
+        self._last_partial_media_progress_seconds = media_progress_seconds
+        previous_evaluation = self._last_partial_media_evaluation_seconds
+        if (
+            previous_evaluation is not None
+            and media_progress_seconds - previous_evaluation < interval
+        ):
+            return None
+        self._last_partial_media_evaluation_seconds = media_progress_seconds
+        return media_progress_seconds
 
     @staticmethod
     def _outcome(

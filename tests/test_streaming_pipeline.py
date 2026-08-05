@@ -418,6 +418,104 @@ def test_meaningful_partial_uses_stricter_threshold_without_committing() -> None
     assert state.classification_transcript_revision is None
 
 
+def test_media_progress_cadence_ignores_accelerated_wall_clock() -> None:
+    classifier = FixedLabelClassifier("complaint")
+    stage = StableTranscriptClassificationStage(
+        classifier,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: 0.0,
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+
+    outcomes = []
+    for revision, media_progress in enumerate((2.0, 4.0, 6.0), start=1):
+        event = partial_event(
+            f"synthetic complaint now revision {revision}",
+            revision=revision,
+            sequence=revision,
+        )
+        state.apply_transcript(event)
+        outcomes.append(
+            stage.process(
+                event,
+                cumulative_stable_transcript="",
+                stable_changed=False,
+                call_state=state,
+                media_progress_seconds=media_progress,
+            )
+        )
+
+    assert all(
+        outcome.status is ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED
+        for outcome in outcomes
+    )
+    assert len(classifier.calls) == 6
+
+
+@pytest.mark.parametrize(
+    "invalid_progress",
+    [float("nan"), float("inf"), float("-inf"), -1.0],
+)
+def test_invalid_media_progress_fails_closed(invalid_progress: float) -> None:
+    classifier = FixedLabelClassifier("complaint")
+    stage = StableTranscriptClassificationStage(
+        classifier,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    event = partial_event("synthetic complaint now")
+
+    outcome = stage.process(
+        event,
+        cumulative_stable_transcript="",
+        stable_changed=False,
+        call_state=state,
+        media_progress_seconds=invalid_progress,
+    )
+
+    assert outcome.status is ClassificationProcessingStatus.PARTIAL_SKIPPED
+    assert classifier.calls == []
+
+
+def test_repeated_and_regressing_media_progress_fail_closed() -> None:
+    classifier = FixedLabelClassifier("complaint")
+    stage = StableTranscriptClassificationStage(
+        classifier,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+
+    statuses = []
+    for revision, media_progress in enumerate(
+        (4.0, 4.0, 3.0, 4.5, 5.0),
+        start=1,
+    ):
+        event = partial_event(
+            f"synthetic complaint now revision {revision}",
+            revision=revision,
+            sequence=revision,
+        )
+        state.apply_transcript(event)
+        statuses.append(
+            stage.process(
+                event,
+                cumulative_stable_transcript="",
+                stable_changed=False,
+                call_state=state,
+                media_progress_seconds=media_progress,
+            ).status
+        )
+
+    assert statuses == [
+        ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED,
+        ClassificationProcessingStatus.PARTIAL_SKIPPED,
+        ClassificationProcessingStatus.PARTIAL_SKIPPED,
+        ClassificationProcessingStatus.PARTIAL_SKIPPED,
+        ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED,
+    ]
+    assert len(classifier.calls) == 4
+
+
 @pytest.mark.parametrize("text", ["one", "one two"])
 def test_short_partial_is_skipped(text: str) -> None:
     classifier = FakeRuntimeClassifier()
@@ -1586,6 +1684,254 @@ def test_pipeline_publishes_provisional_card_before_finalization() -> None:
     assert (
         confirmed.displayed_suggestions[0].lifecycle
         is CoachingSuggestionLifecycle.CONFIRMED
+    )
+
+
+def test_accelerated_upload_admits_distinct_risks_before_end_with_bounded_cards() -> (
+    None
+):
+    class RegionClassifier(FakeRuntimeClassifier):
+        def classify(self, **kwargs: object) -> ClassificationResultEvent:
+            base = super().classify(**kwargs)  # type: ignore[arg-type]
+            text = str(kwargs["text"])
+            if "product" in text:
+                label = "product_information"
+            elif "renewal" in text:
+                label = "renewal_interest"
+            else:
+                label = "cancellation_request"
+            return base.model_copy(
+                update={
+                    "labels": [ClassificationLabel(name=label, score=0.95)],
+                    "probabilities": {label: 0.95},
+                    "thresholds": {label: 0.5},
+                }
+            )
+
+    tenant = TenantConfig(
+        context=context(),
+        asr=config(),
+        classification=TenantClassificationConfig(
+            model_id="common_turkish_setfit_v2",
+            labels=[
+                "product_information",
+                "renewal_interest",
+                "cancellation_request",
+            ],
+        ),
+        rag=TenantRAGConfig(enabled=False),
+        coaching=TenantCoachingConfig(
+            cooldown_seconds=8,
+            max_active_suggestions=2,
+            allowed_actions=[action.value for action in CoachingAction],
+        ),
+    )
+    states: list[CallState] = []
+
+    def create_coordinator(state: CallState) -> CoachingCoordinator:
+        states.append(state)
+        return CoachingCoordinator(
+            tenant,
+            state,
+            RuleBasedCoachingEngine(
+                tenant,
+                (),
+                event_id_factory=lambda: f"suggestion-{state.transcript_revision}",
+                utc_datetime_factory=lambda: NOW,
+            ),
+        )
+
+    subject = pipeline(
+        [
+            chunk(0, 0.0, 2.0),
+            chunk(1, 2.0, 2.0),
+            chunk(2, 4.0, 2.0),
+        ],
+        FakeTranscriber(
+            [
+                [("product details please", 0.0, 2.0)],
+                [("renewal interest now", 2.0, 4.0)],
+                [("cancel service now", 4.0, 6.0)],
+            ]
+        ),
+        runtime_classifier=RegionClassifier(),
+        coaching_factory=create_coordinator,
+    )
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: 0.0,
+    )
+    published: list[StreamingASRStep] = []
+    active_counts: list[int] = []
+    active_label_sets: list[set[str | None]] = []
+
+    def publish(step: StreamingASRStep) -> None:
+        published.append(step)
+        active_counts.append(len(states[0].active_coaching_suggestions))
+        active_label_sets.append(
+            {item.label_id for item in states[0].active_coaching_suggestions}
+        )
+
+    result = subject.run(
+        Path("synthetic.wav"),
+        "call_001",
+        step_callback=publish,
+    )
+
+    displayed_before_end = [
+        suggestion.label_id
+        for step in published
+        for outcome in step.coaching_outcomes
+        if outcome.result is not None
+        for suggestion in outcome.result.displayed_suggestions
+    ]
+    assert displayed_before_end == [
+        "product_information",
+        "renewal_interest",
+        "cancellation_request",
+    ]
+    assert active_counts == [1, 2, 2]
+    assert active_label_sets[-1] == {"renewal_interest", "cancellation_request"}
+    assert {item.label_id for item in states[0].active_coaching_suggestions} == {
+        "cancellation_request"
+    }
+    assert {item.label_id for item in states[0].coaching_suggestion_history} == {
+        "product_information",
+        "renewal_interest",
+    }
+    assert result.final_event is not None
+    final = result.coaching_outcomes[-1].result
+    assert final is not None
+    assert len(final.displayed_suggestions) == 1
+    last_provisional = published[-1].coaching_outcomes[0].result
+    assert last_provisional is not None
+    assert (
+        final.displayed_suggestions[0].suggestion_id
+        == last_provisional.displayed_suggestions[0].suggestion_id
+    )
+
+
+def test_accelerated_upload_same_label_repetition_remains_single_card() -> None:
+    subject = pipeline(
+        [
+            chunk(0, 0.0, 2.0),
+            chunk(1, 2.0, 2.0),
+        ],
+        FakeTranscriber(
+            [
+                [("synthetic complaint now", 0.0, 2.0)],
+                [("synthetic complaint repeated", 2.0, 4.0)],
+            ]
+        ),
+        runtime_classifier=FixedLabelClassifier("complaint"),
+        coaching_factory=coaching_factory(label="complaint"),
+    )
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: 0.0,
+    )
+    published: list[StreamingASRStep] = []
+
+    subject.run(
+        Path("synthetic.wav"),
+        "call_001",
+        step_callback=published.append,
+    )
+
+    displayed = [
+        suggestion
+        for step in published
+        for outcome in step.coaching_outcomes
+        if outcome.result is not None
+        for suggestion in outcome.result.displayed_suggestions
+    ]
+    assert len(displayed) == 1
+    assert displayed[0].label_id == "complaint"
+
+
+def test_new_uploaded_source_resets_media_cadence_state() -> None:
+    class RepeatingTranscriber(FakeTranscriber):
+        def transcribe(self, window: ASRAudioWindow) -> WindowTranscriptionResult:
+            self.windows.append(window)
+            return transcription(window, ("synthetic complaint now", 0.0, 2.0))
+
+    subject = pipeline(
+        [chunk(0, 0.0, 2.0)],
+        RepeatingTranscriber([]),
+        runtime_classifier=FixedLabelClassifier("complaint"),
+        coaching_factory=coaching_factory(label="complaint"),
+    )
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: 0.0,
+    )
+    published_first: list[StreamingASRStep] = []
+    published_second: list[StreamingASRStep] = []
+
+    subject.run(
+        Path("first-synthetic.wav"),
+        "call_001",
+        step_callback=published_first.append,
+    )
+    subject.run(
+        Path("replacement-synthetic.wav"),
+        "call_001",
+        step_callback=published_second.append,
+    )
+
+    assert (
+        published_first[0].classification_outcomes[0].status
+        is ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED
+    )
+    assert (
+        published_second[0].classification_outcomes[0].status
+        is ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED
+    )
+
+
+def test_live_microphone_keeps_wall_clock_partial_cadence() -> None:
+    subject = pipeline(
+        [],
+        FakeTranscriber(
+            [
+                [("synthetic complaint now", 0.0, 2.0)],
+                [("synthetic complaint now repeated", 2.0, 4.0)],
+            ]
+        ),
+        runtime_classifier=FixedLabelClassifier("complaint"),
+        coaching_factory=coaching_factory(label="complaint"),
+    )
+    clock_values = iter((10.0, 10.5))
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: next(clock_values),
+    )
+    resource = object()
+    capability = create_local_mic_test_capability(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        resource=resource,
+        server_address="127.0.0.1",
+        environment={LOCAL_MIC_GATE_ENVIRONMENT_KEY: "1"},
+    )
+    published: list[StreamingASRStep] = []
+
+    subject.run_live(
+        iter((chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0))),
+        "call_001",
+        capability=capability,
+        execution_resource=resource,
+        cancellation=Event(),
+        step_callback=published.append,
+    )
+
+    assert (
+        published[0].classification_outcomes[0].status
+        is ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED
+    )
+    assert (
+        published[1].classification_outcomes[0].status
+        is ClassificationProcessingStatus.PARTIAL_SKIPPED
     )
 
 

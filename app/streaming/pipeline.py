@@ -150,6 +150,7 @@ class StreamingASRPipeline:
         plan_callback: PlanCallback | None = None,
         retain_history: bool = True,
     ) -> StreamingASRResult:
+        self._classification_stage.reset_provisional_source()
         audio_duration_seconds = 0.0
         planning_chunks = self._chunk_generator(
             audio_path,
@@ -187,6 +188,7 @@ class StreamingASRPipeline:
             initial_audio_duration_seconds=audio_duration_seconds,
             step_callback=step_callback,
             retain_history=retain_history,
+            use_media_progress_for_partial=True,
         )
 
     def run_live(
@@ -214,6 +216,7 @@ class StreamingASRPipeline:
             step_callback=step_callback,
             retain_history=retain_history,
             cancellation=cancellation,
+            use_media_progress_for_partial=False,
         )
 
     def _execute_chunks(
@@ -225,6 +228,7 @@ class StreamingASRPipeline:
         step_callback: StepCallback | None,
         retain_history: bool,
         cancellation: Event | None = None,
+        use_media_progress_for_partial: bool,
     ) -> StreamingASRResult:
         call_state = CallState(
             tenant_id=self._tenant_context.tenant_id,
@@ -250,6 +254,7 @@ class StreamingASRPipeline:
             if cancellation is not None and cancellation.is_set():
                 break
             processed_chunks += 1
+            chunk_end_seconds = chunk.chunk_start_seconds + chunk.chunk_duration_seconds
             call_state.apply_audio_chunk(chunk)
             buffer.append(chunk)
             window = window_builder.build(buffer)
@@ -270,6 +275,11 @@ class StreamingASRPipeline:
                         previous_stable=previous_stable,
                         stable_changed=stable_changed,
                         coordinator=coaching_coordinator,
+                        media_progress_seconds=(
+                            chunk_end_seconds
+                            if use_media_progress_for_partial
+                            else None
+                        ),
                     )
                 )
                 step_classification_outcomes.append(outcome)
@@ -284,7 +294,6 @@ class StreamingASRPipeline:
                     if retain_history:
                         all_coaching_outcomes.append(coaching_outcome)
 
-            chunk_end_seconds = chunk.chunk_start_seconds + chunk.chunk_duration_seconds
             audio_duration_seconds = max(audio_duration_seconds, chunk_end_seconds)
             completed_coaching = self._drain_completed_coaching(
                 coordinator=coaching_coordinator,
@@ -370,6 +379,7 @@ class StreamingASRPipeline:
         previous_stable: str,
         stable_changed: bool,
         coordinator: CoachingProcessorProtocol | None,
+        media_progress_seconds: float | None = None,
     ) -> tuple[
         StableClassificationOutcome,
         StableCoachingOutcome | None,
@@ -384,6 +394,7 @@ class StreamingASRPipeline:
                 stable_delta=event.text,
                 preceding_stable_transcript=previous_stable,
                 allow_provisional=not self._customer_router.enabled,
+                media_progress_seconds=media_progress_seconds,
             )
             coaching = (
                 self._process_coaching(

@@ -299,3 +299,19 @@ This log uses local chronological numbering and records only Fatih-owned work.
   Pyright remains limited to the three documented POSIX portability findings.
 - Next planned step: manually verify both upload and microphone GPU profiles on
   the CUDA target while confirming displayed preparation and inference timing.
+
+## Uploaded-audio PARTIAL cadence
+
+- Replaced accelerated upload PARTIAL gating with monotonic processed-audio
+  progress while preserving the existing wall-clock cadence for live
+  microphone capture and callers without media progress.
+- Added fail-closed handling for invalid, repeated, or regressing media
+  timestamps and source-scoped cadence reset without changing transcript
+  reconciliation, confidence, coaching deduplication, or bounded-card policy.
+- Changed files: Fatih-owned classification and streaming pipeline code,
+  focused streaming tests, and this progress file.
+- Tests: focused streaming/coaching/uploaded-dashboard 262 passed; media/audio
+  ingress 148 passed; full Windows suite 2518 passed and 17 skipped, with only
+  the 19 documented POSIX-only vLLM controller failures.
+- Next planned step: manually verify several distinct pre-END risk updates
+  during accelerated `gpu-large-v3` uploaded-audio processing.
