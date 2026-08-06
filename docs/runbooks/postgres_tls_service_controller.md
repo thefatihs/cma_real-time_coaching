@@ -40,13 +40,21 @@ It generates fresh passwords and one-day TLS material, binds only a random
 runs the existing integration proof. At a document-capable commit that proof
 applies migrations 0001-0003, checks repeat idempotence, the nullable source-key
 contract and schema readiness, and performs synthetic tenant-safe
-pgvector operations. The opt-in ephemeral application role retains its existing
+pgvector operations. It also idempotently provisions and retains the dashboard
+smoke profile for `tenant_alpha` / `kb_smoke`: canonical model identity
+`sentence-transformers/all-MiniLM-L6-v2`, 384 dimensions, normalization enabled,
+and cosine distance. This profile registration does not construct or load a
+model, use a machine-local snapshot path, or access the network. The separate
+2-dimensional synthetic ingestion/retrieval proof remains unchanged. The
+opt-in ephemeral application role retains its existing
 `CONNECT`, schema `USAGE`, and table `SELECT`/`INSERT`/`UPDATE` privileges. It
 also receives `DELETE` only on `callmetric_vector.vector_records` and
 `callmetric_vector.embedding_profiles` and `callmetric_vector.documents`, which permits the Windows E2E to remove
 its fixed `tenant_alpha` / `kb_smoke` scope child-first. It receives no broad or
 future-table delete grant. Job deletion occurs only through the document parent
-cascade. `READY` is emitted only after all of those checks and
+cascade. The integration cleanup removes its temporary synthetic rows without
+removing the canonical dashboard profile. `READY` is emitted only after that
+profile remains queryable and all other checks and
 the owner-only handoff succeed.
 
 ## Bounded command timeouts
@@ -68,7 +76,9 @@ that primary phase, but is `E_CLEANUP` when no earlier phase failed.
 TTL expiry, SIGINT, SIGTERM, and SIGHUP where Windows exposes it remove the
 handoff, exact randomized Compose project container/network/ephemeral volume,
 and TLS directory. The controller never prunes or selects resources broadly;
-it compares all pre-existing container, network, and volume IDs afterward.
+the disposable PostgreSQL volume owns the retained dashboard smoke profile, so
+no profile or other database state survives successful service shutdown. It
+compares all pre-existing container, network, and volume IDs afterward.
 The signal handlers remain installed through one cleanup lifecycle. Cleanup
 first attempts bounded exact-project Compose down. If down fails, times out, or
 leaves residue, the fallback enumerates only the exact project label, validates

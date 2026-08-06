@@ -212,6 +212,27 @@ def test_ready_is_emitted_only_from_foreground_wait(
     )
 
 
+def test_profile_proof_failure_prevents_handoff_and_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _stub_bounded_lifecycle(monkeypatch, tmp_path, failures=frozenset({"pytest"}))
+    monkeypatch.setattr(
+        subject,
+        "_create_handoff",
+        lambda *_args: pytest.fail("handoff published before profile proof passed"),
+    )
+    monkeypatch.setattr(
+        subject,
+        "_wait",
+        lambda *_args: pytest.fail("READY emitted before profile proof passed"),
+    )
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError) as captured:
+        subject.run(300)
+
+    assert captured.value.phase == subject.E_MIGRATION
+
+
 def test_controlled_signals_include_available_contract() -> None:
     assert signal.SIGINT in subject._signals()
     assert signal.SIGTERM in subject._signals()

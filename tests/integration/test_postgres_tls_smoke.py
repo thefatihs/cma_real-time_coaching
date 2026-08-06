@@ -39,6 +39,12 @@ APPLICATION_USER = "callmetric_tls_application"
 TLS_HOST = "localhost"
 MISMATCHED_HOST = "mismatch.invalid"
 LOOPBACK_HOST = "127.0.0.1"
+_DASHBOARD_TENANT_ID = "tenant_alpha"
+_DASHBOARD_KNOWLEDGE_BASE_ID = "kb_smoke"
+_MINILM_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+_MINILM_VECTOR_DIMENSION = 384
+_CLEANUP_TENANT_ID = "tenant-tls-cleanup"
+_CLEANUP_KNOWLEDGE_BASE_ID = "kb-tls-cleanup"
 
 
 class _SyntheticBackend:
@@ -274,6 +280,43 @@ def _require_profile_ingestion_and_retrieval() -> None:
     ) == (("synthetic-document", "chunk_000001"),)
 
 
+def _provision_canonical_dashboard_profile() -> None:
+    settings_factory = cast(
+        Callable[[], PostgreSQLVectorStoreSettings], PostgreSQLVectorStoreSettings
+    )
+    provider_settings = KnowledgeBaseRAGProviderSettings(
+        tenant_id=_DASHBOARD_TENANT_ID,
+        knowledge_base_id=_DASHBOARD_KNOWLEDGE_BASE_ID,
+        model_id=_MINILM_MODEL_ID,
+        model_name_or_path=_MINILM_MODEL_ID,
+        vector_dimension=_MINILM_VECTOR_DIMENSION,
+        normalize_embeddings=True,
+        device="cpu",
+        local_files_only=True,
+    )
+
+    def reject_model_construction(_config: object) -> _SyntheticBackend:
+        pytest.fail("profile provisioning must not construct an embedding backend")
+
+    first = provision_profile_bound_postgres_rag(
+        postgres_settings=settings_factory(),
+        knowledge_base_settings=provider_settings,
+        psycopg_connect=psycopg.connect,
+        embedding_backend_factory=reject_model_construction,
+    )
+    second = provision_profile_bound_postgres_rag(
+        postgres_settings=settings_factory(),
+        knowledge_base_settings=provider_settings,
+        psycopg_connect=psycopg.connect,
+        embedding_backend_factory=reject_model_construction,
+    )
+    assert first == second
+    assert first.model_id == _MINILM_MODEL_ID
+    assert first.vector_dimension == _MINILM_VECTOR_DIMENSION
+    assert first.normalize_embeddings is True
+    assert first.distance_metric.value == "cosine"
+
+
 def _require_exact_cleanup_privileges() -> None:
     application_password = _required_environment(
         "CALLMETRIC_POSTGRES_TLS_APPLICATION_PASSWORD"
@@ -303,8 +346,8 @@ def _require_exact_cleanup_privileges() -> None:
                 "normalize_embeddings, distance_metric) "
                 "VALUES (%s, %s, %s, %s, %s, %s)",
                 (
-                    "tenant_alpha",
-                    "kb_smoke",
+                    _CLEANUP_TENANT_ID,
+                    _CLEANUP_KNOWLEDGE_BASE_ID,
                     "synthetic-cleanup-model",
                     2,
                     True,
@@ -317,8 +360,8 @@ def _require_exact_cleanup_privileges() -> None:
                 "vector_dimension, embedding, metadata_json) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
                 (
-                    "tenant_alpha",
-                    "kb_smoke",
+                    _CLEANUP_TENANT_ID,
+                    _CLEANUP_KNOWLEDGE_BASE_ID,
                     "synthetic-cleanup-document",
                     "chunk_000001",
                     "Synthetic cleanup privilege evidence.",
@@ -330,22 +373,31 @@ def _require_exact_cleanup_privileges() -> None:
             cursor.execute(
                 "DELETE FROM callmetric_vector.vector_records "
                 "WHERE tenant_id = %s AND knowledge_base_id = %s",
-                ("tenant_alpha", "kb_smoke"),
+                (_CLEANUP_TENANT_ID, _CLEANUP_KNOWLEDGE_BASE_ID),
             )
             cursor.execute(
                 "DELETE FROM callmetric_vector.embedding_profiles "
                 "WHERE tenant_id = %s AND knowledge_base_id = %s",
-                ("tenant_alpha", "kb_smoke"),
+                (_CLEANUP_TENANT_ID, _CLEANUP_KNOWLEDGE_BASE_ID),
             )
             for table in ("vector_records", "embedding_profiles"):
                 query = sql.SQL(
                     "SELECT count(*) FROM callmetric_vector.{} "
                     "WHERE tenant_id = %s AND knowledge_base_id = %s"
                 ).format(sql.Identifier(table))
-                cursor.execute(query, ("tenant_alpha", "kb_smoke"))
+                cursor.execute(query, (_CLEANUP_TENANT_ID, _CLEANUP_KNOWLEDGE_BASE_ID))
                 assert cursor.fetchall() == [(0,)]
                 cursor.execute(query, ("tenant-tls-smoke", "kb-tls-smoke"))
                 assert cursor.fetchall() == [(1,)]
+            cursor.execute(
+                "SELECT model_id, vector_dimension, normalize_embeddings, "
+                "distance_metric FROM callmetric_vector.embedding_profiles "
+                "WHERE tenant_id = %s AND knowledge_base_id = %s",
+                (_DASHBOARD_TENANT_ID, _DASHBOARD_KNOWLEDGE_BASE_ID),
+            )
+            assert cursor.fetchall() == [
+                (_MINILM_MODEL_ID, _MINILM_VECTOR_DIMENSION, True, "cosine")
+            ]
         connection.commit()
     except BaseException:
         connection.rollback()
@@ -363,4 +415,5 @@ def test_postgres_tls_smoke_end_to_end() -> None:
     _create_application_role()
     _require_tls_for_application_role()
     _require_profile_ingestion_and_retrieval()
+    _provision_canonical_dashboard_profile()
     _require_exact_cleanup_privileges()
