@@ -315,3 +315,21 @@ This log uses local chronological numbering and records only Fatih-owned work.
   the 19 documented POSIX-only vLLM controller failures.
 - Next planned step: manually verify several distinct pre-END risk updates
   during accelerated `gpu-large-v3` uploaded-audio processing.
+
+## Provider-independent mono RTP ingress
+
+- Added immutable, tenant/call/source-generation-scoped START, PCMA/PCMU packet,
+  and END contracts plus a bounded in-memory RTP ordering adapter.
+- The adapter deterministically decodes 8 kHz mono G.711 to 16 kHz PCM16,
+  emits existing two-second `AudioChunkEvent` values, bounds jitter/output
+  state, tracks fixed privacy-safe counters, and releases audio on reset or
+  source replacement.
+- Changed files: Fatih-owned audio-ingress RTP module/exports, synthetic focused
+  tests, and this progress file.
+- Tests: focused RTP/audio-ingress/streaming 186 passed; additional PyAV
+  execution-resource 26 passed; full Windows suite 2537 passed and 17 skipped,
+  with only the 19 documented POSIX-only vLLM controller failures.
+- Ruff and format passed. New RTP code has 0 Pyright errors; repository Pyright
+  remains limited to the three documented POSIX portability findings.
+- Next planned step: review the provider packet mapping and lifecycle contract
+  before any real transport or SIP integration is specified.
