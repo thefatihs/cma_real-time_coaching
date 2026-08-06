@@ -87,12 +87,12 @@ def _mock_clean_repository(
     def output(arguments: list[str], **_kwargs: object) -> str:
         command = tuple(arguments)
         responses = {
-            ("git", "branch", "--show-current"): subject.EXPECTED_BRANCH,
+            ("git", "branch", "--show-current"): subject.DEFAULT_EXPECTED_BRANCH,
             ("git", "rev-parse", "HEAD"): current,
             (
                 "git",
                 "rev-parse",
-                f"origin/{subject.EXPECTED_BRANCH}",
+                f"origin/{subject.DEFAULT_EXPECTED_BRANCH}",
             ): remote,
             (
                 "git",
@@ -112,6 +112,37 @@ def test_exact_configured_current_and_remote_head_pass(
 ) -> None:
     _mock_clean_repository(monkeypatch)
     subject._validate_repository()
+
+
+def test_explicit_reviewed_document_branch_is_supported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    branch = "feat/dashboard-rag-document-upload"
+    monkeypatch.setenv(subject.EXPECTED_BRANCH_VARIABLE, branch)
+    monkeypatch.setenv(subject.EXPECTED_HEAD_VARIABLE, CURRENT_COMMIT)
+    monkeypatch.setattr(subject.Path, "cwd", lambda: subject.REPOSITORY_ROOT)
+
+    def output(arguments: list[str], **_kwargs: object) -> str:
+        responses = {
+            ("git", "branch", "--show-current"): branch,
+            ("git", "rev-parse", "HEAD"): CURRENT_COMMIT,
+            ("git", "rev-parse", f"origin/{branch}"): CURRENT_COMMIT,
+            ("git", "status", "--porcelain", "-z", "--untracked-files=all"): "",
+        }
+        return responses[tuple(arguments)]
+
+    monkeypatch.setattr(subject, "_output", output)
+    subject._validate_repository()
+
+
+@pytest.mark.parametrize("branch", ["", "../unsafe", "-unsafe", "unsafe/"])
+def test_unsafe_expected_branch_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, branch: str
+) -> None:
+    _mock_clean_repository(monkeypatch)
+    monkeypatch.setenv(subject.EXPECTED_BRANCH_VARIABLE, branch)
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject._validate_repository()
 
 
 @pytest.mark.parametrize(

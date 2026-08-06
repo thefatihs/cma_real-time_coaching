@@ -16,6 +16,7 @@ Run read-only preflight first (it checks the checkout, Docker/Compose/server,
 
 ```powershell
 $env:CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD = (git rev-parse HEAD).Trim()
+$env:CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH = "<REVIEWED_BRANCH>"
 uv run python -m scripts.run_postgres_tls_service --ttl-seconds 600 --preflight-only
 ```
 
@@ -24,23 +25,28 @@ After approval, start the foreground controller with a TTL from 300 through
 
 ```powershell
 $env:CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD = (git rev-parse HEAD).Trim()
+$env:CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH = "<REVIEWED_BRANCH>"
 uv run python -m scripts.run_postgres_tls_service --ttl-seconds 7200
 ```
 
 The supplied expected HEAD must be the exact lowercase 40-character commit.
-The controller fails closed unless it matches both the current checkout and
-`origin/feat/rag-coaching-integration`; it never prints the supplied value.
+The controller fails closed unless HEAD matches the current checkout and the
+remote-tracking ref for the reviewed expected branch; it never prints either
+supplied value. The branch setting defaults to the legacy integration branch
+for compatibility, while document verification sets it explicitly.
 
 It generates fresh passwords and one-day TLS material, binds only a random
 `127.0.0.1` port, validates the certificate, waits for container health, then
-runs the existing PR52 integration proof. That proof applies migration 0001,
-checks its idempotence and schema readiness, and performs synthetic tenant-safe
+runs the existing integration proof. At a document-capable commit that proof
+applies migrations 0001-0003, checks repeat idempotence, the nullable source-key
+contract and schema readiness, and performs synthetic tenant-safe
 pgvector operations. The opt-in ephemeral application role retains its existing
 `CONNECT`, schema `USAGE`, and table `SELECT`/`INSERT`/`UPDATE` privileges. It
 also receives `DELETE` only on `callmetric_vector.vector_records` and
-`callmetric_vector.embedding_profiles`, which permits the Windows E2E to remove
+`callmetric_vector.embedding_profiles` and `callmetric_vector.documents`, which permits the Windows E2E to remove
 its fixed `tenant_alpha` / `kb_smoke` scope child-first. It receives no broad or
-future-table delete grant. `READY` is emitted only after all of those checks and
+future-table delete grant. Job deletion occurs only through the document parent
+cascade. `READY` is emitted only after all of those checks and
 the owner-only handoff succeed.
 
 ## Bounded command timeouts

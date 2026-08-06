@@ -157,7 +157,8 @@ def _create_application_role() -> None:
                 sql.SQL(
                     "GRANT DELETE ON TABLE "
                     "callmetric_vector.vector_records, "
-                    "callmetric_vector.embedding_profiles TO {}"
+                    "callmetric_vector.embedding_profiles, "
+                    "callmetric_vector.documents TO {}"
                 ).format(sql.Identifier(APPLICATION_USER))
             )
         connection.commit()
@@ -284,7 +285,7 @@ def _require_exact_cleanup_privileges() -> None:
     )
     try:
         with connection.cursor() as cursor:
-            for table in ("embedding_profiles", "vector_records"):
+            for table in ("embedding_profiles", "vector_records", "documents"):
                 for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
                     cursor.execute(
                         "SELECT has_table_privilege(current_user, %s, %s)",

@@ -154,10 +154,11 @@ def _validate_minilm_settings(settings: KnowledgeBaseRAGProviderSettings) -> Non
     ):
         raise ValueError("knowledge base embedding profile is incompatible")
     if settings.model_name_or_path != MINILM_MODEL:
-        _validate_local_minilm_snapshot(settings.model_name_or_path)
+        validate_local_minilm_snapshot(settings.model_name_or_path)
 
 
-def _validate_local_minilm_snapshot(value: str) -> None:
+def validate_local_minilm_snapshot(value: str) -> Path:
+    """Validate and return one canonical approved immutable MiniLM snapshot."""
     try:
         snapshot = Path(value)
         if (
@@ -202,8 +203,13 @@ def _validate_local_minilm_snapshot(value: str) -> None:
             candidate.resolve(strict=True).relative_to(resolved_root)
             if _sha256_file(candidate) != expected_digest:
                 raise ValueError
+        return resolved_snapshot
     except (OSError, UnicodeError, ValueError):
         raise ValueError(_LOCAL_SNAPSHOT_ERROR) from None
+
+
+def _validate_local_minilm_snapshot(value: str) -> None:
+    validate_local_minilm_snapshot(value)
 
 
 def _read_manifest(path: Path) -> dict[str, tuple[str, int]]:

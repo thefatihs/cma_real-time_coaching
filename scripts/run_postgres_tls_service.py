@@ -25,7 +25,8 @@ from typing import Any, TypeVar
 from scripts import run_postgres_tls_smoke as smoke
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_BRANCH = "feat/rag-coaching-integration"
+DEFAULT_EXPECTED_BRANCH = "feat/rag-coaching-integration"
+EXPECTED_BRANCH_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH"
 EXPECTED_HEAD_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HANDOFF_ROOT_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_HANDOFF_ROOT"
@@ -190,11 +191,21 @@ def _validate_repository() -> None:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
     if Path.cwd().resolve() != REPOSITORY_ROOT:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
-    if _output(["git", "branch", "--show-current"]) != EXPECTED_BRANCH:
+    expected_branch = os.environ.get(EXPECTED_BRANCH_VARIABLE, DEFAULT_EXPECTED_BRANCH)
+    if (
+        not expected_branch
+        or expected_branch != expected_branch.strip()
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", expected_branch)
+        or ".." in expected_branch
+        or expected_branch.startswith("-")
+        or expected_branch.endswith("/")
+    ):
+        raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
+    if _output(["git", "branch", "--show-current"]) != expected_branch:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
     if _output(["git", "rev-parse", "HEAD"]) != expected_head:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
-    if _output(["git", "rev-parse", f"origin/{EXPECTED_BRANCH}"]) != expected_head:
+    if _output(["git", "rev-parse", f"origin/{expected_branch}"]) != expected_head:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
     raw = _output(["git", "status", "--porcelain", "-z", "--untracked-files=all"])
     records = [record for record in raw.split("\0") if record]

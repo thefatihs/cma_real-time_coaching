@@ -17,6 +17,7 @@ from app.composition.postgres_document_ingestion import (
     MINILM_MODEL,
     PostgreSQLDocumentIngestionSettings,
     compose_postgres_document_ingestion,
+    validate_local_minilm_snapshot,
 )
 from app.composition.postgres_rag import (
     KnowledgeBaseRAGProviderSettings,
@@ -169,6 +170,64 @@ def test_approved_local_snapshot_reaches_embedder_config_unchanged(
     assert provider.model_name_or_path == str(snapshot)
     assert runtime.postgres_rag.profile.model_id == MINILM_MODEL
     assert backend_events == []
+
+
+def test_public_snapshot_validation_returns_canonical_path_without_activity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _approved_snapshot(tmp_path, monkeypatch)
+    events: list[str] = []
+    monkeypatch.setattr(
+        subject,
+        "compose_profile_bound_postgres_rag",
+        lambda **kwargs: events.append("composition"),
+    )
+
+    validated = validate_local_minilm_snapshot(str(snapshot))
+
+    assert validated == snapshot.resolve(strict=True)
+    assert events == []
+
+
+def test_composition_delegates_local_snapshot_to_public_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _approved_snapshot(tmp_path, monkeypatch)
+    calls: list[str] = []
+    real_validator = subject.validate_local_minilm_snapshot
+
+    def validate(value: str) -> Path:
+        calls.append(value)
+        return real_validator(value)
+
+    monkeypatch.setattr(subject, "validate_local_minilm_snapshot", validate)
+    monkeypatch.setattr(
+        subject,
+        "compose_profile_bound_postgres_rag",
+        lambda **kwargs: SimpleNamespace(
+            embedder=object(),
+            vector_store=object(),
+            profile_repository=object(),
+            profile=SimpleNamespace(model_id=MINILM_MODEL),
+        ),
+    )
+    monkeypatch.setattr(
+        subject,
+        "BoundedDocumentIngestionManager",
+        lambda **kwargs: SimpleNamespace(close=lambda **close_kwargs: None),
+    )
+
+    compose_postgres_document_ingestion(
+        postgres_settings=_postgres(),
+        knowledge_base_settings=_provider(model_name_or_path=str(snapshot)),
+        ingestion_settings=PostgreSQLDocumentIngestionSettings(),
+        psycopg_connect=lambda **kwargs: pytest.fail("database activity"),
+        embedding_backend_factory=lambda config: pytest.fail("model activity"),
+    )
+
+    assert calls == [str(snapshot)]
 
 
 @pytest.mark.parametrize(
