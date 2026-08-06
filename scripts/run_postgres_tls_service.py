@@ -30,6 +30,7 @@ EXPECTED_BRANCH_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH"
 EXPECTED_HEAD_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 HANDOFF_ROOT_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_HANDOFF_ROOT"
+PROJECT_NAME_VARIABLE = "CALLMETRIC_POSTGRES_TLS_SERVICE_PROJECT_NAME"
 MINIMUM_TTL_SECONDS = 300
 MAXIMUM_TTL_SECONDS = 7_200
 VALIDATION_TIMEOUT_SECONDS = 30.0
@@ -529,9 +530,10 @@ def _remove_handoff(handoff: Path | None, root: Path) -> None:
 
 def _signals() -> tuple[signal.Signals, ...]:
     selected = [signal.SIGINT, signal.SIGTERM]
-    sighup = getattr(signal, "SIGHUP", None)
-    if isinstance(sighup, signal.Signals):
-        selected.append(sighup)
+    for name in ("SIGHUP", "SIGBREAK"):
+        candidate = getattr(signal, name, None)
+        if isinstance(candidate, signal.Signals) and candidate not in selected:
+            selected.append(candidate)
     return tuple(selected)
 
 
@@ -585,7 +587,12 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
     root = _phase(
         E_HANDOFF, lambda: _private_root(os.environ.get(HANDOFF_ROOT_VARIABLE))
     )
-    project = f"callmetric-pgvector-tls-{os.getpid()}-{secrets.token_hex(6)}"
+    configured_project = os.environ.get(PROJECT_NAME_VARIABLE)
+    project = (
+        f"callmetric-pgvector-tls-{os.getpid()}-{secrets.token_hex(6)}"
+        if configured_project is None
+        else configured_project
+    )
     if not PROJECT_PATTERN.fullmatch(project):
         raise PostgreSQLTLSServiceError()
     migration_password = secrets.token_urlsafe(32)

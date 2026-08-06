@@ -239,6 +239,47 @@ def test_controlled_signals_include_available_contract() -> None:
     sighup = getattr(signal, "SIGHUP", None)
     if isinstance(sighup, signal.Signals):
         assert sighup in subject._signals()
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if isinstance(sigbreak, signal.Signals):
+        assert sigbreak in subject._signals()
+
+
+def test_sigbreak_requests_normal_shutdown_and_handlers_are_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if not isinstance(sigbreak, signal.Signals):
+        pytest.skip("SIGBREAK is not supported")
+    installed: dict[signal.Signals, object] = {}
+    restored: list[tuple[signal.Signals, object]] = []
+
+    def install(item: signal.Signals, handler: object) -> object:
+        if callable(handler):
+            installed[item] = handler
+            return f"previous-{item.value}"
+        restored.append((item, handler))
+        return object()
+
+    monkeypatch.setattr(subject.signal, "signal", install)
+    stop = threading.Event()
+    previous = subject._install_handlers(stop)
+    handler = installed[sigbreak]
+    assert callable(handler)
+    handler(sigbreak.value, None)
+    assert stop.is_set()
+
+    subject._restore_handlers(previous)
+    assert {item for item, _handler in restored} == set(previous)
+
+
+def test_explicit_controller_owned_project_is_used(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = "callmetric-pgvector-tls-123-abcdef123456"
+    calls = _stub_bounded_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.setenv(subject.PROJECT_NAME_VARIABLE, project)
+    subject.run(300)
+    assert any(f"--project-name {project}" in rendered for rendered, _ in calls)
 
 
 def test_cleanup_is_exact_project_and_includes_volumes(

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -64,8 +65,8 @@ PHASES = (
     "E_DOCUMENT_READY",
     "E_VECTOR_SCOPE",
     "E_ORCHESTRATION",
-    "E_ADMISSION",
     "E_COMPLETION_PUMP",
+    "E_ADMISSION",
     "E_CITATION_PROJECTION",
     "E_DUPLICATE",
     "E_DELETE",
@@ -338,6 +339,7 @@ class _ProductionLifecycle:
         self._config = config
         self._environment = dict(environment)
         self._service: subprocess.Popen[bytes] | None = None
+        self._postgres_project: str | None = None
         self._handoff: Path | None = None
         self._postgres_settings: PostgreSQLVectorStoreSettings | None = None
         self._document_runtime: PostgreSQLDocumentIngestionRuntime | None = None
@@ -358,6 +360,11 @@ class _ProductionLifecycle:
             self._config.branch
         )
         environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"] = self._config.head
+        project = f"callmetric-pgvector-tls-{os.getpid()}-{secrets.token_hex(6)}"
+        if not re.fullmatch(r"callmetric-pgvector-tls-[0-9]+-[a-f0-9]{12}", project):
+            raise RuntimeError
+        self._postgres_project = project
+        environment["CALLMETRIC_POSTGRES_TLS_SERVICE_PROJECT_NAME"] = project
         self._service = subprocess.Popen(
             [
                 sys.executable,
@@ -682,7 +689,12 @@ class _ProductionLifecycle:
         self._processor = processor
 
     def _admission(self) -> None:
-        if self._processor is None:
+        outcome = self._outcome
+        if (
+            outcome is None
+            or outcome.result is None
+            or len(outcome.result.displayed_suggestions) != 1
+        ):
             raise RuntimeError
 
     def _completion_pump(self) -> None:
@@ -704,19 +716,34 @@ class _ProductionLifecycle:
         from live_dashboard.view_models import suggestion_card
 
         outcome = self._outcome
-        if outcome is None or outcome.result is None or len(outcome.sources) != 1:
+        if (
+            outcome is None
+            or outcome.result is None
+            or not 1 <= len(outcome.sources) <= 5
+        ):
             raise RuntimeError
         displayed = outcome.result.displayed_suggestions
         if len(displayed) != 1:
             raise RuntimeError
         card = suggestion_card(displayed[0], sources=outcome.sources)
-        source = card.sources[0]
-        if (
-            source.media_label != "TXT"
-            or source.original_filename != "synthetic-guide.txt"
-        ):
+        if card.sources != outcome.sources:
             raise RuntimeError
-        if hasattr(source, "document_id") or card.evidence_ids:
+        approved_filenames = {"synthetic-guide.txt", "synthetic-other.txt"}
+        internal_names = (
+            "tenant_id",
+            "knowledge_base_id",
+            "document_id",
+            "chunk_id",
+            "job_id",
+            "storage_object_key",
+            "sha256_hex",
+        )
+        if card.evidence_ids or any(
+            source.media_label != "TXT"
+            or source.original_filename not in approved_filenames
+            or any(hasattr(source, name) for name in internal_names)
+            for source in card.sources
+        ):
             raise RuntimeError
 
     def _duplicate(self) -> None:
@@ -828,14 +855,53 @@ class _ProductionLifecycle:
         except BaseException as error:
             primary = primary or error
         service = self._service
-        if service is not None and service.poll() is None:
-            service.send_signal(signal.CTRL_BREAK_EVENT)
+        if service is not None:
+            if service.poll() is None:
+                try:
+                    service.send_signal(signal.CTRL_BREAK_EVENT)
+                except BaseException as error:
+                    primary = primary or error
             try:
-                service.wait(timeout=150)
-            except subprocess.TimeoutExpired:
-                primary = primary or RuntimeError()
+                return_code = service.wait(timeout=150)
+                if return_code != 0:
+                    primary = primary or RuntimeError()
+            except BaseException as error:
+                primary = primary or error
+        try:
+            self._require_postgres_residue_absent()
+        except BaseException as error:
+            primary = primary or error
         if primary is not None:
             raise primary
+
+    def _require_postgres_residue_absent(self) -> None:
+        project = self._postgres_project
+        if project is None:
+            return
+        docker = shutil.which("docker")
+        if docker is None:
+            raise RuntimeError
+        for resource in ("container", "network", "volume"):
+            result = subprocess.run(
+                [
+                    docker,
+                    resource,
+                    "ls",
+                    "-q",
+                    "--filter",
+                    f"label=com.docker.compose.project={project}",
+                ],
+                cwd=REPOSITORY_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                shell=False,
+                timeout=30,
+            )
+            if result.stdout.strip():
+                raise RuntimeError
+        if self._handoff is not None and self._handoff.exists():
+            raise RuntimeError
 
 
 def main(arguments: list[str] | None = None) -> int:

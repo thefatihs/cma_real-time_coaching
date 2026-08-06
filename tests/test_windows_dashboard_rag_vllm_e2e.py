@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import signal
 import subprocess
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
 import scripts.run_windows_dashboard_rag_vllm_e2e as subject
+from app.coaching.coordinator import CoachingSourcePresentation, StableCoachingOutcome
 
 HEAD = "4" * 40
 BASELINE = "3" * 40
@@ -182,6 +184,115 @@ def test_primary_failure_is_not_masked_by_cleanup_failure(
     assert caught.value.phase == "E_ORCHESTRATION"
 
 
+def test_citation_primary_failure_is_not_masked_by_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    operations = FakeOperations(
+        fail_phase="E_CITATION_PROJECTION", cleanup_failure=True
+    )
+    with pytest.raises(subject.DashboardRAGVLLME2EError) as caught:
+        subject.run(
+            preflight_only=False,
+            environment=environment(tmp_path),
+            operations_factory=lambda _config: operations,
+        )
+    assert caught.value.phase == "E_CITATION_PROJECTION"
+
+
+@pytest.mark.parametrize("count", range(2, 6))
+def test_citation_projection_accepts_two_through_five_safe_sources(
+    count: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    sources = tuple(
+        CoachingSourcePresentation(
+            "synthetic-guide.txt" if index == 0 else "synthetic-other.txt", "TXT"
+        )
+        for index in range(count)
+    )
+    displayed = (object(),)
+    lifecycle._outcome = cast(
+        StableCoachingOutcome,
+        SimpleNamespace(
+            result=SimpleNamespace(displayed_suggestions=displayed), sources=sources
+        ),
+    )
+    monkeypatch.setattr(
+        "live_dashboard.view_models.suggestion_card",
+        lambda _event, *, sources: SimpleNamespace(sources=sources, evidence_ids=()),
+    )
+
+    lifecycle._admission()
+    lifecycle._citation_projection()
+
+
+@pytest.mark.parametrize("count", [0, 6])
+def test_citation_projection_rejects_zero_or_more_than_five_sources(
+    count: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    lifecycle._outcome = cast(
+        StableCoachingOutcome,
+        SimpleNamespace(
+            result=SimpleNamespace(displayed_suggestions=(object(),)),
+            sources=tuple(
+                CoachingSourcePresentation("synthetic-guide.txt", "TXT")
+                for _ in range(count)
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        lifecycle._citation_projection()
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_admission_requires_exactly_one_displayed_suggestion(
+    count: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    lifecycle._outcome = cast(
+        StableCoachingOutcome,
+        SimpleNamespace(
+            result=SimpleNamespace(
+                displayed_suggestions=tuple(object() for _ in range(count))
+            ),
+            sources=(),
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        lifecycle._admission()
+
+
+def test_citation_projection_rejects_internal_identity_leakage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    source = SimpleNamespace(
+        original_filename="synthetic-guide.txt", media_label="TXT", document_id="hidden"
+    )
+    lifecycle._outcome = cast(
+        StableCoachingOutcome,
+        SimpleNamespace(
+            result=SimpleNamespace(displayed_suggestions=(object(),)), sources=(source,)
+        ),
+    )
+    monkeypatch.setattr(
+        "live_dashboard.view_models.suggestion_card",
+        lambda _event, *, sources: SimpleNamespace(sources=sources, evidence_ids=()),
+    )
+    with pytest.raises(RuntimeError):
+        lifecycle._citation_projection()
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -247,19 +358,21 @@ def test_main_prints_only_fixed_phase(
 
 
 class FakeServiceProcess:
-    def __init__(self) -> None:
+    def __init__(self, *, poll_result: int | None = None, return_code: int = 0) -> None:
         self.signals: list[int] = []
         self.waits: list[float | None] = []
+        self.poll_result = poll_result
+        self.return_code = return_code
 
-    def poll(self) -> None:
-        return None
+    def poll(self) -> int | None:
+        return self.poll_result
 
     def send_signal(self, signal_number: int) -> None:
         self.signals.append(signal_number)
 
     def wait(self, timeout: float | None = None) -> int:
         self.waits.append(timeout)
-        return 0
+        return self.return_code
 
 
 def test_production_cleanup_requests_graceful_service_signal_only(
@@ -271,8 +384,94 @@ def test_production_cleanup_requests_graceful_service_signal_only(
     lifecycle = subject._ProductionLifecycle(config, values)
     process = FakeServiceProcess()
     lifecycle._service = cast(subprocess.Popen[bytes], process)
+    lifecycle._postgres_project = "callmetric-pgvector-tls-123-abcdef123456"
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    commands: list[list[str]] = []
+
+    def run(
+        arguments: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
 
     lifecycle.cleanup()
 
     assert process.signals == [signal.CTRL_BREAK_EVENT]
     assert process.waits == [150]
+    assert len(commands) == 3
+    assert all("--filter" in command for command in commands)
+    assert all("prune" not in command and "rm" not in command for command in commands)
+
+
+@pytest.mark.parametrize("resource", ["container", "network", "volume"])
+def test_remaining_exact_project_resource_fails_cleanup(
+    resource: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    lifecycle._service = cast(subprocess.Popen[bytes], FakeServiceProcess())
+    lifecycle._postgres_project = "callmetric-pgvector-tls-123-abcdef123456"
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+
+    def run(
+        arguments: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        output = "residue" if arguments[1] == resource else ""
+        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
+    with pytest.raises(RuntimeError):
+        lifecycle.cleanup()
+
+
+def test_remaining_handoff_fails_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    lifecycle._service = cast(subprocess.Popen[bytes], FakeServiceProcess())
+    lifecycle._postgres_project = "callmetric-pgvector-tls-123-abcdef123456"
+    lifecycle._handoff = tmp_path / "handoff-residue"
+    lifecycle._handoff.mkdir()
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout="", stderr=""
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        lifecycle.cleanup()
+
+
+def test_signal_failure_wait_timeout_and_abnormal_exit_fail_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+
+    class FailingProcess(FakeServiceProcess):
+        def send_signal(self, signal_number: int) -> None:
+            del signal_number
+            raise OSError
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            raise subprocess.TimeoutExpired([], 150)
+
+    lifecycle._service = cast(subprocess.Popen[bytes], FailingProcess())
+    monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", lambda: None)
+    with pytest.raises(OSError):
+        lifecycle.cleanup()
+
+    lifecycle._service = cast(
+        subprocess.Popen[bytes], FakeServiceProcess(poll_result=1, return_code=1)
+    )
+    with pytest.raises(RuntimeError):
+        lifecycle.cleanup()
