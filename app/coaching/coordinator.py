@@ -13,7 +13,10 @@ from app.calls.models import (
     CallRevisionLabelDiagnostic,
     CallState,
 )
-from app.coaching.rule_engine import RuleBasedCoachingEngine
+from app.coaching.rule_engine import (
+    RULE_ONLY_PARTIAL_MODEL_ID,
+    RuleBasedCoachingEngine,
+)
 from app.events.labels import canonical_label
 from app.events.models import (
     ClassificationResultEvent,
@@ -380,7 +383,13 @@ class CoachingCoordinator:
             )
         self._processed_partial_keys.append(partial_key)
         del self._processed_partial_keys[:-64]
-        evaluation = self._rule_engine.evaluate(event, active_labels)
+        evaluation = self._rule_engine.evaluate(
+            event,
+            active_labels,
+            classification_labels_are_rules=(
+                classification_event.model_id == RULE_ONLY_PARTIAL_MODEL_ID
+            ),
+        )
         candidates = _merge_current_candidates(evaluation.suggestion_events)
         fresh = tuple(
             suggestion

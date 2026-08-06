@@ -25,6 +25,9 @@ from app.events.validation import ensure_same_tenant
 from app.tenancy.models import TenantConfig
 
 
+RULE_ONLY_PARTIAL_MODEL_ID = "deterministic_rule_engine"
+
+
 class CoachingRule(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -189,10 +192,57 @@ class RuleBasedCoachingEngine:
     def tenant_id(self) -> str:
         return self._tenant_config.context.tenant_id
 
+    def classify_partial(
+        self,
+        event: TranscriptEvent,
+    ) -> ClassificationResultEvent | None:
+        """Return explicit deterministic PARTIAL evidence without model metadata."""
+        ensure_same_tenant(self._tenant_config.context, event)
+        if event.kind is not TranscriptKind.PARTIAL:
+            raise ValueError("rule-only classification requires PARTIAL transcript")
+        transcript_tokens = _tokens(event.text)
+        matched = tuple(
+            rule
+            for rule in self._rules
+            if rule.enabled and _matches(rule, transcript_tokens)
+        )
+        tenant_cancellation_matched = any(
+            _is_cancellation_label(rule.label) for rule in matched
+        )
+        explicit_cancellation = (
+            _matches_explicit_cancellation(transcript_tokens)
+            and not tenant_cancellation_matched
+        )
+        labels = {canonical_label(rule.label) or rule.label for rule in matched}
+        if explicit_cancellation:
+            labels.add("cancellation_request")
+        if not labels:
+            return None
+        actions = [rule.action for rule in matched]
+        if explicit_cancellation:
+            actions.append(
+                CLASSIFICATION_COACHING_TEMPLATES["cancellation_request"].action
+            )
+        return ClassificationResultEvent(
+            tenant_id=event.tenant_id,
+            call_id=event.call_id,
+            transcript_event_id=event.event_id,
+            labels=[
+                ClassificationLabel(name=label, score=1.0)
+                for label in sorted(labels, key=str.casefold)
+            ],
+            action=max(actions, key=self._ACTION_STRENGTH.__getitem__),
+            model_id=RULE_ONLY_PARTIAL_MODEL_ID,
+            provisional=True,
+            created_at_utc=self._utc_datetime_factory(),
+        )
+
     def evaluate(
         self,
         event: TranscriptEvent,
         classification_labels: tuple[str, ...] = (),
+        *,
+        classification_labels_are_rules: bool = False,
     ) -> RuleEvaluationResult:
         ensure_same_tenant(self._tenant_config.context, event)
         if event.kind is TranscriptKind.PARTIAL and not classification_labels:
@@ -211,6 +261,9 @@ class RuleBasedCoachingEngine:
         classification_label_set = {
             canonical_label(label) or label for label in classification_labels
         }
+        model_classification_labels = (
+            set() if classification_labels_are_rules else classification_label_set
+        )
         classification_matches = tuple(
             rule
             for rule in self._rules
@@ -274,6 +327,8 @@ class RuleBasedCoachingEngine:
         rule_labels = {
             canonical_label(rule.label) or rule.label for rule in rule_matches
         }
+        if classification_labels_are_rules:
+            rule_labels.update(classification_label_set)
         if explicit_cancellation:
             rule_labels.add("cancellation_request")
         suggestion_labels = tuple(
@@ -286,7 +341,7 @@ class RuleBasedCoachingEngine:
                     suggestion_rules[label],
                     label=label,
                     source=_source_for_signals(
-                        label, rule_labels, classification_label_set
+                        label, rule_labels, model_classification_labels
                     ),
                 )
                 if label in suggestion_rules
@@ -294,7 +349,7 @@ class RuleBasedCoachingEngine:
                     event,
                     label,
                     source=_source_for_signals(
-                        label, rule_labels, classification_label_set
+                        label, rule_labels, model_classification_labels
                     ),
                 )
             )

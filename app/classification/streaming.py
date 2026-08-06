@@ -38,6 +38,13 @@ class RuntimeClassifierProtocol(Protocol):
     ) -> ClassificationResultEvent: ...
 
 
+class RuleOnlyPartialClassifierProtocol(Protocol):
+    def classify_partial(
+        self,
+        event: TranscriptEvent,
+    ) -> ClassificationResultEvent | None: ...
+
+
 class ClassificationProcessingStatus(str, Enum):
     CLASSIFIED = "classified"
     PROVISIONAL_CLASSIFIED = "provisional_classified"
@@ -47,6 +54,12 @@ class ClassificationProcessingStatus(str, Enum):
     EMPTY_SKIPPED = "empty_skipped"
     DISABLED = "disabled"
     FAILED = "failed"
+
+
+class ProvisionalClassificationSource(str, Enum):
+    NONE = "none"
+    SETFIT = "setfit"
+    RULE_ONLY = "rule_only"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +89,9 @@ class StableClassificationOutcome:
     context_labels: tuple[str, ...] = ()
     label_view_sources: tuple[tuple[str, ClassificationViewSource], ...] = ()
     provisional: bool = False
+    provisional_source: ProvisionalClassificationSource = (
+        ProvisionalClassificationSource.NONE
+    )
 
 
 _DEFAULT_PROVISIONAL_LABELS = frozenset(
@@ -136,6 +152,7 @@ class StableTranscriptClassificationStage:
         logger: logging.Logger | None = None,
         maximum_preceding_sentences: int = 2,
         provisional_policy: ProvisionalClassificationPolicy | None = None,
+        rule_only_partial_classifier: RuleOnlyPartialClassifierProtocol | None = None,
         monotonic_clock: Callable[[], float] = monotonic,
     ) -> None:
         if maximum_preceding_sentences < 0 or maximum_preceding_sentences > 2:
@@ -146,6 +163,7 @@ class StableTranscriptClassificationStage:
         self._provisional_policy = (
             provisional_policy or ProvisionalClassificationPolicy()
         )
+        self._rule_only_partial_classifier = rule_only_partial_classifier
         self._monotonic_clock = monotonic_clock
         self._processed_partial_chunk_keys: list[int] = []
         self._last_partial_text = ""
@@ -340,34 +358,40 @@ class StableTranscriptClassificationStage:
         media_progress_seconds: float | None,
     ) -> StableClassificationOutcome:
         policy = self._provisional_policy
-        if not policy.enabled or not allow_provisional or self._classifier is None:
-            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+        if (
+            not policy.enabled
+            or not allow_provisional
+            or (self._classifier is None and self._rule_only_partial_classifier is None)
+        ):
+            return self._partial_skipped(event)
         chunk_key = (
             event.source_chunk_sequence
             if event.source_chunk_sequence is not None
             else event.revision
         )
         if chunk_key in self._processed_partial_chunk_keys:
-            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+            return self._partial_skipped(event)
         normalized = " ".join(event.text.casefold().split())
         words = normalized.split()
         if not normalized or len(words) < policy.minimum_words:
-            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+            return self._partial_skipped(event)
         if normalized == self._last_partial_text:
-            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+            return self._partial_skipped(event)
         if (
             self._last_partial_text
             and normalized.startswith(self._last_partial_text)
             and len(words) - self._last_partial_word_count < policy.minimum_growth_words
         ):
-            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+            return self._partial_skipped(event)
         cadence_seconds = self._accepted_cadence_seconds(media_progress_seconds)
         if cadence_seconds is None:
-            return self._outcome(ClassificationProcessingStatus.PARTIAL_SKIPPED, event)
+            return self._partial_skipped(event)
         self._processed_partial_chunk_keys.append(chunk_key)
         del self._processed_partial_chunk_keys[:-64]
         self._last_partial_text = normalized
         self._last_partial_word_count = len(words)
+        if self._classifier is None:
+            return self._process_rule_only_partial(event, words)
         classification_text, preceding_count, sentence_count = _bounded_context(
             preceding_stable_transcript,
             event.text,
@@ -452,6 +476,7 @@ class StableTranscriptClassificationStage:
                     if label in active_names
                 ),
                 provisional=True,
+                provisional_source=ProvisionalClassificationSource.SETFIT,
             )
         except Exception as error:
             safe_error = SafeClassificationError(error_type=type(error).__name__)
@@ -462,7 +487,70 @@ class StableTranscriptClassificationStage:
                 error=safe_error,
                 delta_word_count=len(words),
                 provisional=True,
+                provisional_source=ProvisionalClassificationSource.SETFIT,
             )
+
+    def _process_rule_only_partial(
+        self,
+        event: TranscriptEvent,
+        words: list[str],
+    ) -> StableClassificationOutcome:
+        classifier = self._rule_only_partial_classifier
+        if classifier is None:
+            return self._partial_skipped(event)
+        try:
+            result = classifier.classify_partial(event)
+            if result is None or not result.labels:
+                return self._partial_skipped(event)
+            if (
+                result.tenant_id != event.tenant_id
+                or result.call_id != event.call_id
+                or result.transcript_event_id != event.event_id
+                or not result.provisional
+                or result.probabilities
+                or result.thresholds
+            ):
+                raise ValueError("invalid_rule_only_partial_result")
+            return StableClassificationOutcome(
+                status=ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED,
+                transcript_revision=event.revision,
+                source_sequence=event.source_chunk_sequence,
+                classification_event=result,
+                delta_word_count=len(words),
+                delta_labels=tuple(label.name for label in result.labels),
+                provisional=True,
+                provisional_source=ProvisionalClassificationSource.RULE_ONLY,
+            )
+        except Exception as error:
+            return StableClassificationOutcome(
+                status=ClassificationProcessingStatus.FAILED,
+                transcript_revision=event.revision,
+                source_sequence=event.source_chunk_sequence,
+                error=SafeClassificationError(error_type=type(error).__name__),
+                delta_word_count=len(words),
+                provisional=True,
+                provisional_source=ProvisionalClassificationSource.RULE_ONLY,
+            )
+
+    def _partial_skipped(
+        self,
+        event: TranscriptEvent,
+    ) -> StableClassificationOutcome:
+        source = (
+            ProvisionalClassificationSource.SETFIT
+            if self._classifier is not None
+            else (
+                ProvisionalClassificationSource.RULE_ONLY
+                if self._rule_only_partial_classifier is not None
+                else ProvisionalClassificationSource.NONE
+            )
+        )
+        return StableClassificationOutcome(
+            status=ClassificationProcessingStatus.PARTIAL_SKIPPED,
+            transcript_revision=event.revision,
+            source_sequence=event.source_chunk_sequence,
+            provisional_source=source,
+        )
 
     def _accepted_cadence_seconds(
         self,

@@ -17,7 +17,9 @@ from app.audio_ingress.local_microphone import (
 )
 from app.classification.streaming import (
     ClassificationProcessingStatus,
+    ProvisionalClassificationSource,
     ProvisionalClassificationPolicy,
+    RuleOnlyPartialClassifierProtocol,
     RuntimeClassifierProtocol,
     StableClassificationOutcome,
     StableTranscriptClassificationStage,
@@ -162,6 +164,7 @@ def pipeline(
     transcriber: FakeTranscriber,
     calls: list[object] | None = None,
     runtime_classifier: RuntimeClassifierProtocol | None = None,
+    rule_only_partial_classifier: RuleOnlyPartialClassifierProtocol | None = None,
     coaching_factory: CoachingCoordinatorFactory | None = None,
     customer_only_classification_enabled: bool = False,
     customer_projection_provider: CustomerProjectionProviderProtocol | None = None,
@@ -172,6 +175,7 @@ def pipeline(
         transcriber,
         chunk_generator=generator_for(source, calls),
         runtime_classifier=runtime_classifier,
+        rule_only_partial_classifier=rule_only_partial_classifier,
         coaching_coordinator_factory=coaching_factory,
         customer_only_classification_enabled=customer_only_classification_enabled,
         customer_projection_provider=customer_projection_provider,
@@ -406,6 +410,7 @@ def test_meaningful_partial_uses_stricter_threshold_without_committing() -> None
 
     assert accepted.status is ClassificationProcessingStatus.PROVISIONAL_CLASSIFIED
     assert accepted.provisional
+    assert accepted.provisional_source is ProvisionalClassificationSource.SETFIT
     assert accepted.classification_event is not None
     assert [label.name for label in accepted.classification_event.labels] == [
         "complaint"
@@ -450,6 +455,48 @@ def test_media_progress_cadence_ignores_accelerated_wall_clock() -> None:
         for outcome in outcomes
     )
     assert len(classifier.calls) == 6
+
+
+def test_rule_only_partial_cadence_skips_unmatched_and_repeated_media_time() -> None:
+    class CountingRuleClassifier:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def classify_partial(
+            self,
+            event: TranscriptEvent,
+        ) -> ClassificationResultEvent | None:
+            self.calls.append(event.revision)
+            return None
+
+    classifier = CountingRuleClassifier()
+    stage = StableTranscriptClassificationStage(
+        None,
+        provisional_policy=ProvisionalClassificationPolicy(enabled=True),
+        rule_only_partial_classifier=classifier,
+        monotonic_clock=lambda: 0.0,
+    )
+    state = CallState(tenant_id="tenant_alpha", call_id="call_001")
+    statuses = []
+    for revision, media_progress in enumerate((2.0, 2.0, 2.5, 4.0), start=1):
+        event = partial_event(
+            f"synthetic unmatched partial revision {revision}",
+            revision=revision,
+            sequence=revision,
+        )
+        state.apply_transcript(event)
+        statuses.append(
+            stage.process(
+                event,
+                cumulative_stable_transcript="",
+                stable_changed=False,
+                call_state=state,
+                media_progress_seconds=media_progress,
+            ).status
+        )
+
+    assert statuses == [ClassificationProcessingStatus.PARTIAL_SKIPPED] * 4
+    assert classifier.calls == [1, 4]
 
 
 @pytest.mark.parametrize(
@@ -1684,6 +1731,152 @@ def test_pipeline_publishes_provisional_card_before_finalization() -> None:
     assert (
         confirmed.displayed_suggestions[0].lifecycle
         is CoachingSuggestionLifecycle.CONFIRMED
+    )
+
+
+def test_accelerated_rule_only_cancellation_is_provisional_before_end() -> None:
+    tenant = TenantConfig(
+        context=context(),
+        asr=config(),
+        classification=TenantClassificationConfig(
+            model_id="common_turkish_setfit_v2",
+            labels=["cancellation_request"],
+        ),
+        rag=TenantRAGConfig(enabled=False),
+        coaching=TenantCoachingConfig(
+            cooldown_seconds=8,
+            max_active_suggestions=2,
+            allowed_actions=[action.value for action in CoachingAction],
+        ),
+    )
+    rule_classifier = RuleBasedCoachingEngine(
+        tenant,
+        (),
+        utc_datetime_factory=lambda: NOW,
+    )
+    states: list[CallState] = []
+
+    def create_coordinator(state: CallState) -> CoachingCoordinator:
+        states.append(state)
+        return CoachingCoordinator(
+            tenant,
+            state,
+            RuleBasedCoachingEngine(
+                tenant,
+                (),
+                event_id_factory=lambda: "rule-only-cancellation",
+                utc_datetime_factory=lambda: NOW,
+            ),
+        )
+
+    subject = pipeline(
+        [chunk(0, 0.0, 2.0)],
+        FakeTranscriber([[("aboneliğimi iptal etmek istiyorum", 0.0, 2.0)]]),
+        runtime_classifier=None,
+        rule_only_partial_classifier=rule_classifier,
+        coaching_factory=create_coordinator,
+    )
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True),
+        monotonic_clock=lambda: 0.0,
+    )
+    published: list[StreamingASRStep] = []
+
+    result = subject.run(
+        Path("synthetic.wav"),
+        "call_001",
+        step_callback=published.append,
+    )
+
+    partial = published[0].classification_outcomes[0]
+    assert partial.provisional_source is ProvisionalClassificationSource.RULE_ONLY
+    assert partial.classification_event is not None
+    assert partial.classification_event.probabilities == {}
+    provisional = published[0].coaching_outcomes[0].result
+    assert provisional is not None
+    assert provisional.displayed_suggestions[0].source is CoachingSuggestionSource.RULE
+    assert (
+        provisional.displayed_suggestions[0].lifecycle
+        is CoachingSuggestionLifecycle.PROVISIONAL
+    )
+    final = result.coaching_outcomes[-1].result
+    assert final is not None
+    assert final.displayed_suggestions[0].suggestion_id == (
+        provisional.displayed_suggestions[0].suggestion_id
+    )
+    assert final.displayed_suggestions[0].lifecycle is (
+        CoachingSuggestionLifecycle.CONFIRMED
+    )
+    assert len(states[0].active_coaching_suggestions) == 1
+
+
+def test_rule_only_provisional_is_withdrawn_when_final_no_longer_matches() -> None:
+    tenant = TenantConfig(
+        context=context(),
+        asr=config(),
+        classification=TenantClassificationConfig(
+            model_id="common_turkish_setfit_v2",
+            labels=["cancellation_request"],
+        ),
+        rag=TenantRAGConfig(enabled=False),
+        coaching=TenantCoachingConfig(
+            cooldown_seconds=8,
+            max_active_suggestions=2,
+            allowed_actions=[action.value for action in CoachingAction],
+        ),
+    )
+    rule_classifier = RuleBasedCoachingEngine(
+        tenant,
+        (),
+        utc_datetime_factory=lambda: NOW,
+    )
+    states: list[CallState] = []
+
+    def create_coordinator(state: CallState) -> CoachingCoordinator:
+        states.append(state)
+        return CoachingCoordinator(
+            tenant,
+            state,
+            RuleBasedCoachingEngine(
+                tenant,
+                (),
+                event_id_factory=lambda: "rule-only-withdrawn",
+                utc_datetime_factory=lambda: NOW,
+            ),
+        )
+
+    subject = pipeline(
+        [chunk(0, 0.0, 2.0), chunk(1, 2.0, 2.0)],
+        FakeTranscriber(
+            [
+                [("aboneliğimi iptal etmek istiyorum", 0.0, 2.0)],
+                [("yalnızca bilgi almak istiyorum", 2.0, 4.0)],
+            ]
+        ),
+        rule_only_partial_classifier=rule_classifier,
+        coaching_factory=create_coordinator,
+    )
+    subject.configure_provisional_coaching(
+        ProvisionalClassificationPolicy(enabled=True)
+    )
+    published: list[StreamingASRStep] = []
+
+    result = subject.run(
+        Path("synthetic.wav"),
+        "call_001",
+        step_callback=published.append,
+    )
+
+    provisional = published[0].coaching_outcomes[0].result
+    assert provisional is not None
+    suggestion_id = provisional.displayed_suggestions[0].suggestion_id
+    final = result.coaching_outcomes[-1].result
+    assert final is not None
+    assert final.displayed_suggestions == ()
+    assert final.withdrawn_suggestion_ids == (suggestion_id,)
+    assert states[0].active_coaching_suggestions == []
+    assert states[0].coaching_suggestion_history[-1].lifecycle is (
+        CoachingSuggestionLifecycle.WITHDRAWN
     )
 
 

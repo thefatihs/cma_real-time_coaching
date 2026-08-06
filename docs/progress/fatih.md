@@ -333,3 +333,21 @@ This log uses local chronological numbering and records only Fatih-owned work.
   remains limited to the three documented POSIX portability findings.
 - Next planned step: review the provider packet mapping and lifecycle contract
   before any real transport or SIP integration is specified.
+
+## Rule-only provisional coaching fallback
+
+- Added cadence-gated deterministic PARTIAL classification when optional SetFit
+  artifacts are unavailable, using only existing tenant rule-engine evidence.
+- Rule-only outcomes carry fixed internal provenance without probabilities;
+  SetFit thresholds, media-time/wall-clock cadence selection, isolation,
+  deduplication, capacity, promotion, withdrawal, and FINAL behavior are
+  unchanged.
+- Changed files: Fatih-owned classification, coaching, streaming, dashboard
+  runtime wiring, focused synthetic tests, and this progress file.
+- Tests: focused core 221 passed; dashboard/worker/microphone 111 passed; full
+  Windows suite 2543 passed and 17 skipped, with only the 19 documented
+  POSIX-only vLLM controller failures.
+- Ruff, format, conflict-marker, and diff checks passed. Pyright remains
+  limited to the three documented POSIX portability findings.
+- Next planned step: manually verify a pre-END rule-only provisional card in
+  accelerated uploaded-audio execution without SetFit artifacts.

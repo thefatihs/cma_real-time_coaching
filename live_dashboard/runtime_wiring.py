@@ -577,6 +577,14 @@ def build_live_pipeline(
         asr_config or runtime.tenant.config.asr,
         window_transcriber,
         runtime_classifier=classifier,
+        rule_only_partial_classifier=(
+            RuleBasedCoachingEngine(
+                runtime.tenant.config,
+                runtime.tenant.rules,
+            )
+            if selection.enable_coaching
+            else None
+        ),
         coaching_coordinator_factory=coaching_factory,
     )
     if execution_resource is not None:

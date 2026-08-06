@@ -14,10 +14,12 @@ from app.coaching.coordinator import (
     SafeSuggestionDecision,
     StableCoachingOutcome,
 )
+from app.coaching.rule_engine import RULE_ONLY_PARTIAL_MODEL_ID
 from app.events.models import (
     ClassificationLabel,
     ClassificationResultEvent,
     CoachingAction,
+    CoachingSuggestionLifecycle,
     CoachingSuggestionEvent,
     CoachingSuggestionSource,
     SuggestionPriority,
@@ -679,6 +681,80 @@ def test_live_step_updates_latest_only_state_with_exact_scope() -> None:
             replace(step, call_id="other-call"),
             elapsed_seconds=0.5,
         )
+
+
+def test_rule_only_provisional_card_is_retained_in_pre_end_snapshots() -> None:
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "local-call")
+    base_step = fake_pipeline_result().steps[0]
+    partial = base_step.transcript_events[0]
+    classification = ClassificationResultEvent(
+        tenant_id=partial.tenant_id,
+        call_id=partial.call_id,
+        transcript_event_id=partial.event_id,
+        labels=[ClassificationLabel(name="cancellation_request", score=1.0)],
+        action=CoachingAction.TEMPLATE_ACTION,
+        model_id=RULE_ONLY_PARTIAL_MODEL_ID,
+        provisional=True,
+        created_at_utc=partial.created_at_utc,
+    )
+    suggestion = CoachingSuggestionEvent(
+        tenant_id=partial.tenant_id,
+        call_id=partial.call_id,
+        suggestion_id="rule-only-provisional",
+        source_transcript_event_id=partial.event_id,
+        action=CoachingAction.TEMPLATE_ACTION,
+        priority=SuggestionPriority.HIGH,
+        source=CoachingSuggestionSource.RULE,
+        lifecycle=CoachingSuggestionLifecycle.PROVISIONAL,
+        label_id="cancellation_request",
+        title="Sentetik iptal desteği",
+        suggestion="Onaylı sentetik adımları uygulayın.",
+        created_at_utc=partial.created_at_utc,
+    )
+    coaching = StableCoachingOutcome(
+        status=CoachingProcessingStatus.PROCESSED,
+        transcript_revision=partial.revision,
+        result=CoachingCoordinatorResult(
+            classification_event=classification,
+            displayed_suggestions=(suggestion,),
+            suppressed_suggestions=(),
+            matched_rule_ids=("general-explicit-cancellation",),
+            suppression_reasons=(),
+            transcript_revision=partial.revision,
+            lifecycle=CoachingSuggestionLifecycle.PROVISIONAL,
+        ),
+    )
+    provisional_step = replace(base_step, coaching_outcomes=(coaching,))
+
+    consume_live_step(state, provisional_step, elapsed_seconds=0.1)
+    first = execution_snapshot(
+        state,
+        revision=1,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+    )
+    consume_live_step(
+        state,
+        replace(
+            base_step,
+            sequence_number=1,
+            chunk_start_seconds=1.0,
+            chunk_end_seconds=2.0,
+            transcript_events=(),
+            coaching_outcomes=(),
+        ),
+        elapsed_seconds=0.2,
+    )
+    latest = execution_snapshot(
+        state,
+        revision=2,
+        lifecycle_status=DashboardExecutionStatus.RUNNING,
+    )
+
+    assert first.active_coaching[0].lifecycle is (
+        CoachingSuggestionLifecycle.PROVISIONAL
+    )
+    assert latest.active_coaching == first.active_coaching
+    assert latest.lifecycle_status is DashboardExecutionStatus.RUNNING
 
 
 def test_progress_percentage_eta_and_completed_state() -> None:

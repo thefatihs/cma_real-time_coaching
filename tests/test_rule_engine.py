@@ -4,7 +4,11 @@ from itertools import count
 import pytest
 from pydantic import ValidationError
 
-from app.coaching.rule_engine import CoachingRule, RuleBasedCoachingEngine
+from app.coaching.rule_engine import (
+    RULE_ONLY_PARTIAL_MODEL_ID,
+    CoachingRule,
+    RuleBasedCoachingEngine,
+)
 from app.events.models import (
     CoachingAction,
     CoachingSuggestionSource,
@@ -90,6 +94,30 @@ def test_partial_transcript_is_ignored() -> None:
     result = engine(rule()).evaluate(transcript(TranscriptKind.PARTIAL))
     assert result.classification_event is None
     assert result.suggestion_events == result.matched_rule_ids == ()
+
+
+def test_rule_only_partial_uses_existing_explicit_evidence_without_probabilities() -> (
+    None
+):
+    event = transcript(TranscriptKind.PARTIAL)
+
+    result = engine(rule()).classify_partial(event)
+
+    assert result is not None
+    assert result.provisional
+    assert result.model_id == RULE_ONLY_PARTIAL_MODEL_ID
+    assert result.threshold_profile_id is None
+    assert result.probabilities == result.thresholds == {}
+    assert [label.name for label in result.labels] == ["iade"]
+
+
+def test_rule_only_partial_without_existing_match_returns_none() -> None:
+    assert (
+        engine(rule()).classify_partial(
+            transcript(TranscriptKind.PARTIAL, text="Eşleşmeyen sentetik ifade.")
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize("kind", [TranscriptKind.STABLE, TranscriptKind.FINAL])

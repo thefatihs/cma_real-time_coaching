@@ -11,6 +11,7 @@ from app.calls.models import CallClassificationMetadata, CallState
 from app.classification.streaming import (
     ClassificationProcessingStatus,
     ProvisionalClassificationPolicy,
+    RuleOnlyPartialClassifierProtocol,
     RuntimeClassifierProtocol,
     StableClassificationOutcome,
     StableTranscriptClassificationStage,
@@ -112,6 +113,7 @@ class StreamingASRPipeline:
         *,
         chunk_generator: ChunkGenerator = generate_audio_chunks,
         runtime_classifier: RuntimeClassifierProtocol | None = None,
+        rule_only_partial_classifier: RuleOnlyPartialClassifierProtocol | None = None,
         coaching_coordinator_factory: CoachingCoordinatorFactory | None = None,
         customer_only_classification_enabled: bool = False,
         customer_projection_provider: CustomerProjectionProviderProtocol | None = None,
@@ -121,7 +123,8 @@ class StreamingASRPipeline:
         self._window_transcriber = window_transcriber
         self._chunk_generator = chunk_generator
         self._classification_stage = StableTranscriptClassificationStage(
-            runtime_classifier
+            runtime_classifier,
+            rule_only_partial_classifier=rule_only_partial_classifier,
         )
         self._coaching_coordinator_factory = coaching_coordinator_factory
         self._customer_router = CustomerOnlyClassificationRouter(

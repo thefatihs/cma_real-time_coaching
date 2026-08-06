@@ -192,6 +192,9 @@ def test_missing_artifacts_are_safe_and_keep_rule_coaching() -> None:
     assert subject.coaching_enabled
     assert subject.rule_engine_enabled
     assert pipeline._coaching_coordinator_factory is not None  # noqa: SLF001
+    assert (  # noqa: SLF001
+        pipeline._classification_stage._rule_only_partial_classifier is not None
+    )
     coordinator = pipeline._coaching_coordinator_factory(  # noqa: SLF001
         CallState(tenant_id="tenant_alpha", call_id="synthetic-call")
     )
@@ -257,6 +260,9 @@ def test_setfit_and_coaching_toggles_control_pipeline_services() -> None:
         classifier_provider=provider,
     )
     assert disabled._classification_stage._classifier is None  # noqa: SLF001
+    assert (  # noqa: SLF001
+        disabled._classification_stage._rule_only_partial_classifier is None
+    )
     assert disabled._coaching_coordinator_factory is None  # noqa: SLF001
     assert calls == 1
     assert ("SetFit", "disabled") in dashboard_tabs(
