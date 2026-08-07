@@ -185,6 +185,23 @@ def test_primary_failure_is_not_masked_by_cleanup_failure(
     assert caught.value.phase == "E_ORCHESTRATION"
 
 
+def test_full_functional_success_with_recovered_cleanup_returns_e2e_ok(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    operations = FakeOperations()
+
+    assert (
+        subject.run(
+            preflight_only=False,
+            environment=environment(tmp_path),
+            operations_factory=lambda _config: operations,
+        )
+        == subject.E2E_OK
+    )
+    assert operations.events[-1] == "E_CLEANUP"
+
+
 def test_citation_primary_failure_is_not_masked_by_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -397,6 +414,14 @@ def _fake_process_tables(
         "_windows_process_table",
         lambda: {process.pid: 1} if process.poll_result is None else {},
     )
+    lifecycle._protected_resources = {
+        "container": frozenset(),
+        "network": frozenset(),
+        "volume": frozenset(),
+    }
+    monkeypatch.setattr(
+        lifecycle, "_require_protected_resources_unchanged", lambda: None
+    )
 
 
 def test_production_cleanup_requests_graceful_service_signal_only(
@@ -508,6 +533,9 @@ def test_graceful_failure_modes_each_trigger_every_fallback(
     lifecycle._service = cast(subprocess.Popen[bytes], process)
     failing = cast(FailingProcess, lifecycle._service)
     monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {failing.pid: 1})
+    monkeypatch.setattr(
+        lifecycle, "_require_protected_resources_unchanged", lambda: None
+    )
     fallbacks: list[str] = []
     monkeypatch.setattr(
         lifecycle,
@@ -525,9 +553,130 @@ def test_graceful_failure_modes_each_trigger_every_fallback(
         lambda: fallbacks.append("handoff"),
     )
     monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", lambda: None)
-    with pytest.raises((OSError, RuntimeError, subprocess.TimeoutExpired)):
-        lifecycle.cleanup()
+    lifecycle.cleanup()
     assert fallbacks == ["process", "project", "handoff"]
+
+
+def test_early_owned_residue_triggers_recoverable_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    _fake_process_tables(monkeypatch, lifecycle, process)
+    verifications = 0
+    fallbacks: list[str] = []
+
+    def verify() -> None:
+        nonlocal verifications
+        verifications += 1
+        if verifications == 1:
+            raise RuntimeError
+
+    monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", verify)
+    monkeypatch.setattr(
+        lifecycle,
+        "_terminate_owned_process_tree",
+        lambda *_args: fallbacks.append("process"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_cleanup_exact_postgres_project",
+        lambda: fallbacks.append("project"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_cleanup_exact_handoff",
+        lambda: fallbacks.append("handoff"),
+    )
+
+    lifecycle.cleanup()
+
+    assert verifications == 2
+    assert fallbacks == ["process", "project", "handoff"]
+
+
+@pytest.mark.parametrize("failed_action", ["process", "project", "handoff"])
+def test_fallback_action_failure_remains_cleanup_failure(
+    failed_action: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess(return_code=1)
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    _fake_process_tables(monkeypatch, lifecycle, process)
+    actions: list[str] = []
+
+    def action(name: str) -> None:
+        actions.append(name)
+        if name == failed_action:
+            raise RuntimeError
+
+    monkeypatch.setattr(
+        lifecycle, "_terminate_owned_process_tree", lambda *_args: action("process")
+    )
+    monkeypatch.setattr(
+        lifecycle, "_cleanup_exact_postgres_project", lambda: action("project")
+    )
+    monkeypatch.setattr(lifecycle, "_cleanup_exact_handoff", lambda: action("handoff"))
+    monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", lambda: None)
+
+    with pytest.raises(RuntimeError):
+        lifecycle.cleanup()
+
+    assert actions == ["process", "project", "handoff"]
+
+
+def test_unverifiable_or_changed_protected_resources_fail_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    _fake_process_tables(monkeypatch, lifecycle, process)
+    monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", lambda: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "_require_protected_resources_unchanged",
+        lambda: (_ for _ in ()).throw(RuntimeError()),
+    )
+
+    with pytest.raises(RuntimeError):
+        lifecycle.cleanup()
+
+
+def test_remaining_owned_process_after_fallback_fails_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    lifecycle._postgres_project = "callmetric-pgvector-tls-123-abcdef123456"
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {process.pid: 1})
+    monkeypatch.setattr(lifecycle, "_terminate_owned_process_tree", lambda *_args: None)
+    monkeypatch.setattr(lifecycle, "_cleanup_exact_postgres_project", lambda: None)
+    monkeypatch.setattr(lifecycle, "_cleanup_exact_handoff", lambda: None)
+    monkeypatch.setattr(
+        lifecycle, "_require_protected_resources_unchanged", lambda: None
+    )
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout="", stderr=""
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        lifecycle.cleanup()
 
 
 def test_owned_process_tree_is_terminated_descendant_first(

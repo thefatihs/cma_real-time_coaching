@@ -311,7 +311,7 @@ def run(
         if operations_factory is None
         else operations_factory(config)
     )
-    primary: BaseException | None = None
+    functional_primary_error: BaseException | None = None
     try:
         for phase in PHASES[1:-1]:
             try:
@@ -319,14 +319,14 @@ def run(
             except BaseException:
                 raise DashboardRAGVLLME2EError(phase) from None
     except BaseException as error:
-        primary = error
+        functional_primary_error = error
     try:
         operations.cleanup()
     except BaseException:
-        if primary is None:
-            primary = DashboardRAGVLLME2EError("E_CLEANUP")
-    if primary is not None:
-        raise primary
+        if functional_primary_error is None:
+            functional_primary_error = DashboardRAGVLLME2EError("E_CLEANUP")
+    if functional_primary_error is not None:
+        raise functional_primary_error
     return E2E_OK
 
 
@@ -349,12 +349,19 @@ class _ProductionLifecycle:
         self._outcome: StableCoachingOutcome | None = None
         self._processor: RAGCoachingProcessorDecorator | None = None
         self._vector_count = 0
+        self._protected_resources: dict[str, frozenset[str]] | None = None
 
     def run_phase(self, phase: str) -> None:
         getattr(self, f"_{phase.removeprefix('E_').lower()}")()
 
     def _postgres_start(self) -> None:
+        from scripts.run_postgres_tls_service import snapshot_protected_resources
+
         before = set(self._config.handoff_root.iterdir())
+        docker = shutil.which("docker")
+        if docker is None:
+            raise RuntimeError
+        self._protected_resources = snapshot_protected_resources(docker)
         environment = dict(self._environment)
         environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH"] = (
             self._config.branch
@@ -838,12 +845,12 @@ class _ProductionLifecycle:
             raise RuntimeError
 
     def cleanup(self) -> None:
-        primary: BaseException | None = None
+        fallback_action_error: BaseException | None = None
         try:
             if self._rag_manager is not None:
                 self._rag_manager.close(wait=False)
         except BaseException as error:
-            primary = error
+            fallback_action_error = error
         try:
             if self._document_runtime is not None:
                 for entry in (self._target_entry, self._other_entry):
@@ -855,56 +862,59 @@ class _ProductionLifecycle:
                         )
                 self._document_runtime.close(wait=False)
         except BaseException as error:
-            primary = primary or error
+            fallback_action_error = fallback_action_error or error
         service = self._service
         initial_processes: dict[int, int] = {}
-        graceful_failed = False
+        graceful_recovery_trigger: BaseException | None = None
         if service is not None:
             try:
                 initial_processes = self._windows_process_table()
             except BaseException as error:
-                primary = primary or error
-                graceful_failed = True
+                graceful_recovery_trigger = error
             if service.poll() is None:
                 try:
                     service.send_signal(signal.CTRL_BREAK_EVENT)
                 except BaseException as error:
-                    primary = primary or error
-                    graceful_failed = True
+                    graceful_recovery_trigger = graceful_recovery_trigger or error
             try:
                 return_code = service.wait(timeout=150)
                 if return_code != 0:
-                    primary = primary or RuntimeError()
-                    graceful_failed = True
+                    graceful_recovery_trigger = (
+                        graceful_recovery_trigger or RuntimeError()
+                    )
             except BaseException as error:
-                primary = primary or error
-                graceful_failed = True
-        if not graceful_failed:
+                graceful_recovery_trigger = graceful_recovery_trigger or error
+        if graceful_recovery_trigger is None:
             try:
                 self._require_postgres_residue_absent()
             except BaseException as error:
-                primary = primary or error
-                graceful_failed = True
-        if graceful_failed:
+                graceful_recovery_trigger = error
+        if graceful_recovery_trigger is not None:
             try:
                 if service is not None:
                     self._terminate_owned_process_tree(service, initial_processes)
             except BaseException as error:
-                primary = primary or error
+                fallback_action_error = fallback_action_error or error
             try:
                 self._cleanup_exact_postgres_project()
             except BaseException as error:
-                primary = primary or error
+                fallback_action_error = fallback_action_error or error
             try:
                 self._cleanup_exact_handoff()
             except BaseException as error:
-                primary = primary or error
+                fallback_action_error = fallback_action_error or error
+        final_verification_error: BaseException | None = None
         try:
             self._require_postgres_residue_absent()
         except BaseException as error:
-            primary = primary or error
-        if primary is not None:
-            raise primary
+            final_verification_error = error
+        try:
+            self._require_protected_resources_unchanged()
+        except BaseException as error:
+            final_verification_error = final_verification_error or error
+        cleanup_error = fallback_action_error or final_verification_error
+        if cleanup_error is not None:
+            raise cleanup_error
 
     @staticmethod
     def _windows_process_table() -> dict[int, int]:
@@ -1066,6 +1076,17 @@ class _ProductionLifecycle:
         if handoff is None or not handoff.exists():
             return
         cleanup_exact_handoff_child(self._config.handoff_root, handoff)
+
+    def _require_protected_resources_unchanged(self) -> None:
+        from scripts.run_postgres_tls_service import (
+            require_protected_resources_unchanged,
+        )
+
+        expected = self._protected_resources
+        docker = shutil.which("docker")
+        if expected is None or docker is None:
+            raise RuntimeError
+        require_protected_resources_unchanged(docker, expected)
 
     def _require_postgres_residue_absent(self) -> None:
         project = self._postgres_project

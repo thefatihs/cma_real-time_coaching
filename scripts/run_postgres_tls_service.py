@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 import csv
 import io
@@ -246,6 +246,35 @@ def _resource_snapshot(docker: str) -> dict[str, frozenset[str]]:
     }
 
 
+def snapshot_protected_resources(docker: str) -> dict[str, frozenset[str]]:
+    """Return a secret-free read-only inventory for later preservation proof."""
+    if not isinstance(docker, str) or not docker:
+        raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+    return _resource_snapshot(docker)
+
+
+def require_protected_resources_unchanged(
+    docker: str, expected: Mapping[str, frozenset[str]]
+) -> None:
+    """Require the current Docker inventory to equal one trusted snapshot."""
+    if (
+        not isinstance(docker, str)
+        or not docker
+        or set(expected) != {"container", "network", "volume"}
+        or any(
+            not isinstance(values, frozenset)
+            or any(
+                not isinstance(value, str) or not RESOURCE_ID_PATTERN.fullmatch(value)
+                for value in values
+            )
+            for values in expected.values()
+        )
+    ):
+        raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+    if _resource_snapshot(docker) != expected:
+        raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+
+
 def _inspect_field(
     docker: str,
     resource: str,
@@ -377,17 +406,23 @@ def _validate_exact_project_resources(
 def _exact_project_fallback(docker: str, project: str) -> None:
     resources = _project_resource_references(docker, project)
     _validate_exact_project_resources(docker, project, resources)
+    failure: BaseException | None = None
     for resource, remove_arguments in (
         ("container", ("container", "rm", "--force")),
         ("volume", ("volume", "rm")),
         ("network", ("network", "rm")),
     ):
         for reference in resources[resource]:
-            _run_command(
-                [docker, *remove_arguments, reference],
-                capture_output=True,
-                timeout=CLEANUP_TIMEOUT_SECONDS,
-            )
+            try:
+                _run_command(
+                    [docker, *remove_arguments, reference],
+                    capture_output=True,
+                    timeout=CLEANUP_TIMEOUT_SECONDS,
+                )
+            except BaseException as error:
+                failure = failure or error
+    if failure is not None:
+        raise failure
 
 
 def cleanup_exact_project_resources(docker: str, project: str) -> None:

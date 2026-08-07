@@ -60,6 +60,102 @@ def test_handoff_is_owner_only_verify_full_and_removable(
     assert not handoff.exists()
 
 
+def test_public_protected_resource_snapshot_comparison_is_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = [
+        {
+            "container": frozenset({"container123"}),
+            "network": frozenset({"network123"}),
+            "volume": frozenset({"volume123"}),
+        },
+        {
+            "container": frozenset({"container123"}),
+            "network": frozenset({"network123"}),
+            "volume": frozenset({"volume123"}),
+        },
+    ]
+    monkeypatch.setattr(subject, "_resource_snapshot", lambda _docker: snapshots.pop(0))
+
+    expected = subject.snapshot_protected_resources("docker")
+    subject.require_protected_resources_unchanged("docker", expected)
+
+    assert snapshots == []
+
+
+def test_public_protected_resource_comparison_rejects_change_or_invalid_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "container": frozenset({"container123"}),
+        "network": frozenset({"network123"}),
+        "volume": frozenset({"volume123"}),
+    }
+    monkeypatch.setattr(
+        subject,
+        "_resource_snapshot",
+        lambda _docker: {**expected, "volume": frozenset()},
+    )
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.require_protected_resources_unchanged("docker", expected)
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.require_protected_resources_unchanged("docker", {})
+
+
+def test_exact_project_cleanup_is_idempotent_when_targets_are_already_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = "callmetric-pgvector-tls-123-abcdef123456"
+    monkeypatch.setattr(
+        subject,
+        "_project_resource_references",
+        lambda _docker, _project: {
+            "container": (),
+            "network": (),
+            "volume": (),
+        },
+    )
+    monkeypatch.setattr(
+        subject,
+        "_run_command",
+        lambda *_args, **_kwargs: pytest.fail("absent resource removal attempted"),
+    )
+    monkeypatch.setattr(subject.smoke, "_require_no_project_resources", lambda *_: None)
+
+    subject.cleanup_exact_project_resources("docker", project)
+
+
+def test_exact_project_fallback_attempts_volume_and_network_after_container_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = "callmetric-pgvector-tls-123-abcdef123456"
+    resources = {
+        "container": ("container123",),
+        "network": ("network123",),
+        "volume": ("volume123",),
+    }
+    monkeypatch.setattr(
+        subject, "_project_resource_references", lambda _docker, _project: resources
+    )
+    monkeypatch.setattr(
+        subject, "_validate_exact_project_resources", lambda *_args: None
+    )
+    attempted: list[str] = []
+
+    def remove(arguments: list[str], **_kwargs: object) -> None:
+        attempted.append(arguments[1])
+        if arguments[1] == "container":
+            raise RuntimeError
+
+    monkeypatch.setattr(subject, "_run_command", remove)
+
+    with pytest.raises(RuntimeError):
+        subject._exact_project_fallback("docker", project)
+
+    assert attempted == ["container", "volume", "network"]
+
+
 def test_exact_handoff_cleanup_removes_only_validated_run_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
