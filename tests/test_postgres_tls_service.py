@@ -156,6 +156,36 @@ def test_exact_project_fallback_attempts_volume_and_network_after_container_fail
     assert attempted == ["container", "volume", "network"]
 
 
+@pytest.mark.parametrize("disappearing", ["container", "volume", "network"])
+def test_exact_project_removal_disappearance_race_is_recovered(
+    disappearing: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = "callmetric-pgvector-tls-123-abcdef123456"
+    initial = {
+        "container": ("container123",),
+        "network": ("network123",),
+        "volume": ("volume123",),
+    }
+    after = {**initial, disappearing: ()}
+    observations = [initial, after]
+
+    def observe(_docker: str, _project: str) -> dict[str, tuple[str, ...]]:
+        return observations.pop(0) if observations else after
+
+    monkeypatch.setattr(subject, "_project_resource_references", observe)
+    monkeypatch.setattr(
+        subject, "_validate_exact_project_resources", lambda *_args: None
+    )
+
+    def remove(arguments: list[str], **_kwargs: object) -> None:
+        if arguments[1] == disappearing:
+            raise RuntimeError
+
+    monkeypatch.setattr(subject, "_run_command", remove)
+
+    subject._exact_project_fallback("docker", project)
+
+
 def test_exact_handoff_cleanup_removes_only_validated_run_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -196,6 +226,103 @@ def test_exact_handoff_cleanup_refuses_sibling_or_incomplete_child(
 
     assert sibling.exists()
     assert handoff.exists()
+
+
+def test_exact_handoff_cleanup_refuses_reparse_or_unverifiable_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    handoff = root / "callmetric-postgres-tls-abcdefgh"
+    handoff.mkdir()
+    for name in subject.HANDOFF_FILES:
+        (handoff / name).write_text("synthetic", encoding="utf-8")
+    monkeypatch.setattr(subject, "_private_root", lambda _raw: root.resolve())
+    monkeypatch.setattr(subject, "_is_reparse_point", lambda path: path == handoff)
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.cleanup_exact_handoff_child(root, handoff)
+
+    assert handoff.exists()
+
+    monkeypatch.setattr(
+        subject,
+        "_private_root",
+        lambda _raw: (_ for _ in ()).throw(subject.PostgreSQLTLSServiceError()),
+    )
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.cleanup_exact_handoff_child(root, handoff)
+
+
+def test_exact_handoff_disappearance_during_rmtree_is_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    handoff = root / "callmetric-postgres-tls-abcdefgh"
+    handoff.mkdir()
+    for name in subject.HANDOFF_FILES:
+        (handoff / name).write_text("synthetic", encoding="utf-8")
+    sibling = root / "operator-owned-sibling"
+    sibling.mkdir()
+    monkeypatch.setattr(subject, "_private_root", lambda _raw: root.resolve())
+    remove = subject.shutil.rmtree
+
+    def disappear(path: Path) -> None:
+        remove(path)
+        raise OSError
+
+    monkeypatch.setattr(subject.shutil, "rmtree", disappear)
+
+    subject.cleanup_exact_handoff_child(root, handoff)
+
+    assert not handoff.exists()
+    assert sibling.exists()
+
+
+def test_exact_handoff_remaining_after_failed_delete_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    handoff = root / "callmetric-postgres-tls-abcdefgh"
+    handoff.mkdir()
+    for name in subject.HANDOFF_FILES:
+        (handoff / name).write_text("synthetic", encoding="utf-8")
+    monkeypatch.setattr(subject, "_private_root", lambda _raw: root.resolve())
+    monkeypatch.setattr(
+        subject.shutil, "rmtree", lambda _path: (_ for _ in ()).throw(OSError())
+    )
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.cleanup_exact_handoff_child(root, handoff)
+
+
+def test_exact_handoff_sibling_mutation_during_delete_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    handoff = root / "callmetric-postgres-tls-abcdefgh"
+    handoff.mkdir()
+    for name in subject.HANDOFF_FILES:
+        (handoff / name).write_text("synthetic", encoding="utf-8")
+    sibling = root / "operator-owned-sibling"
+    sibling.mkdir()
+    monkeypatch.setattr(subject, "_private_root", lambda _raw: root.resolve())
+    remove = subject.shutil.rmtree
+
+    def mutate(path: Path) -> None:
+        remove(path)
+        (root / "unexpected-sibling").mkdir()
+        raise OSError
+
+    monkeypatch.setattr(subject.shutil, "rmtree", mutate)
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.cleanup_exact_handoff_child(root, handoff)
+
+    assert sibling.exists()
 
 
 def test_preflight_stops_before_secrets_signals_or_runtime(

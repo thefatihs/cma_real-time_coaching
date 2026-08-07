@@ -54,6 +54,14 @@ POLL_INTERVAL_SECONDS = 0.2
 
 PREFLIGHT_OK = "PREFLIGHT_OK"
 E2E_OK = "E2E_OK"
+E_CLEANUP_PROCESS_ACTION = "E_CLEANUP_PROCESS_ACTION"
+E_CLEANUP_PROJECT_ACTION = "E_CLEANUP_PROJECT_ACTION"
+E_CLEANUP_HANDOFF_ACTION = "E_CLEANUP_HANDOFF_ACTION"
+E_CLEANUP_PROCESS_VERIFY = "E_CLEANUP_PROCESS_VERIFY"
+E_CLEANUP_PROJECT_VERIFY = "E_CLEANUP_PROJECT_VERIFY"
+E_CLEANUP_HANDOFF_VERIFY = "E_CLEANUP_HANDOFF_VERIFY"
+E_CLEANUP_PROTECTED_VERIFY = "E_CLEANUP_PROTECTED_VERIFY"
+E_CLEANUP_UNVERIFIABLE = "E_CLEANUP_UNVERIFIABLE"
 PHASES = (
     "E_PREFLIGHT",
     "E_POSTGRES_START",
@@ -81,6 +89,12 @@ class DashboardRAGVLLME2EError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase if phase in PHASES else "E_PREFLIGHT"
         super().__init__(self.phase)
+
+
+class _CleanupPhaseError(RuntimeError):
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__(phase)
 
 
 @dataclass(frozen=True, slots=True)
@@ -871,11 +885,14 @@ class _ProductionLifecycle:
                 initial_processes = self._windows_process_table()
             except BaseException as error:
                 graceful_recovery_trigger = error
-            if service.poll() is None:
-                try:
+                fallback_action_error = fallback_action_error or _CleanupPhaseError(
+                    E_CLEANUP_UNVERIFIABLE
+                )
+            try:
+                if service.poll() is None:
                     service.send_signal(signal.CTRL_BREAK_EVENT)
-                except BaseException as error:
-                    graceful_recovery_trigger = graceful_recovery_trigger or error
+            except BaseException as error:
+                graceful_recovery_trigger = graceful_recovery_trigger or error
             try:
                 return_code = service.wait(timeout=150)
                 if return_code != 0:
@@ -908,6 +925,10 @@ class _ProductionLifecycle:
             self._require_postgres_residue_absent()
         except BaseException as error:
             final_verification_error = error
+        try:
+            self._require_initial_processes_absent(initial_processes)
+        except BaseException as error:
+            final_verification_error = final_verification_error or error
         try:
             self._require_protected_resources_unchanged()
         except BaseException as error:
@@ -991,41 +1012,80 @@ class _ProductionLifecycle:
             )
         )
         failure: BaseException | None = None
-        taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
-        if taskkill is None:
-            raise RuntimeError
+
+        def taskkill_path() -> str:
+            taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
+            if taskkill is None:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+            return taskkill
+
         for _depth, process_id in descendants:
             try:
                 current = self._windows_process_table()
-                if process_id not in current or not self._same_owned_chain(
+                if process_id not in current:
+                    continue
+                if not self._same_owned_chain(
                     initial_processes, current, process_id, root
                 ):
-                    raise RuntimeError
-                subprocess.run(
-                    [taskkill, "/PID", str(process_id), "/F"],
-                    cwd=REPOSITORY_ROOT,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    shell=False,
-                    timeout=30,
-                )
+                    raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+                try:
+                    subprocess.run(
+                        [taskkill_path(), "/PID", str(process_id), "/F"],
+                        cwd=REPOSITORY_ROOT,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        shell=False,
+                        timeout=30,
+                    )
+                except BaseException:
+                    observed = self._windows_process_table()
+                    if process_id in observed:
+                        if not self._same_owned_chain(
+                            initial_processes, observed, process_id, root
+                        ):
+                            raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY) from None
+                        raise _CleanupPhaseError(E_CLEANUP_PROCESS_ACTION) from None
             except BaseException as error:
                 failure = failure or error
         if service.poll() is None:
             try:
-                subprocess.run(
-                    [taskkill, "/PID", str(root), "/F"],
-                    cwd=REPOSITORY_ROOT,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    shell=False,
-                    timeout=30,
-                )
+                current = self._windows_process_table()
+                if root in current:
+                    if (
+                        root not in initial_processes
+                        or current[root] != initial_processes[root]
+                    ):
+                        raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+                    try:
+                        subprocess.run(
+                            [taskkill_path(), "/PID", str(root), "/F"],
+                            cwd=REPOSITORY_ROOT,
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            shell=False,
+                            timeout=30,
+                        )
+                    except BaseException:
+                        observed = self._windows_process_table()
+                        if root in observed:
+                            if observed[root] != initial_processes[root]:
+                                raise _CleanupPhaseError(
+                                    E_CLEANUP_PROCESS_VERIFY
+                                ) from None
+                            raise _CleanupPhaseError(E_CLEANUP_PROCESS_ACTION) from None
                 service.wait(timeout=30)
             except BaseException as error:
                 failure = failure or error
+        try:
+            observed = self._windows_process_table()
+            if any(process_id in observed for _depth, process_id in descendants):
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            if root in observed or service.poll() is None:
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+        except BaseException as error:
+            failure = failure or error
         if failure is not None:
             raise failure
 
@@ -1066,16 +1126,22 @@ class _ProductionLifecycle:
         project = self._postgres_project
         docker = shutil.which("docker")
         if project is None or docker is None:
-            raise RuntimeError
-        cleanup_exact_project_resources(docker, project)
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+        try:
+            cleanup_exact_project_resources(docker, project)
+        except BaseException:
+            raise _CleanupPhaseError(E_CLEANUP_PROJECT_ACTION) from None
 
     def _cleanup_exact_handoff(self) -> None:
         from scripts.run_postgres_tls_service import cleanup_exact_handoff_child
 
         handoff = self._handoff
-        if handoff is None or not handoff.exists():
+        if handoff is None:
             return
-        cleanup_exact_handoff_child(self._config.handoff_root, handoff)
+        try:
+            cleanup_exact_handoff_child(self._config.handoff_root, handoff)
+        except BaseException:
+            raise _CleanupPhaseError(E_CLEANUP_HANDOFF_ACTION) from None
 
     def _require_protected_resources_unchanged(self) -> None:
         from scripts.run_postgres_tls_service import (
@@ -1085,8 +1151,11 @@ class _ProductionLifecycle:
         expected = self._protected_resources
         docker = shutil.which("docker")
         if expected is None or docker is None:
-            raise RuntimeError
-        require_protected_resources_unchanged(docker, expected)
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+        try:
+            require_protected_resources_unchanged(docker, expected)
+        except BaseException:
+            raise _CleanupPhaseError(E_CLEANUP_PROTECTED_VERIFY) from None
 
     def _require_postgres_residue_absent(self) -> None:
         project = self._postgres_project
@@ -1094,33 +1163,40 @@ class _ProductionLifecycle:
             return
         docker = shutil.which("docker")
         if docker is None:
-            raise RuntimeError
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
         for resource in ("container", "network", "volume"):
-            result = subprocess.run(
-                [
-                    docker,
-                    resource,
-                    "ls",
-                    "-q",
-                    "--filter",
-                    f"label=com.docker.compose.project={project}",
-                ],
-                cwd=REPOSITORY_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-                shell=False,
-                timeout=30,
-            )
+            try:
+                result = subprocess.run(
+                    [
+                        docker,
+                        resource,
+                        "ls",
+                        "-q",
+                        "--filter",
+                        f"label=com.docker.compose.project={project}",
+                    ],
+                    cwd=REPOSITORY_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                    timeout=30,
+                )
+            except BaseException:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
             if result.stdout.strip():
-                raise RuntimeError
-        if self._handoff is not None and self._handoff.exists():
-            raise RuntimeError
+                raise _CleanupPhaseError(E_CLEANUP_PROJECT_VERIFY)
+        if self._handoff is not None and os.path.lexists(self._handoff):
+            raise _CleanupPhaseError(E_CLEANUP_HANDOFF_VERIFY)
         service = self._service
         if service is not None:
-            table = self._windows_process_table()
+            try:
+                table = self._windows_process_table()
+                running = service.poll() is None
+            except BaseException:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
             if (
-                service.poll() is None
+                running
                 or service.pid in table
                 or any(
                     self._is_descendant(table, process_id, service.pid)
@@ -1128,7 +1204,19 @@ class _ProductionLifecycle:
                     if process_id != service.pid
                 )
             ):
-                raise RuntimeError
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+
+    def _require_initial_processes_absent(
+        self, initial_processes: Mapping[int, int]
+    ) -> None:
+        if not initial_processes:
+            return
+        try:
+            observed = self._windows_process_table()
+        except BaseException:
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
+        if any(process_id in observed for process_id in initial_processes):
+            raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
 
 
 def main(arguments: list[str] | None = None) -> int:

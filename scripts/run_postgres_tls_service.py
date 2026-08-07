@@ -420,7 +420,13 @@ def _exact_project_fallback(docker: str, project: str) -> None:
                     timeout=CLEANUP_TIMEOUT_SECONDS,
                 )
             except BaseException as error:
-                failure = failure or error
+                try:
+                    observed = _project_resource_references(docker, project)
+                    _validate_exact_project_resources(docker, project, observed)
+                    if reference in observed[resource]:
+                        failure = failure or error
+                except BaseException as verification_error:
+                    failure = failure or verification_error
     if failure is not None:
         raise failure
 
@@ -589,6 +595,12 @@ def cleanup_exact_handoff_child(root: Path, handoff: Path) -> None:
     """Remove one complete controller-created handoff child and no sibling/root."""
     validated_root = _private_root(str(root))
     try:
+        if handoff.parent.resolve(
+            strict=True
+        ) != validated_root or not HANDOFF_PATTERN.fullmatch(handoff.name):
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+        if not os.path.lexists(handoff):
+            return
         resolved = handoff.resolve(strict=True)
         if (
             handoff != resolved
@@ -613,7 +625,31 @@ def cleanup_exact_handoff_child(root: Path, handoff: Path) -> None:
                 raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
     except (OSError, RuntimeError) as error:
         raise PostgreSQLTLSServiceError(phase=E_CLEANUP) from error
-    shutil.rmtree(resolved)
+    siblings = frozenset(
+        item.name for item in validated_root.iterdir() if item != handoff
+    )
+    try:
+        shutil.rmtree(resolved)
+    except OSError:
+        try:
+            current_root = _private_root(str(root))
+            current_siblings = frozenset(
+                item.name for item in current_root.iterdir() if item != handoff
+            )
+            if os.path.lexists(handoff) or current_siblings != siblings:
+                raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+            return
+        except (OSError, RuntimeError) as verification_error:
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP) from verification_error
+    try:
+        current_root = _private_root(str(root))
+        current_siblings = frozenset(
+            item.name for item in current_root.iterdir() if item != handoff
+        )
+        if os.path.lexists(handoff) or current_siblings != siblings:
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+    except (OSError, RuntimeError) as error:
+        raise PostgreSQLTLSServiceError(phase=E_CLEANUP) from error
 
 
 def _signals() -> tuple[signal.Signals, ...]:

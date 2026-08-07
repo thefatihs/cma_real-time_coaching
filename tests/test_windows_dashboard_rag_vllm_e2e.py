@@ -185,6 +185,25 @@ def test_primary_failure_is_not_masked_by_cleanup_failure(
     assert caught.value.phase == "E_ORCHESTRATION"
 
 
+@pytest.mark.parametrize(
+    "phase",
+    [
+        subject.E_CLEANUP_PROCESS_ACTION,
+        subject.E_CLEANUP_PROJECT_ACTION,
+        subject.E_CLEANUP_HANDOFF_ACTION,
+        subject.E_CLEANUP_PROCESS_VERIFY,
+        subject.E_CLEANUP_PROJECT_VERIFY,
+        subject.E_CLEANUP_HANDOFF_VERIFY,
+        subject.E_CLEANUP_PROTECTED_VERIFY,
+        subject.E_CLEANUP_UNVERIFIABLE,
+    ],
+)
+def test_cleanup_diagnostic_subphases_are_fixed_and_secret_safe(phase: str) -> None:
+    error = subject._CleanupPhaseError(phase)
+    assert error.phase == phase
+    assert str(error) == phase
+
+
 def test_full_functional_success_with_recovered_cleanup_returns_e2e_ok(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -532,7 +551,10 @@ def test_graceful_failure_modes_each_trigger_every_fallback(
     )
     lifecycle._service = cast(subprocess.Popen[bytes], process)
     failing = cast(FailingProcess, lifecycle._service)
-    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {failing.pid: 1})
+    process_tables = [{failing.pid: 1}, {}]
+    monkeypatch.setattr(
+        lifecycle, "_windows_process_table", lambda: process_tables.pop(0)
+    )
     monkeypatch.setattr(
         lifecycle, "_require_protected_resources_unchanged", lambda: None
     )
@@ -599,7 +621,7 @@ def test_early_owned_residue_triggers_recoverable_fallback(
 
 
 @pytest.mark.parametrize("failed_action", ["process", "project", "handoff"])
-def test_fallback_action_failure_remains_cleanup_failure(
+def test_nonrecoverable_fallback_validation_failure_remains_cleanup_failure(
     failed_action: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     prepare_preflight(monkeypatch, tmp_path)
@@ -691,6 +713,7 @@ def test_owned_process_tree_is_terminated_descendant_first(
         {100: 1, 200: 100, 300: 200},
         {100: 1, 200: 100, 300: 200},
         {100: 1, 200: 100},
+        {},
     ]
     monkeypatch.setattr(
         lifecycle,
@@ -711,6 +734,48 @@ def test_owned_process_tree_is_terminated_descendant_first(
         cast(subprocess.Popen[bytes], process), {100: 1, 200: 100, 300: 200}
     )
     assert terminated == [300, 200, 100]
+
+
+def test_descendant_disappearance_before_termination_is_recovered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess(poll_result=0)
+    process.pid = 100
+    tables = [{}, {}]
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: tables.pop(0))
+    monkeypatch.setattr(
+        subject.shutil,
+        "which",
+        lambda _name: pytest.fail("no termination tool required for absent targets"),
+    )
+
+    lifecycle._terminate_owned_process_tree(
+        cast(subprocess.Popen[bytes], process), {100: 1, 200: 100}
+    )
+
+
+def test_root_disappearance_before_termination_is_recovered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.pid = 100
+    tables = [{}, {}]
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: tables.pop(0))
+    monkeypatch.setattr(
+        subject.shutil,
+        "which",
+        lambda _name: pytest.fail("no termination tool required for absent targets"),
+    )
+
+    lifecycle._terminate_owned_process_tree(
+        cast(subprocess.Popen[bytes], process), {100: 1}
+    )
 
 
 def test_pid_reuse_or_non_descendant_is_never_terminated(
