@@ -351,3 +351,16 @@ This log uses local chronological numbering and records only Fatih-owned work.
   limited to the three documented POSIX portability findings.
 - Next planned step: manually verify a pre-END rule-only provisional card in
   accelerated uploaded-audio execution without SetFit artifacts.
+
+## GPU demo readiness preflight
+
+- Added a read-only, dependency-injected GPU demo preflight CLI covering the
+  Linux CUDA target, offline Whisper cache, SetFit, relay, dashboard packages,
+  and explicit feature gates without loading models by default.
+- Changed files: preflight script, synthetic focused tests, and this progress
+  file.
+- Tests: focused preflight 13 passed; classification/relay regressions 52
+  passed; full Windows suite 2635 passed and 17 skipped, with the 19 documented
+  POSIX-only vLLM controller failures.
+- Next planned step: run the preflight on the Linux CUDA demo host after its
+  model caches and feature gates are provisioned.
