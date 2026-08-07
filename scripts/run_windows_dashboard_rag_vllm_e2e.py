@@ -629,7 +629,9 @@ class _ProductionLifecycle:
                 "minimum_score": 0.0,
             }
         )
-        config.coaching = config.coaching.model_copy(update={"enable_llm": True})
+        config.coaching = config.coaching.model_copy(
+            update={"enable_llm": True, "cooldown_seconds": 0.0}
+        )
         config = TenantConfig.model_validate(config.model_dump())
         now = datetime.now(UTC)
         event = TranscriptEvent(
@@ -855,16 +857,46 @@ class _ProductionLifecycle:
         except BaseException as error:
             primary = primary or error
         service = self._service
+        initial_processes: dict[int, int] = {}
+        graceful_failed = False
         if service is not None:
+            try:
+                initial_processes = self._windows_process_table()
+            except BaseException as error:
+                primary = primary or error
+                graceful_failed = True
             if service.poll() is None:
                 try:
                     service.send_signal(signal.CTRL_BREAK_EVENT)
                 except BaseException as error:
                     primary = primary or error
+                    graceful_failed = True
             try:
                 return_code = service.wait(timeout=150)
                 if return_code != 0:
                     primary = primary or RuntimeError()
+                    graceful_failed = True
+            except BaseException as error:
+                primary = primary or error
+                graceful_failed = True
+        if not graceful_failed:
+            try:
+                self._require_postgres_residue_absent()
+            except BaseException as error:
+                primary = primary or error
+                graceful_failed = True
+        if graceful_failed:
+            try:
+                if service is not None:
+                    self._terminate_owned_process_tree(service, initial_processes)
+            except BaseException as error:
+                primary = primary or error
+            try:
+                self._cleanup_exact_postgres_project()
+            except BaseException as error:
+                primary = primary or error
+            try:
+                self._cleanup_exact_handoff()
             except BaseException as error:
                 primary = primary or error
         try:
@@ -873,6 +905,167 @@ class _ProductionLifecycle:
             primary = primary or error
         if primary is not None:
             raise primary
+
+    @staticmethod
+    def _windows_process_table() -> dict[int, int]:
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if powershell is None:
+            raise RuntimeError
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-CimInstance Win32_Process | Select-Object ProcessId,"
+                "ParentProcessId | ConvertTo-Json -Compress",
+            ],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+            shell=False,
+            timeout=30,
+        )
+        payload = json.loads(result.stdout)
+        rows = payload if isinstance(payload, list) else [payload]
+        table: dict[int, int] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RuntimeError
+            process_id = row.get("ProcessId")
+            parent_id = row.get("ParentProcessId")
+            if (
+                type(process_id) is not int
+                or type(parent_id) is not int
+                or process_id <= 0
+                or parent_id < 0
+                or process_id in table
+            ):
+                raise RuntimeError
+            table[process_id] = parent_id
+        return table
+
+    @staticmethod
+    def _descendant_depth(table: Mapping[int, int], process_id: int, root: int) -> int:
+        current = process_id
+        seen: set[int] = set()
+        depth = 0
+        while current != root:
+            if current in seen or current not in table:
+                raise RuntimeError
+            seen.add(current)
+            current = table[current]
+            depth += 1
+            if depth > len(table):
+                raise RuntimeError
+        return depth
+
+    def _terminate_owned_process_tree(
+        self,
+        service: subprocess.Popen[bytes],
+        initial_processes: Mapping[int, int],
+    ) -> None:
+        root = service.pid
+        if type(root) is not int or root <= 0:
+            raise RuntimeError
+        descendants = tuple(
+            sorted(
+                (
+                    (self._descendant_depth(initial_processes, item, root), item)
+                    for item in initial_processes
+                    if item != root
+                    and self._is_descendant(initial_processes, item, root)
+                ),
+                reverse=True,
+            )
+        )
+        failure: BaseException | None = None
+        taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
+        if taskkill is None:
+            raise RuntimeError
+        for _depth, process_id in descendants:
+            try:
+                current = self._windows_process_table()
+                if process_id not in current or not self._same_owned_chain(
+                    initial_processes, current, process_id, root
+                ):
+                    raise RuntimeError
+                subprocess.run(
+                    [taskkill, "/PID", str(process_id), "/F"],
+                    cwd=REPOSITORY_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                    timeout=30,
+                )
+            except BaseException as error:
+                failure = failure or error
+        if service.poll() is None:
+            try:
+                subprocess.run(
+                    [taskkill, "/PID", str(root), "/F"],
+                    cwd=REPOSITORY_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                    timeout=30,
+                )
+                service.wait(timeout=30)
+            except BaseException as error:
+                failure = failure or error
+        if failure is not None:
+            raise failure
+
+    @classmethod
+    def _is_descendant(
+        cls, table: Mapping[int, int], process_id: int, root: int
+    ) -> bool:
+        try:
+            return cls._descendant_depth(table, process_id, root) > 0
+        except RuntimeError:
+            return False
+
+    @classmethod
+    def _same_owned_chain(
+        cls,
+        initial: Mapping[int, int],
+        current: Mapping[int, int],
+        process_id: int,
+        root: int,
+    ) -> bool:
+        candidate = process_id
+        seen: set[int] = set()
+        while candidate != root:
+            if (
+                candidate in seen
+                or candidate not in initial
+                or candidate not in current
+                or initial[candidate] != current[candidate]
+            ):
+                return False
+            seen.add(candidate)
+            candidate = current[candidate]
+        return True
+
+    def _cleanup_exact_postgres_project(self) -> None:
+        from scripts.run_postgres_tls_service import cleanup_exact_project_resources
+
+        project = self._postgres_project
+        docker = shutil.which("docker")
+        if project is None or docker is None:
+            raise RuntimeError
+        cleanup_exact_project_resources(docker, project)
+
+    def _cleanup_exact_handoff(self) -> None:
+        from scripts.run_postgres_tls_service import cleanup_exact_handoff_child
+
+        handoff = self._handoff
+        if handoff is None or not handoff.exists():
+            return
+        cleanup_exact_handoff_child(self._config.handoff_root, handoff)
 
     def _require_postgres_residue_absent(self) -> None:
         project = self._postgres_project
@@ -902,6 +1095,19 @@ class _ProductionLifecycle:
                 raise RuntimeError
         if self._handoff is not None and self._handoff.exists():
             raise RuntimeError
+        service = self._service
+        if service is not None:
+            table = self._windows_process_table()
+            if (
+                service.poll() is None
+                or service.pid in table
+                or any(
+                    self._is_descendant(table, process_id, service.pid)
+                    for process_id in table
+                    if process_id != service.pid
+                )
+            ):
+                raise RuntimeError
 
 
 def main(arguments: list[str] | None = None) -> int:

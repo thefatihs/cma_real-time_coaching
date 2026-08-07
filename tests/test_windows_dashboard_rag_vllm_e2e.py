@@ -12,6 +12,7 @@ import pytest
 
 import scripts.run_windows_dashboard_rag_vllm_e2e as subject
 from app.coaching.coordinator import CoachingSourcePresentation, StableCoachingOutcome
+from app.coaching.coordinator import _cooldown_available
 
 HEAD = "4" * 40
 BASELINE = "3" * 40
@@ -270,6 +271,15 @@ def test_admission_requires_exactly_one_displayed_suggestion(
         lifecycle._admission()
 
 
+def test_e2e_zero_cooldown_allows_same_label_after_positive_cooldown_suppresses() -> (
+    None
+):
+    assert _cooldown_available(1.0, 1.0, 8.0) is False
+    assert _cooldown_available(1.0, 1.0, 0.0) is True
+    source = Path(subject.__file__).read_text(encoding="utf-8")
+    assert 'update={"enable_llm": True, "cooldown_seconds": 0.0}' in source
+
+
 def test_citation_projection_rejects_internal_identity_leakage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -363,6 +373,7 @@ class FakeServiceProcess:
         self.waits: list[float | None] = []
         self.poll_result = poll_result
         self.return_code = return_code
+        self.pid = 123
 
     def poll(self) -> int | None:
         return self.poll_result
@@ -372,7 +383,20 @@ class FakeServiceProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         self.waits.append(timeout)
+        self.poll_result = self.return_code
         return self.return_code
+
+
+def _fake_process_tables(
+    monkeypatch: pytest.MonkeyPatch,
+    lifecycle: subject._ProductionLifecycle,
+    process: FakeServiceProcess,
+) -> None:
+    monkeypatch.setattr(
+        lifecycle,
+        "_windows_process_table",
+        lambda: {process.pid: 1} if process.poll_result is None else {},
+    )
 
 
 def test_production_cleanup_requests_graceful_service_signal_only(
@@ -395,12 +419,13 @@ def test_production_cleanup_requests_graceful_service_signal_only(
         return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
 
     monkeypatch.setattr(subject.subprocess, "run", run)
+    _fake_process_tables(monkeypatch, lifecycle, process)
 
     lifecycle.cleanup()
 
     assert process.signals == [signal.CTRL_BREAK_EVENT]
     assert process.waits == [150]
-    assert len(commands) == 3
+    assert len(commands) == 6
     assert all("--filter" in command for command in commands)
     assert all("prune" not in command and "rm" not in command for command in commands)
 
@@ -413,6 +438,7 @@ def test_remaining_exact_project_resource_fails_cleanup(
     values = environment(tmp_path)
     lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
     lifecycle._service = cast(subprocess.Popen[bytes], FakeServiceProcess())
+    process = cast(FakeServiceProcess, lifecycle._service)
     lifecycle._postgres_project = "callmetric-pgvector-tls-123-abcdef123456"
     monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
 
@@ -423,6 +449,9 @@ def test_remaining_exact_project_resource_fails_cleanup(
         return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
 
     monkeypatch.setattr(subject.subprocess, "run", run)
+    _fake_process_tables(monkeypatch, lifecycle, process)
+    monkeypatch.setattr(lifecycle, "_cleanup_exact_postgres_project", lambda: None)
+    monkeypatch.setattr(lifecycle, "_cleanup_exact_handoff", lambda: None)
     with pytest.raises(RuntimeError):
         lifecycle.cleanup()
 
@@ -434,6 +463,7 @@ def test_remaining_handoff_fails_cleanup(
     values = environment(tmp_path)
     lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
     lifecycle._service = cast(subprocess.Popen[bytes], FakeServiceProcess())
+    process = cast(FakeServiceProcess, lifecycle._service)
     lifecycle._postgres_project = "callmetric-pgvector-tls-123-abcdef123456"
     lifecycle._handoff = tmp_path / "handoff-residue"
     lifecycle._handoff.mkdir()
@@ -445,12 +475,16 @@ def test_remaining_handoff_fails_cleanup(
             arguments, 0, stdout="", stderr=""
         ),
     )
+    _fake_process_tables(monkeypatch, lifecycle, process)
+    monkeypatch.setattr(lifecycle, "_cleanup_exact_postgres_project", lambda: None)
+    monkeypatch.setattr(lifecycle, "_cleanup_exact_handoff", lambda: None)
     with pytest.raises(RuntimeError):
         lifecycle.cleanup()
 
 
-def test_signal_failure_wait_timeout_and_abnormal_exit_fail_cleanup(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("failure", ["signal", "timeout", "abnormal"])
+def test_graceful_failure_modes_each_trigger_every_fallback(
+    failure: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     prepare_preflight(monkeypatch, tmp_path)
     values = environment(tmp_path)
@@ -458,20 +492,96 @@ def test_signal_failure_wait_timeout_and_abnormal_exit_fail_cleanup(
 
     class FailingProcess(FakeServiceProcess):
         def send_signal(self, signal_number: int) -> None:
-            del signal_number
-            raise OSError
+            if failure == "signal":
+                raise OSError
+            super().send_signal(signal_number)
 
         def wait(self, timeout: float | None = None) -> int:
-            del timeout
-            raise subprocess.TimeoutExpired([], 150)
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired([], 150)
+            return super().wait(timeout)
 
-    lifecycle._service = cast(subprocess.Popen[bytes], FailingProcess())
+    process = FailingProcess(
+        poll_result=1 if failure == "abnormal" else None,
+        return_code=1 if failure == "abnormal" else 0,
+    )
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    failing = cast(FailingProcess, lifecycle._service)
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {failing.pid: 1})
+    fallbacks: list[str] = []
+    monkeypatch.setattr(
+        lifecycle,
+        "_terminate_owned_process_tree",
+        lambda *_args: fallbacks.append("process"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_cleanup_exact_postgres_project",
+        lambda: fallbacks.append("project"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_cleanup_exact_handoff",
+        lambda: fallbacks.append("handoff"),
+    )
     monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", lambda: None)
-    with pytest.raises(OSError):
+    with pytest.raises((OSError, RuntimeError, subprocess.TimeoutExpired)):
         lifecycle.cleanup()
+    assert fallbacks == ["process", "project", "handoff"]
 
-    lifecycle._service = cast(
-        subprocess.Popen[bytes], FakeServiceProcess(poll_result=1, return_code=1)
+
+def test_owned_process_tree_is_terminated_descendant_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.pid = 100
+    tables = [
+        {100: 1, 200: 100, 300: 200},
+        {100: 1, 200: 100, 300: 200},
+        {100: 1, 200: 100},
+    ]
+    monkeypatch.setattr(
+        lifecycle,
+        "_windows_process_table",
+        lambda: tables.pop(0),
+    )
+    monkeypatch.setattr(subject.shutil, "which", lambda name: name)
+    terminated: list[int] = []
+
+    def run(
+        arguments: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        terminated.append(int(arguments[2]))
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
+    lifecycle._terminate_owned_process_tree(
+        cast(subprocess.Popen[bytes], process), {100: 1, 200: 100, 300: 200}
+    )
+    assert terminated == [300, 200, 100]
+
+
+def test_pid_reuse_or_non_descendant_is_never_terminated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.pid = 100
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {100: 1, 200: 999})
+    monkeypatch.setattr(subject.shutil, "which", lambda name: name)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: terminated.append(int(arguments[2])),
     )
     with pytest.raises(RuntimeError):
-        lifecycle.cleanup()
+        lifecycle._terminate_owned_process_tree(
+            cast(subprocess.Popen[bytes], process), {100: 1, 200: 100}
+        )
+    assert 200 not in terminated

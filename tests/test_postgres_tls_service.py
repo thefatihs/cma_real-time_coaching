@@ -60,6 +60,48 @@ def test_handoff_is_owner_only_verify_full_and_removable(
     assert not handoff.exists()
 
 
+def test_exact_handoff_cleanup_removes_only_validated_run_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    handoff = root / "callmetric-postgres-tls-abcdefgh"
+    handoff.mkdir()
+    for name in subject.HANDOFF_FILES:
+        (handoff / name).write_text("synthetic", encoding="utf-8")
+    sibling = root / "operator-owned-sibling"
+    sibling.mkdir()
+    (sibling / "preserved.txt").write_text("synthetic", encoding="utf-8")
+    monkeypatch.setattr(subject, "_private_root", lambda _raw: root.resolve())
+
+    subject.cleanup_exact_handoff_child(root, handoff)
+
+    assert not handoff.exists()
+    assert sibling.exists()
+    assert (sibling / "preserved.txt").exists()
+
+
+def test_exact_handoff_cleanup_refuses_sibling_or_incomplete_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    sibling = root / "operator-owned-sibling"
+    sibling.mkdir()
+    handoff = root / "callmetric-postgres-tls-abcdefgh"
+    handoff.mkdir()
+    (handoff / "application.dsn").write_text("synthetic", encoding="utf-8")
+    monkeypatch.setattr(subject, "_private_root", lambda _raw: root.resolve())
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.cleanup_exact_handoff_child(root, sibling)
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.cleanup_exact_handoff_child(root, handoff)
+
+    assert sibling.exists()
+    assert handoff.exists()
+
+
 def test_preflight_stops_before_secrets_signals_or_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -586,8 +628,8 @@ def test_compose_down_timeout_uses_only_validated_exact_project_fallback(
 
     assert removals == [
         ["docker", "container", "rm", "--force", "container123"],
-        ["docker", "network", "rm", "network123"],
         ["docker", "volume", "rm", "volume123"],
+        ["docker", "network", "rm", "network123"],
     ]
     assert residue_checks == 1
     rendered = " ".join(" ".join(arguments) for arguments in removals)

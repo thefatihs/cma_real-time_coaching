@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,7 @@ CLEANUP_TIMEOUT_SECONDS = 120.0
 PROJECT_PATTERN = smoke.PROJECT_NAME_PATTERN
 HANDOFF_PATTERN = re.compile(r"^callmetric-postgres-tls-[a-z0-9_]{8}$")
 HANDOFF_FILES = frozenset({"application.dsn", "ca.crt", "connection.json"})
+MAX_HANDOFF_FILE_BYTES = 65_536
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 CERTIFICATE_CONTAINER_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]+$")
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
@@ -377,8 +379,8 @@ def _exact_project_fallback(docker: str, project: str) -> None:
     _validate_exact_project_resources(docker, project, resources)
     for resource, remove_arguments in (
         ("container", ("container", "rm", "--force")),
-        ("network", ("network", "rm")),
         ("volume", ("volume", "rm")),
+        ("network", ("network", "rm")),
     ):
         for reference in resources[resource]:
             _run_command(
@@ -386,6 +388,21 @@ def _exact_project_fallback(docker: str, project: str) -> None:
                 capture_output=True,
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             )
+
+
+def cleanup_exact_project_resources(docker: str, project: str) -> None:
+    """Remove and verify only resources carrying one validated exact project label."""
+    if (
+        not isinstance(docker, str)
+        or not docker
+        or not PROJECT_PATTERN.fullmatch(project)
+    ):
+        raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+    _exact_project_fallback(docker, project)
+    _bounded_smoke_call(
+        CLEANUP_TIMEOUT_SECONDS,
+        lambda: smoke._require_no_project_resources(docker, project),
+    )
 
 
 def _cleanup_project(
@@ -525,6 +542,42 @@ def _remove_handoff(handoff: Path | None, root: Path) -> None:
     resolved = handoff.resolve(strict=True)
     if resolved.parent != root or not HANDOFF_PATTERN.fullmatch(resolved.name):
         raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+    shutil.rmtree(resolved)
+
+
+def _is_reparse_point(path: Path) -> bool:
+    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def cleanup_exact_handoff_child(root: Path, handoff: Path) -> None:
+    """Remove one complete controller-created handoff child and no sibling/root."""
+    validated_root = _private_root(str(root))
+    try:
+        resolved = handoff.resolve(strict=True)
+        if (
+            handoff != resolved
+            or resolved.parent != validated_root
+            or not HANDOFF_PATTERN.fullmatch(resolved.name)
+            or handoff.is_symlink()
+            or _is_reparse_point(handoff)
+            or not handoff.is_dir()
+        ):
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+        items = tuple(handoff.iterdir())
+        if frozenset(item.name for item in items) != HANDOFF_FILES:
+            raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+        for item in items:
+            if (
+                item.parent != handoff
+                or item.is_symlink()
+                or _is_reparse_point(item)
+                or not item.is_file()
+                or not 0 < item.stat().st_size <= MAX_HANDOFF_FILE_BYTES
+            ):
+                raise PostgreSQLTLSServiceError(phase=E_CLEANUP)
+    except (OSError, RuntimeError) as error:
+        raise PostgreSQLTLSServiceError(phase=E_CLEANUP) from error
     shutil.rmtree(resolved)
 
 
