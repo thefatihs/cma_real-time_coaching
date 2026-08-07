@@ -13,7 +13,7 @@ import json
 from math import isfinite
 import socket
 from struct import Struct
-from threading import Lock
+from threading import Lock, Thread, current_thread
 from typing import Final, TypeAlias
 
 from app.audio_ingress.local_microphone import (
@@ -635,6 +635,7 @@ class LocalhostMicrophoneRelayReceiver:
         )
         self._listener: socket.socket | None = None
         self._client: socket.socket | None = None
+        self._worker: Thread | None = None
         self._client_lock = Lock()
         self._client_active = False
         self._closed = False
@@ -657,10 +658,17 @@ class LocalhostMicrophoneRelayReceiver:
         with self._client_lock:
             return self._client_active
 
+    @property
+    def worker_active(self) -> bool:
+        worker = self._worker
+        return worker is not None and worker.is_alive()
+
     def start(self) -> tuple[str, int]:
         if not self._enabled:
             raise PermissionError(RelayReason.RECEIVER_DISABLED.value)
         if self._closed:
+            raise RuntimeError(RelayReason.TERMINAL_STATE.value)
+        if self.state is not RelaySessionState.AWAIT_START:
             raise RuntimeError(RelayReason.TERMINAL_STATE.value)
         if self._listener is not None:
             address = self.listening_address
@@ -688,7 +696,30 @@ class LocalhostMicrophoneRelayReceiver:
         except TimeoutError:
             self._fail(RelayReason.IO_TIMEOUT)
             return
-        self.serve_connected_socket(client)
+        except OSError:
+            if not self._closed:
+                self._fail(RelayReason.CONNECTION_CLOSED)
+            return
+        try:
+            self.serve_connected_socket(client)
+        finally:
+            self.stop_listening()
+
+    def start_background(self) -> tuple[str, int]:
+        address = self.start()
+        worker = self._worker
+        if worker is not None:
+            if worker.is_alive():
+                return address
+            raise RuntimeError(RelayReason.TERMINAL_STATE.value)
+        worker = Thread(
+            target=self.serve_once,
+            name="local-microphone-relay",
+            daemon=True,
+        )
+        self._worker = worker
+        worker.start()
+        return address
 
     def serve_connected_socket(self, client: socket.socket) -> None:
         if not self._enabled or self._closed:
@@ -769,13 +800,19 @@ class LocalhostMicrophoneRelayReceiver:
         if self._closed:
             return
         self._closed = True
+        self.stop_listening()
+        self._release_session(LocalMicrophoneTerminalReason.RESOURCE_CLOSED)
+
+    def stop_listening(self) -> None:
         listener, self._listener = self._listener, None
         client, self._client = self._client, None
         if listener is not None:
             listener.close()
         if client is not None:
             client.close()
-        self._release_session(LocalMicrophoneTerminalReason.RESOURCE_CLOSED)
+        worker = self._worker
+        if worker is not None and worker is not current_thread():
+            worker.join(timeout=self._io_timeout_seconds)
 
     def _admit(
         self,

@@ -90,6 +90,8 @@ class _RecordingStreamlit:
         self.writes: list[str] = []
         self.metrics: list[tuple[str, ...]] = []
         self.markdown_kwargs: list[dict[str, object]] = []
+        self.text_inputs: list[tuple[str, str, dict[str, object]]] = []
+        self.codes: list[str] = []
         self.toggle_values: dict[str, bool] = {}
         self.button_values: dict[str, list[bool]] = {}
         self.rerun_scopes: list[str | None] = []
@@ -139,9 +141,13 @@ class _RecordingStreamlit:
         key: str | None = None,
         **_kwargs: object,
     ) -> str:
+        self.text_inputs.append((_label, value, dict(_kwargs)))
         if key is not None:
             self.session_state[key] = value
         return value
+
+    def code(self, value: object, **_kwargs: object) -> None:
+        self.codes.append(str(value))
 
     def radio(self, _label: str, options: tuple[str, ...], **_kwargs: object) -> str:
         return options[0]
@@ -1804,6 +1810,175 @@ def test_microphone_start_action_is_retained_before_fragment_rerun(
 
     assert recorder.session_state["local_mic_call_active"] is True
     assert recorder.rerun_scopes == ["fragment"]
+
+
+def test_ssh_relay_source_requires_both_default_off_development_gates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _load_dashboard_app(monkeypatch, _RecordingStreamlit())
+    local_gate = {"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"}
+    relay_gate = {app._SSH_MIC_RELAY_GATE_ENVIRONMENT_KEY: "1"}
+
+    assert not app._ssh_microphone_relay_enabled(
+        server_address="127.0.0.1",
+        environment={},
+    )
+    assert not app._ssh_microphone_relay_enabled(
+        server_address="127.0.0.1",
+        environment=local_gate,
+    )
+    assert not app._ssh_microphone_relay_enabled(
+        server_address="127.0.0.1",
+        environment=relay_gate,
+    )
+    assert app._ssh_microphone_relay_enabled(
+        server_address="127.0.0.1",
+        environment={**local_gate, **relay_gate},
+    )
+    assert not app._ssh_microphone_relay_enabled(
+        server_address="0.0.0.0",
+        environment={**local_gate, **relay_gate},
+    )
+    assert app._SSH_MIC_RELAY_SOURCE not in app._local_source_options(
+        local_microphone_gate=True,
+        ssh_microphone_relay_gate=False,
+    )
+    assert app._SSH_MIC_RELAY_SOURCE in app._local_source_options(
+        local_microphone_gate=True,
+        ssh_microphone_relay_gate=True,
+    )
+
+
+def test_ssh_relay_explicit_start_creates_memory_only_fresh_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    recorder.button_values["SSH mikrofon relay testini başlat"] = [True]
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-relay")
+    monkeypatch.setattr(app, "_retained_execution_resource", lambda _runtime: None)
+    monkeypatch.setattr(
+        app,
+        "_local_microphone_resource",
+        lambda _runtime: pytest.fail("listener must not start before fragment rerun"),
+    )
+
+    assert (
+        app._render_local_microphone_controls(
+            local=state,
+            selection=DashboardServiceSelection(False, False),
+            availability=ArtifactAvailability(True),
+            relay_mode=True,
+        )
+        is None
+    )
+
+    context = cast(Any, recorder.session_state[app._SSH_MIC_RELAY_SESSION_KEY])
+    assert isinstance(context, app._SSHMicrophoneRelayContext)
+    assert context.receiver is None
+    assert context.token
+    assert context.stream_id.startswith("ssh-relay-")
+    assert context.token not in repr(context)
+    assert recorder.rerun_scopes == ["fragment"]
+    replacement = app._new_ssh_microphone_relay_context()
+    assert replacement.token != context.token
+    assert replacement.stream_id != context.stream_id
+
+
+def test_ssh_relay_receiver_is_retained_once_and_session_cleanup_owns_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-relay")
+    resource = app.DashboardExecutionResource(
+        app.DashboardExecutionIdentity("tenant_alpha", "call-relay"),
+        integration=None,
+    )
+    session = app.LocalMicrophoneIngressSession(
+        capability=app.create_local_mic_test_capability(
+            tenant_id="tenant_alpha",
+            call_id="call-relay",
+            resource=resource,
+            server_address="127.0.0.1",
+            environment={"CALLMETRIC_DASHBOARD_LOCAL_MIC_TEST": "1"},
+        ),
+        resource=resource,
+        provider_stream_id="relay-stream",
+    )
+    resource.attach_microphone_session(session)
+    context = app._SSHMicrophoneRelayContext(
+        stream_id="relay-stream",
+        token="synthetic-relay-token-00000001",
+    )
+    created: list[Any] = []
+
+    class FakeReceiver:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.started = 0
+            self.closed = 0
+            self.state = app.RelaySessionState.AWAIT_START
+            self.worker_active = False
+            created.append(self)
+
+        def start_background(self) -> tuple[str, int]:
+            self.started += 1
+            self.worker_active = True
+            return "127.0.0.1", 18_765
+
+        def close(self) -> None:
+            self.closed += 1
+            self.worker_active = False
+
+    monkeypatch.setattr(app, "LocalhostMicrophoneRelayReceiver", FakeReceiver)
+
+    first = app._ensure_ssh_microphone_relay_receiver(
+        local=state,
+        resource=resource,
+        session=session,
+        context=context,
+    )
+    second = app._ensure_ssh_microphone_relay_receiver(
+        local=state,
+        resource=resource,
+        session=session,
+        context=context,
+    )
+
+    assert first is second
+    assert len(created) == 1
+    assert first.started == 1
+    assert first.kwargs["port"] == 18_765
+    session.close()
+    session.close()
+    assert first.closed == 1
+
+
+def test_ssh_relay_details_mask_token_and_render_no_secret_in_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-relay")
+    context = app._SSHMicrophoneRelayContext(
+        stream_id="relay-stream",
+        token="synthetic-relay-token-00000001",
+    )
+
+    app._render_ssh_microphone_relay_details(
+        local=state,
+        context=context,
+        receiver=None,
+    )
+
+    token_inputs = [
+        item for item in recorder.text_inputs if item[0] == "Ephemeral relay token"
+    ]
+    assert token_inputs[0][2]["type"] == "password"
+    assert context.token not in "\n".join(recorder.codes)
+    assert "127.0.0.1:18765" in recorder.codes[0]
+    assert "<gpu-ssh-alias>" in recorder.codes[0]
 
 
 def test_local_microphone_model_preparation_failure_is_visible_and_revokes_once(

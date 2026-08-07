@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -416,6 +416,7 @@ class LocalMicrophoneIngressSession:
         self._terminal_status: LocalMicrophoneStatus | None = None
         self._end_emitted = False
         self._closed = False
+        self._transport_closer: Callable[[], None] | None = None
 
     @property
     def capability(self) -> LocalMicTestCapability:
@@ -1047,6 +1048,26 @@ class LocalMicrophoneIngressSession:
                 self._condition.wait(timeout=remaining)
             return self._status is LocalMicrophoneStatus.PAUSED
 
+    def attach_transport_closer(
+        self,
+        closer: Callable[[], None],
+        *,
+        resource: object,
+    ) -> None:
+        """Bind one transport lifetime to this retained call session."""
+        if not callable(closer):
+            raise ValueError("invalid_local_microphone_transport_closer")
+        with self._condition:
+            self._require_resource(resource)
+            if self._closed:
+                raise RuntimeError("local_microphone_session_closed")
+            if (
+                self._transport_closer is not None
+                and self._transport_closer is not closer
+            ):
+                raise RuntimeError("local_microphone_transport_already_attached")
+            self._transport_closer = closer
+
     def resume_capture(
         self,
         capability: LocalMicTestCapability,
@@ -1439,6 +1460,7 @@ class LocalMicrophoneIngressSession:
         self._capability.revoke()
 
     def _cancel(self, reason: LocalMicrophoneTerminalReason) -> None:
+        transport_closer: Callable[[], None] | None = None
         with self._condition:
             if self._closed:
                 return
@@ -1467,7 +1489,11 @@ class LocalMicrophoneIngressSession:
             else:
                 self._end_emitted = True
                 self._capability.revoke()
+            transport_closer = self._transport_closer
+            self._transport_closer = None
             self._condition.notify_all()
+        if transport_closer is not None:
+            transport_closer()
 
     def _event(
         self,

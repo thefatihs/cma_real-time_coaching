@@ -1,9 +1,10 @@
 """Professional synthetic and opt-in local-file coaching dashboard."""
 
 import os
+import secrets
 import sys
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Event
 from time import perf_counter
@@ -30,6 +31,11 @@ from app.audio_ingress.local_microphone import (  # noqa: E402
     LocalMicrophoneTranscriptRejectionReason,
     create_local_mic_test_capability,
     local_microphone_test_enabled,
+)
+from app.audio_ingress.tcp_microphone_relay import (  # noqa: E402
+    RELAY_LOOPBACK_HOST,
+    LocalhostMicrophoneRelayReceiver,
+    RelaySessionState,
 )
 from app.classification.runtime import RuntimeSetFitClassifier  # noqa: E402
 from app.classification.streaming import ProvisionalClassificationPolicy  # noqa: E402
@@ -137,10 +143,22 @@ _RAG_RUNTIME_STATUS_NOT_AVAILABLE = object()
 _LOCAL_MIC_CALL_ACTIVE_SESSION_KEY = "local_mic_call_active"
 _LOCAL_MIC_FINISH_PENDING_SESSION_KEY = "local_mic_finish_pending"
 _LOCAL_MIC_ASR_PROFILE_ENVIRONMENT_KEY = "CALLMETRIC_LOCAL_MIC_ASR_PROFILE"
+_SSH_MIC_RELAY_GATE_ENVIRONMENT_KEY = "CALLMETRIC_DASHBOARD_SSH_MIC_RELAY_TEST"
+_SSH_MIC_RELAY_SESSION_KEY = "dashboard_ssh_microphone_relay"
+_SSH_MIC_RELAY_SOURCE = "SSH Mikrofon Relay — Geliştirme Testi"
+_LOCAL_MIC_SOURCE = "Tek konuşmacılı mikrofon testi"
+_SSH_MIC_RELAY_PORT = 18_765
 _UPLOADED_ASR_PROFILE_ENVIRONMENT_KEY = "CALLMETRIC_UPLOADED_ASR_PROFILE"
 _LOCAL_MIC_ASR_CPU_THREADS = 4
 _LOCAL_MIC_ASR_ROLLING_WINDOW_SECONDS = 6.0
 _LOCAL_MIC_ASR_STABLE_REGION_SECONDS = 2.0
+_SSH_TUNNEL_COMMAND = """ssh -N -T \\
+  -o ExitOnForwardFailure=yes \\
+  -o ServerAliveInterval=30 \\
+  -o ServerAliveCountMax=3 \\
+  -L 127.0.0.1:8502:127.0.0.1:8502 \\
+  -L 127.0.0.1:18765:127.0.0.1:18765 \\
+  <gpu-ssh-alias>"""
 _EXECUTION_STAGE_TEXT = {
     DashboardExecutionStage.PREPARING_MODEL: (
         "Konuşma modeli hazırlanıyor; henüz konuşmayın"
@@ -190,6 +208,73 @@ _EXECUTION_STAGE_TEXT = {
     DashboardExecutionStage.CANCELLED: "Analiz durduruldu",
     DashboardExecutionStage.FAILED: "Analiz başarısız",
 }
+
+
+@dataclass(slots=True)
+class _SSHMicrophoneRelayContext:
+    stream_id: str
+    token: str = field(repr=False)
+    receiver: LocalhostMicrophoneRelayReceiver | None = field(
+        default=None,
+        repr=False,
+    )
+
+    def close(self) -> None:
+        receiver, self.receiver = self.receiver, None
+        if receiver is not None:
+            receiver.close()
+
+
+def _ssh_microphone_relay_enabled(
+    *,
+    server_address: str | None,
+    environment: Mapping[str, str] | None = None,
+) -> bool:
+    source = os.environ if environment is None else environment
+    return source.get(
+        _SSH_MIC_RELAY_GATE_ENVIRONMENT_KEY
+    ) == "1" and local_microphone_test_enabled(
+        server_address=server_address,
+        environment=source,
+    )
+
+
+def _is_microphone_source(source_mode: str) -> bool:
+    return source_mode in {_LOCAL_MIC_SOURCE, _SSH_MIC_RELAY_SOURCE}
+
+
+def _local_source_options(
+    *,
+    local_microphone_gate: bool,
+    ssh_microphone_relay_gate: bool,
+) -> tuple[str, ...]:
+    values = ["Dosya yükle", "Yerel yol"]
+    if local_microphone_gate:
+        values.append(_LOCAL_MIC_SOURCE)
+    if ssh_microphone_relay_gate:
+        values.append(_SSH_MIC_RELAY_SOURCE)
+    return tuple(values)
+
+
+def _new_ssh_microphone_relay_context() -> _SSHMicrophoneRelayContext:
+    return _SSHMicrophoneRelayContext(
+        stream_id=f"ssh-relay-{secrets.token_hex(16)}",
+        token=secrets.token_urlsafe(32),
+    )
+
+
+def _ssh_microphone_relay_context() -> _SSHMicrophoneRelayContext | None:
+    value = st.session_state.get(_SSH_MIC_RELAY_SESSION_KEY)
+    return value if isinstance(value, _SSHMicrophoneRelayContext) else None
+
+
+def _close_ssh_microphone_relay_context() -> None:
+    value = st.session_state.pop(_SSH_MIC_RELAY_SESSION_KEY, None)
+    st.session_state.pop("ssh_microphone_relay_token", None)
+    if isinstance(value, _SSHMicrophoneRelayContext):
+        value.close()
+
+
 _EXECUTION_MODE_TEXT = {
     DashboardExecutionMode.FAST_ANALYSIS: "Hızlı analiz",
     DashboardExecutionMode.REALTIME_SIMULATION: "Gerçek zaman simülasyonu",
@@ -619,6 +704,7 @@ def _execution_resource(runtime: DashboardRuntime) -> DashboardExecutionResource
 
 
 def _close_execution_resource() -> None:
+    _close_ssh_microphone_relay_context()
     st.session_state.pop(_RAG_RUNTIME_STATUS_SESSION_KEY, None)
     key = st.session_state.pop(_EXECUTION_RESOURCE_SESSION_KEY, None)
     if key is None:
@@ -703,6 +789,8 @@ def _local_microphone_resource(
 def _local_microphone_session(
     runtime: DashboardRuntime,
     resource: DashboardExecutionResource,
+    *,
+    provider_stream_id: str | None = None,
 ) -> LocalMicrophoneIngressSession:
     existing = resource.microphone_session
     if existing is not None:
@@ -710,6 +798,7 @@ def _local_microphone_session(
     session = LocalMicrophoneIngressSession(
         capability=_local_microphone_capability(runtime, resource),
         resource=resource,
+        provider_stream_id=provider_stream_id,
     )
     resource.attach_microphone_session(session)
     return session
@@ -1124,6 +1213,9 @@ def _request_local_microphone_finish(
         LocalMicrophoneStatus.STOP_REQUESTED,
         LocalMicrophoneStatus.COMPLETED,
     }:
+        relay_context = _ssh_microphone_relay_context()
+        if relay_context is not None and relay_context.receiver is not None:
+            relay_context.receiver.stop_listening()
         st.session_state[_LOCAL_MIC_FINISH_PENDING_SESSION_KEY] = True
         st.session_state.local_mic_desired_playing = False
         return True
@@ -1308,11 +1400,107 @@ def _local_microphone_audio_diagnostic_message(
     return None
 
 
+def _ensure_ssh_microphone_relay_receiver(
+    *,
+    local: LocalExecutionState,
+    resource: DashboardExecutionResource,
+    session: LocalMicrophoneIngressSession,
+    context: _SSHMicrophoneRelayContext,
+) -> LocalhostMicrophoneRelayReceiver:
+    if context.receiver is not None:
+        return context.receiver
+    receiver = LocalhostMicrophoneRelayReceiver(
+        session=session,
+        resource=resource,
+        expected_token=context.token,
+        tenant_id=local.runtime.call_state.tenant_id,
+        call_id=local.runtime.call_id,
+        stream_id=context.stream_id,
+        resume_capability_factory=lambda: _local_microphone_capability(
+            local.runtime,
+            resource,
+        ),
+        enabled=True,
+        port=_SSH_MIC_RELAY_PORT,
+    )
+    session.attach_transport_closer(receiver.close, resource=resource)
+    try:
+        receiver.start_background()
+    except Exception:
+        receiver.close()
+        raise
+    context.receiver = receiver
+    return receiver
+
+
+def _render_ssh_microphone_relay_details(
+    *,
+    local: LocalExecutionState,
+    context: _SSHMicrophoneRelayContext,
+    receiver: LocalhostMicrophoneRelayReceiver | None,
+) -> None:
+    status = "Konuşma modeli hazırlanıyor"
+    if receiver is not None:
+        status = {
+            RelaySessionState.AWAIT_START: "Relay bağlantısı bekleniyor",
+            RelaySessionState.STREAMING: "Relay üzerinden canlı ses alınıyor",
+            RelaySessionState.PAUSED: "Relay yakalama duraklatıldı",
+            RelaySessionState.ENDED: "Relay oturumu tamamlandı",
+            RelaySessionState.FAILED: "Relay oturumu başarısız",
+        }[receiver.state]
+    st.info(status)
+    _metric_rows(
+        (
+            StatusCardViewModel("Relay adresi", RELAY_LOOPBACK_HOST),
+            StatusCardViewModel("Relay portu", str(_SSH_MIC_RELAY_PORT)),
+            StatusCardViewModel(
+                "Relay worker",
+                "Çalışıyor"
+                if receiver is not None and receiver.worker_active
+                else "Kapalı",
+            ),
+        )
+    )
+    st.text_input(
+        "tenant_id",
+        value=local.runtime.call_state.tenant_id,
+        disabled=True,
+        key="ssh_microphone_relay_tenant",
+    )
+    st.text_input(
+        "call_id",
+        value=local.runtime.call_id,
+        disabled=True,
+        key="ssh_microphone_relay_call",
+    )
+    st.text_input(
+        "stream_id",
+        value=context.stream_id,
+        disabled=True,
+        key="ssh_microphone_relay_stream",
+    )
+    st.text_input(
+        "Ephemeral relay token",
+        value=context.token,
+        type="password",
+        disabled=True,
+        key="ssh_microphone_relay_token",
+    )
+    st.caption("Token yalnızca bu geliştirme çağrısı için bellekte tutulur.")
+    st.code(_SSH_TUNNEL_COMMAND, language="bash")
+    st.caption(
+        "Windows istemcisi: uv run streamlit run "
+        "scripts/run_local_microphone_relay_client.py "
+        "--server.address 127.0.0.1 --server.port 8503"
+    )
+
+
 def _render_local_microphone_controls(
     *,
     local: LocalExecutionState,
     selection: DashboardServiceSelection,
     availability: ArtifactAvailability,
+    relay_mode: bool = False,
 ) -> tuple[DashboardExecutionResource, LocalMicrophoneIngressSession] | None:
     """Render the retained WebRTC component in the same fragment as polling."""
     try:
@@ -1343,12 +1531,25 @@ def _render_local_microphone_controls(
             call_active = _retained_execution_resource(local.runtime) is not None
             st.session_state[_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY] = call_active
         if call_active is not True:
-            st.info("Yerel mikrofon testi başlatılmayı bekliyor")
+            st.info(
+                "SSH relay testi başlatılmayı bekliyor"
+                if relay_mode
+                else "Yerel mikrofon testi başlatılmayı bekliyor"
+            )
             if st.button(
-                "Mikrofon testini başlat",
+                (
+                    "SSH mikrofon relay testini başlat"
+                    if relay_mode
+                    else "Mikrofon testini başlat"
+                ),
                 type="primary",
                 use_container_width=True,
             ):
+                if relay_mode:
+                    _close_ssh_microphone_relay_context()
+                    st.session_state[_SSH_MIC_RELAY_SESSION_KEY] = (
+                        _new_ssh_microphone_relay_context()
+                    )
                 st.session_state[_LOCAL_MIC_CALL_ACTIVE_SESSION_KEY] = True
                 st.session_state.pop(_LOCAL_MIC_FINISH_PENDING_SESSION_KEY, None)
                 st.session_state.pop("local_mic_desired_playing", None)
@@ -1356,7 +1557,18 @@ def _render_local_microphone_controls(
             return None
 
         resource = _local_microphone_resource(local.runtime)
-        session = _local_microphone_session(local.runtime, resource)
+        relay_context = _ssh_microphone_relay_context() if relay_mode else None
+        if relay_mode and relay_context is None:
+            raise RuntimeError("ssh_microphone_relay_context_missing")
+        session = (
+            _local_microphone_session(
+                local.runtime,
+                resource,
+                provider_stream_id=relay_context.stream_id,
+            )
+            if relay_context is not None
+            else _local_microphone_session(local.runtime, resource)
+        )
         if resource.latest_snapshot is None:
             _start_local_microphone_worker(
                 local=local,
@@ -1372,6 +1584,30 @@ def _render_local_microphone_controls(
             DashboardExecutionStatus.CANCELLED,
             DashboardExecutionStatus.FAILED,
         }
+        relay_receiver = None
+        if (
+            relay_context is not None
+            and diagnostics.asr_readiness
+            in {
+                LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+                LocalMicrophoneASRReadiness.STREAMING,
+            }
+            and not terminal_snapshot
+        ):
+            relay_receiver = _ensure_ssh_microphone_relay_receiver(
+                local=local,
+                resource=resource,
+                session=session,
+                context=relay_context,
+            )
+        elif relay_context is not None:
+            relay_receiver = relay_context.receiver
+        if relay_context is not None:
+            _render_ssh_microphone_relay_details(
+                local=local,
+                context=relay_context,
+                receiver=relay_receiver,
+            )
         finish_pending = st.session_state.get(
             _LOCAL_MIC_FINISH_PENDING_SESSION_KEY,
             False,
@@ -1497,17 +1733,18 @@ def _render_local_microphone_controls(
                     "Son güvenli ret nedeni: "
                     f"{diagnostics.latest_transcript_rejection_reason.value}"
                 )
-            if st.button(
-                "Mikrofonu yeniden başlat",
-                disabled=diagnostics.status is LocalMicrophoneStatus.PAUSING,
-                use_container_width=True,
-            ):
-                session.resume_capture(
-                    _local_microphone_capability(local.runtime, resource),
-                    resource=resource,
-                )
-                st.session_state.local_mic_desired_playing = True
-                st.rerun(scope="fragment")
+            if not relay_mode:
+                if st.button(
+                    "Mikrofonu yeniden başlat",
+                    disabled=diagnostics.status is LocalMicrophoneStatus.PAUSING,
+                    use_container_width=True,
+                ):
+                    session.resume_capture(
+                        _local_microphone_capability(local.runtime, resource),
+                        resource=resource,
+                    )
+                    st.session_state.local_mic_desired_playing = True
+                    st.rerun(scope="fragment")
             if st.button("Görüşmeyi bitir", use_container_width=True):
                 if _request_local_microphone_finish(session, resource):
                     st.rerun(scope="fragment")
@@ -1522,11 +1759,12 @@ def _render_local_microphone_controls(
             LocalMicrophoneStatus.RECONNECTING,
         }:
             desired_playing_state = True
-        microphone_webrtc_streamer(
-            session=session,
-            key=session.component_key,
-            desired_playing_state=desired_playing_state,
-        )
+        if not relay_mode:
+            microphone_webrtc_streamer(
+                session=session,
+                key=session.component_key,
+                desired_playing_state=desired_playing_state,
+            )
         connection = local_microphone_connection_view(session)
         st.info(connection.status_text)
         diagnostic_cards: list[StatusCardViewModel] = [
@@ -1580,10 +1818,11 @@ def _render_local_microphone_controls(
                 "Son güvenli ret nedeni: "
                 f"{diagnostics.latest_transcript_rejection_reason.value}"
             )
-        if st.button("Mikrofonu duraklat", use_container_width=True):
-            session.pause_capture(resource=resource)
-            st.session_state.local_mic_desired_playing = False
-            st.rerun(scope="fragment")
+        if not relay_mode:
+            if st.button("Mikrofonu duraklat", use_container_width=True):
+                session.pause_capture(resource=resource)
+                st.session_state.local_mic_desired_playing = False
+                st.rerun(scope="fragment")
         if st.button("Görüşmeyi bitir", use_container_width=True):
             if _request_local_microphone_finish(session, resource):
                 st.rerun(scope="fragment")
@@ -2280,6 +2519,13 @@ local_microphone_gate = local_microphone_test_enabled(
         else None
     )
 )
+ssh_microphone_relay_gate = _ssh_microphone_relay_enabled(
+    server_address=(
+        configured_server_address
+        if isinstance(configured_server_address, str)
+        else None
+    )
+)
 with st.sidebar:
     st.header("Kontroller")
     with st.expander("Görüşme", expanded=True):
@@ -2311,9 +2557,10 @@ with st.sidebar:
             )
             st.slider("Oynatma hızı", 0.5, 2.0, 1.0, 0.5, key="playback_speed")
         else:
-            local_source_options = ["Dosya yükle", "Yerel yol"]
-            if local_microphone_gate:
-                local_source_options.append("Tek konuşmacılı mikrofon testi")
+            local_source_options = _local_source_options(
+                local_microphone_gate=local_microphone_gate,
+                ssh_microphone_relay_gate=ssh_microphone_relay_gate,
+            )
             source_mode = st.radio(
                 "Ses kaynağı", tuple(local_source_options), horizontal=True
             )
@@ -2357,10 +2604,13 @@ with st.sidebar:
                     "Yerel ses dosyası yolu",
                     type="password",
                 )
-            else:
+            elif source_mode == _LOCAL_MIC_SOURCE:
                 for warning_line in LOCAL_MIC_WARNING_LINES:
                     st.warning(warning_line)
-            if source_mode != "Tek konuşmacılı mikrofon testi":
+            else:
+                st.warning("Yalnızca yerel geliştirme ve SSH tüneli testi")
+                st.warning("Relay portu yalnızca 127.0.0.1 üzerinde dinlenir")
+            if not _is_microphone_source(source_mode):
                 playback_mode = st.radio(
                     "Oynatma", ("Hızlı analiz", "Gerçek zaman simülasyonu")
                 )
@@ -2418,7 +2668,7 @@ with st.sidebar:
             else _local_state()
         )
         local_state_for_render = local
-        if source_mode != "Tek konuşmacılı mikrofon testi":
+        if not _is_microphone_source(source_mode):
             st.warning("CPU çıkarımı gerçek zamandan daha yavaş olabilir.")
         retained_before_start = _retained_execution_resource(local.runtime)
         running_before_start = (
@@ -2427,7 +2677,7 @@ with st.sidebar:
             and retained_before_start.latest_snapshot.lifecycle_status
             is DashboardExecutionStatus.RUNNING
         )
-        if source_mode != "Tek konuşmacılı mikrofon testi" and st.button(
+        if not _is_microphone_source(source_mode) and st.button(
             "Başlat",
             type="primary",
             use_container_width=True,
@@ -2725,7 +2975,7 @@ with st.sidebar:
                     local.stage = "Başarısız"
                     local.error_message = "Ses işleme güvenli biçimde tamamlanamadı."
                     st.error(local.error_message)
-        if source_mode != "Tek konuşmacılı mikrofon testi" and st.button(
+        if not _is_microphone_source(source_mode) and st.button(
             "Durdur",
             disabled=not (local.stop_enabled or running_before_start),
             use_container_width=True,
@@ -2733,7 +2983,7 @@ with st.sidebar:
             retained = _retained_execution_resource(local.runtime)
             if retained is not None:
                 retained.cancel()
-        if source_mode != "Tek konuşmacılı mikrofon testi" and st.button(
+        if not _is_microphone_source(source_mode) and st.button(
             "Sıfırla", use_container_width=True
         ):
             _close_execution_resource()
@@ -2776,7 +3026,8 @@ else:
     retained_snapshot = (
         None if retained_resource is None else retained_resource.latest_snapshot
     )
-    local_microphone_source = source_mode == "Tek konuşmacılı mikrofon testi"
+    local_microphone_source = _is_microphone_source(source_mode)
+    ssh_microphone_relay_source = source_mode == _SSH_MIC_RELAY_SOURCE
     polling_interval = (
         0.5
         if local_microphone_source
@@ -2796,6 +3047,7 @@ else:
                     local=render_local_state,
                     selection=service_selection,
                     availability=artifact_availability,
+                    relay_mode=ssh_microphone_relay_source,
                 )
         resource = _retained_execution_resource(render_local_state.runtime)
         snapshot = None if resource is None else resource.latest_snapshot
