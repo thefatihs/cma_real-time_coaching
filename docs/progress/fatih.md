@@ -364,3 +364,13 @@ This log uses local chronological numbering and records only Fatih-owned work.
   POSIX-only vLLM controller failures.
 - Next planned step: run the preflight on the Linux CUDA demo host after its
   model caches and feature gates are provisioned.
+
+## Platform-independent model directory checksum
+
+- Canonicalized model file ordering by relative POSIX path with an exact-case
+  tie-breaker, preserving the trusted Windows checksum across platforms.
+- Changed files: classification calibration, synthetic focused tests, and this
+  progress file.
+- Tests: focused calibration and threshold-profile tests 20 passed. Ruff,
+  formatting, and focused Pyright passed.
+- Next planned step: confirm the trusted checksum on the Linux model host.

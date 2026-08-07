@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,10 +8,12 @@ import pytest
 from app.classification.artifacts import MODEL_ID, TrainingArtifactMetadata
 from app.classification.calibration import (
     CalibrationConfiguration,
+    _canonical_posix_path_sort_key,
     calibrate_probabilities,
     calibrate_validation_model,
     save_calibration_report,
     select_threshold,
+    sha256_directory,
 )
 from app.classification.dataset import (
     ClassificationDataset,
@@ -20,6 +23,47 @@ from app.classification.encoding import MultiLabelEncoder
 from app.classification.models import ClassificationExample, DatasetSplit
 
 CHECKSUM = "a" * 64
+
+
+def test_directory_checksum_uses_canonical_mixed_case_posix_order(
+    tmp_path: Path,
+) -> None:
+    files = {
+        "README.md": b"readme",
+        "config.json": b"config",
+        "subdir/Alpha.txt": b"alpha",
+        "subdir/beta.txt": b"beta",
+    }
+    for relative_path, content in reversed(tuple(files.items())):
+        destination = tmp_path / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+
+    expected = hashlib.sha256()
+    canonical_paths = sorted(files, key=_canonical_posix_path_sort_key)
+    assert canonical_paths == [
+        "config.json",
+        "README.md",
+        "subdir/Alpha.txt",
+        "subdir/beta.txt",
+    ]
+    for relative_path in canonical_paths:
+        encoded_path = relative_path.encode()
+        expected.update(len(encoded_path).to_bytes(8, "big"))
+        expected.update(encoded_path)
+        expected.update(files[relative_path])
+
+    assert sha256_directory(tmp_path) == expected.hexdigest()
+
+
+def test_canonical_posix_order_has_exact_case_tie_breaker() -> None:
+    paths = ("readme.MD", "README.md", "weights/model.bin")
+
+    assert sorted(paths, key=_canonical_posix_path_sort_key) == [
+        "README.md",
+        "readme.MD",
+        "weights/model.bin",
+    ]
 
 
 def test_best_f1_and_deterministic_tie_select_higher_threshold() -> None:

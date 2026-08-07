@@ -267,17 +267,28 @@ def sha256_directory(path: str | Path) -> str:
     if not root.is_dir():
         raise ValueError("model directory does not exist")
     digest = hashlib.sha256()
-    files = sorted(item for item in root.rglob("*") if item.is_file())
+    files = sorted(
+        (
+            (item.relative_to(root).as_posix(), item)
+            for item in root.rglob("*")
+            if item.is_file()
+        ),
+        key=lambda entry: _canonical_posix_path_sort_key(entry[0]),
+    )
     if not files:
         raise ValueError("model directory contains no files")
-    for item in files:
-        relative = item.relative_to(root).as_posix().encode()
+    for relative_path, item in files:
+        relative = relative_path.encode()
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
         with item.open("rb") as source:
             for block in iter(lambda: source.read(65536), b""):
                 digest.update(block)
     return digest.hexdigest()
+
+
+def _canonical_posix_path_sort_key(relative_path: str) -> tuple[str, str]:
+    return relative_path.lower(), relative_path
 
 
 def _candidate_metrics(
