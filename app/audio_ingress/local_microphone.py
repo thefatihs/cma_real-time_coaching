@@ -12,6 +12,7 @@ from hashlib import sha256
 from ipaddress import ip_address
 from math import isfinite, sqrt
 from threading import Condition, Event, RLock
+from time import monotonic
 from typing import Never, Protocol, runtime_checkable
 from uuid import uuid4
 
@@ -866,7 +867,98 @@ class LocalMicrophoneIngressSession:
             if self._capability.active:
                 self._status = LocalMicrophoneStatus.STREAMING
             self._condition.notify_all()
-        return frame
+            return frame
+
+    def accept_validated_pcm(
+        self,
+        pcm_s16le: bytes,
+        *,
+        captured_at_utc: datetime,
+        arrived_at_utc: datetime | None = None,
+        capture_generation: int,
+    ) -> None:
+        """Admit already-normalized relay PCM through the existing boundary."""
+        now = _aware_utc(arrived_at_utc)
+        captured = _aware_utc(captured_at_utc)
+        with self._condition:
+            if capture_generation != self._capture_generation:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.STALE_CAPTURE_GENERATION
+                )
+                raise PermissionError("stale_local_microphone_capture_generation")
+            if self._asr_readiness not in {
+                LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+                LocalMicrophoneASRReadiness.STREAMING,
+            }:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.ASR_NOT_READY
+                )
+                raise RuntimeError("local_microphone_asr_not_ready")
+            if self._status in {
+                LocalMicrophoneStatus.PERMISSION_PENDING,
+                LocalMicrophoneStatus.RECONNECTING,
+            }:
+                self.start(arrived_at_utc=now)
+            try:
+                self._require_authorized()
+            except PermissionError:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.CAPABILITY_REVOKED
+                )
+                raise
+            if self._status not in {
+                LocalMicrophoneStatus.READY,
+                LocalMicrophoneStatus.STREAMING,
+            }:
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.CAPTURE_NOT_STREAMING
+                )
+                raise RuntimeError("local_microphone_session_not_streaming")
+            if (
+                not isinstance(pcm_s16le, bytes)
+                or not pcm_s16le
+                or len(pcm_s16le) > LOCAL_MIC_CHUNK_BYTES
+                or len(pcm_s16le) % 2
+            ):
+                self._record_audio_rejection(
+                    LocalMicrophoneAudioRejectionReason.NORMALIZATION_FAILED
+                )
+                raise ValueError("invalid_local_microphone_pcm")
+            self._callback_frame_count = _bounded_counter_increment(
+                self._callback_frame_count
+            )
+            self._input_sample_rate_hz = LOCAL_MIC_SAMPLE_RATE_HZ
+            self._input_channel_count = LOCAL_MIC_CHANNEL_COUNT
+            energy = _pcm_energy(
+                (
+                    _NormalizedAudio(
+                        pcm_s16le=pcm_s16le,
+                        media_time_seconds=None,
+                    ),
+                )
+            )
+            self._input_sample_count = min(
+                self._input_sample_count + energy.sample_count,
+                _MAX_LOCAL_MIC_AUDIO_VALUE_COUNT,
+            )
+            self._pre_resample_square_sum += energy.square_sum
+            self._pre_resample_peak = max(self._pre_resample_peak, energy.peak)
+            self._accumulate_output_energy(energy)
+            self._produced_pcm_byte_count = min(
+                self._produced_pcm_byte_count + len(pcm_s16le),
+                _MAX_LOCAL_MIC_AUDIO_VALUE_COUNT,
+            )
+            self._append_normalized(
+                _NormalizedAudio(
+                    pcm_s16le=pcm_s16le,
+                    media_time_seconds=None,
+                ),
+                arrived_at_utc=now,
+                captured_at_utc=captured,
+            )
+            if self._closed:
+                raise RuntimeError("local_microphone_ingress_rejected")
+            self._status = LocalMicrophoneStatus.STREAMING
 
     def _record_audio_rejection(
         self,
@@ -935,6 +1027,25 @@ class LocalMicrophoneIngressSession:
             arrived_at_utc=arrived_at_utc,
             flush=True,
         )
+
+    def wait_until_paused(
+        self,
+        *,
+        resource: object,
+        timeout_seconds: float,
+    ) -> bool:
+        """Wait boundedly for admitted audio to drain after a pause request."""
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("invalid_local_microphone_pause_timeout")
+        deadline = monotonic() + timeout_seconds
+        with self._condition:
+            self._require_resource(resource)
+            while self._status is LocalMicrophoneStatus.PAUSING:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(timeout=remaining)
+            return self._status is LocalMicrophoneStatus.PAUSED
 
     def resume_capture(
         self,
@@ -1226,15 +1337,17 @@ class LocalMicrophoneIngressSession:
         item: _NormalizedAudio,
         *,
         arrived_at_utc: datetime,
+        captured_at_utc: datetime | None = None,
     ) -> None:
         if not item.pcm_s16le:
             return
         if len(item.pcm_s16le) % 2:
             raise ValueError("incomplete_pcm16_frame")
-        capture_utc = self._estimated_capture_time(
+        capture_utc = captured_at_utc or self._estimated_capture_time(
             item.media_time_seconds,
             arrived_at_utc=arrived_at_utc,
         )
+        capture_utc = min(capture_utc, arrived_at_utc)
         offset = 0
         while offset < len(item.pcm_s16le):
             if not self._buffer:

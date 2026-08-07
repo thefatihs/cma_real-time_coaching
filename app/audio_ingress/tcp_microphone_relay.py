@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum, IntEnum
 from hashlib import sha256
 import hmac
 import json
 from math import isfinite
+import socket
 from struct import Struct
+from threading import Lock
 from typing import Final, TypeAlias
+
+from app.audio_ingress.local_microphone import (
+    LocalMicrophoneIngressSession,
+    LocalMicrophoneTerminalReason,
+    LocalMicTestCapability,
+)
 
 
 RELAY_MAGIC: Final = b"CMRL"
@@ -31,6 +39,10 @@ MAX_RELAY_DUPLICATE_HISTORY: Final = 64
 RELAY_CODEC_NAME: Final = "pcm_s16le"
 RELAY_SAMPLE_RATE_HZ: Final = 16_000
 RELAY_CHANNEL_COUNT: Final = 1
+RELAY_LOOPBACK_HOST: Final = "127.0.0.1"
+RELAY_BACKLOG: Final = 1
+RELAY_IO_TIMEOUT_SECONDS: Final = 5.0
+RELAY_RECV_BYTES: Final = 4_096
 
 
 class RelayMessageType(IntEnum):
@@ -98,6 +110,12 @@ class RelayReason(str, Enum):
     CONFLICTING_DUPLICATE = "conflicting_duplicate"
     TERMINAL_STATE = "terminal_state"
     BUFFER_LIMIT = "buffer_limit"
+    RECEIVER_DISABLED = "receiver_disabled"
+    INVALID_BIND = "invalid_bind"
+    CLIENT_ACTIVE = "client_active"
+    IO_TIMEOUT = "io_timeout"
+    CONNECTION_CLOSED = "connection_closed"
+    SESSION_REJECTED = "session_rejected"
 
 
 class MicrophoneRelayProtocolError(ValueError):
@@ -562,6 +580,295 @@ class BoundedMicrophoneRelayProtocol:
             self._state_machine.fail(error.reason)
             raise
         return tuple(self._state_machine.accept(record) for record in records)
+
+    def fail(self, reason: RelayReason) -> None:
+        self._state_machine.fail(reason)
+
+
+class LocalhostMicrophoneRelayReceiver:
+    """Own one loopback listener/client and adapt validated PCM to local ingress."""
+
+    def __init__(
+        self,
+        *,
+        session: LocalMicrophoneIngressSession,
+        resource: object,
+        expected_token: str,
+        tenant_id: str,
+        call_id: str,
+        stream_id: str,
+        resume_capability_factory: Callable[[], LocalMicTestCapability],
+        enabled: bool = False,
+        bind_host: str = RELAY_LOOPBACK_HOST,
+        port: int = 0,
+        io_timeout_seconds: float = RELAY_IO_TIMEOUT_SECONDS,
+        socket_factory: Callable[..., socket.socket] = socket.socket,
+    ) -> None:
+        if bind_host != RELAY_LOOPBACK_HOST:
+            raise ValueError(RelayReason.INVALID_BIND.value)
+        if type(port) is not int or not 0 <= port <= 65_535:
+            raise ValueError(RelayReason.INVALID_BIND.value)
+        if (
+            not isfinite(io_timeout_seconds)
+            or io_timeout_seconds <= 0
+            or io_timeout_seconds > RELAY_IO_TIMEOUT_SECONDS
+        ):
+            raise ValueError(RelayReason.IO_TIMEOUT.value)
+        if (
+            session.capability.tenant_id != tenant_id
+            or session.capability.call_id != call_id
+        ):
+            raise ValueError(RelayReason.SCOPE_MISMATCH.value)
+        self._session = session
+        self._resource = resource
+        self._resume_capability_factory = resume_capability_factory
+        self._enabled = enabled
+        self._bind_host = bind_host
+        self._port = port
+        self._io_timeout_seconds = io_timeout_seconds
+        self._socket_factory = socket_factory
+        self._protocol = BoundedMicrophoneRelayProtocol(
+            expected_token=expected_token,
+            tenant_id=tenant_id,
+            call_id=call_id,
+            stream_id=stream_id,
+        )
+        self._listener: socket.socket | None = None
+        self._client: socket.socket | None = None
+        self._client_lock = Lock()
+        self._client_active = False
+        self._closed = False
+        self._session_released = False
+
+    @property
+    def state(self) -> RelaySessionState:
+        return self._protocol.state
+
+    @property
+    def listening_address(self) -> tuple[str, int] | None:
+        listener = self._listener
+        if listener is None:
+            return None
+        host, port = listener.getsockname()[:2]
+        return str(host), int(port)
+
+    @property
+    def client_active(self) -> bool:
+        with self._client_lock:
+            return self._client_active
+
+    def start(self) -> tuple[str, int]:
+        if not self._enabled:
+            raise PermissionError(RelayReason.RECEIVER_DISABLED.value)
+        if self._closed:
+            raise RuntimeError(RelayReason.TERMINAL_STATE.value)
+        if self._listener is not None:
+            address = self.listening_address
+            assert address is not None
+            return address
+        listener = self._socket_factory(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.settimeout(self._io_timeout_seconds)
+            listener.bind((self._bind_host, self._port))
+            listener.listen(RELAY_BACKLOG)
+        except Exception:
+            listener.close()
+            raise RuntimeError(RelayReason.INVALID_BIND.value) from None
+        self._listener = listener
+        address = self.listening_address
+        assert address is not None
+        return address
+
+    def serve_once(self) -> None:
+        listener = self._listener
+        if listener is None:
+            raise RuntimeError(RelayReason.RECEIVER_DISABLED.value)
+        try:
+            client, _address = listener.accept()
+        except TimeoutError:
+            self._fail(RelayReason.IO_TIMEOUT)
+            return
+        self.serve_connected_socket(client)
+
+    def serve_connected_socket(self, client: socket.socket) -> None:
+        if not self._enabled or self._closed:
+            client.close()
+            raise PermissionError(RelayReason.RECEIVER_DISABLED.value)
+        with self._client_lock:
+            if self._client_active:
+                self._send_error(client, RelayReason.CLIENT_ACTIVE)
+                client.close()
+                return
+            self._client_active = True
+            self._client = client
+        try:
+            client.settimeout(self._io_timeout_seconds)
+            while self.state not in {
+                RelaySessionState.ENDED,
+                RelaySessionState.FAILED,
+            }:
+                try:
+                    data = client.recv(RELAY_RECV_BYTES)
+                except TimeoutError:
+                    self._fail(RelayReason.IO_TIMEOUT)
+                    self._send_error(client, RelayReason.IO_TIMEOUT)
+                    return
+                if not data:
+                    self._fail(RelayReason.CONNECTION_CLOSED)
+                    return
+                for response in self.process_bytes(data):
+                    client.sendall(response)
+        except OSError:
+            self._fail(RelayReason.CONNECTION_CLOSED)
+        finally:
+            client.close()
+            with self._client_lock:
+                if self._client is client:
+                    self._client = None
+                self._client_active = False
+
+    def process_bytes(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        arrived_at_utc: datetime | None = None,
+    ) -> tuple[bytes, ...]:
+        if self._closed:
+            return (self._error_record(0, RelayReason.TERMINAL_STATE),)
+        now = arrived_at_utc or datetime.now(UTC)
+        try:
+            acceptances = self._protocol.feed(data)
+        except MicrophoneRelayProtocolError as error:
+            self._fail(error.reason)
+            return (self._error_record(0, error.reason),)
+        responses: list[bytes] = []
+        for acceptance in acceptances:
+            sequence = (
+                acceptance.record.sequence_number
+                if acceptance.record is not None
+                else 0
+            )
+            if acceptance.status is RelayAcceptanceStatus.REJECTED:
+                self._fail(acceptance.reason)
+                responses.append(self._error_record(sequence, acceptance.reason))
+                break
+            if acceptance.status is RelayAcceptanceStatus.DUPLICATE:
+                responses.append(self._ack_record(sequence, acceptance.reason))
+                continue
+            record = acceptance.record
+            assert record is not None
+            reason = self._admit(record, arrived_at_utc=now)
+            if reason is not None:
+                self._fail(reason)
+                responses.append(self._error_record(sequence, reason))
+                break
+            responses.append(self._ack_record(sequence, acceptance.reason))
+        return tuple(responses)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        listener, self._listener = self._listener, None
+        client, self._client = self._client, None
+        if listener is not None:
+            listener.close()
+        if client is not None:
+            client.close()
+        self._release_session(LocalMicrophoneTerminalReason.RESOURCE_CLOSED)
+
+    def _admit(
+        self,
+        record: MicrophoneRelayRecord,
+        *,
+        arrived_at_utc: datetime,
+    ) -> RelayReason | None:
+        try:
+            if record.message_type is RelayMessageType.START:
+                metadata = record.metadata
+                assert isinstance(metadata, RelayStartMetadata)
+                if metadata.generation != self._session.diagnostics.capture_generation:
+                    return RelayReason.GENERATION_MISMATCH
+                self._session.start(arrived_at_utc=arrived_at_utc)
+            elif record.message_type is RelayMessageType.AUDIO:
+                metadata = record.metadata
+                assert isinstance(metadata, RelayAudioMetadata)
+                self._session.accept_validated_pcm(
+                    record.payload,
+                    captured_at_utc=metadata.captured_at_utc,
+                    arrived_at_utc=arrived_at_utc,
+                    capture_generation=metadata.generation,
+                )
+            elif record.message_type is RelayMessageType.PAUSE:
+                if not self._session.pause_capture(
+                    resource=self._resource,
+                    arrived_at_utc=arrived_at_utc,
+                ):
+                    return RelayReason.SESSION_REJECTED
+                if not self._session.wait_until_paused(
+                    resource=self._resource,
+                    timeout_seconds=self._io_timeout_seconds,
+                ):
+                    return RelayReason.IO_TIMEOUT
+            elif record.message_type is RelayMessageType.RESUME:
+                capability = self._resume_capability_factory()
+                if not self._session.resume_capture(
+                    capability,
+                    resource=self._resource,
+                ):
+                    capability.revoke()
+                    return RelayReason.SESSION_REJECTED
+            elif record.message_type is RelayMessageType.END:
+                if not self._session.finish_call(
+                    resource=self._resource,
+                    arrived_at_utc=arrived_at_utc,
+                ):
+                    return RelayReason.SESSION_REJECTED
+            else:
+                return RelayReason.UNEXPECTED_MESSAGE_ORDER
+        except Exception:
+            return RelayReason.SESSION_REJECTED
+        return None
+
+    def _fail(self, reason: RelayReason) -> None:
+        if self.state is RelaySessionState.ENDED:
+            return
+        self._protocol.fail(reason)
+        self._release_session(
+            (
+                LocalMicrophoneTerminalReason.DISCONNECTED
+                if reason is RelayReason.CONNECTION_CLOSED
+                else LocalMicrophoneTerminalReason.FAILED
+            )
+        )
+
+    def _release_session(self, reason: LocalMicrophoneTerminalReason) -> None:
+        if self._session_released:
+            return
+        self._session_released = True
+        self._session.close(reason)
+
+    @staticmethod
+    def _ack_record(sequence: int, reason: RelayReason) -> bytes:
+        return encode_relay_record(
+            RelayMessageType.ACK,
+            {"sequence_number": sequence, "reason": reason.value},
+        )
+
+    @staticmethod
+    def _error_record(sequence: int, reason: RelayReason) -> bytes:
+        return encode_relay_record(
+            RelayMessageType.ERROR,
+            {"sequence_number": sequence, "reason": reason.value},
+        )
+
+    @classmethod
+    def _send_error(cls, client: socket.socket, reason: RelayReason) -> None:
+        try:
+            client.settimeout(RELAY_IO_TIMEOUT_SECONDS)
+            client.sendall(cls._error_record(0, reason))
+        except OSError:
+            return
 
 
 def _validate_declared_lengths(
