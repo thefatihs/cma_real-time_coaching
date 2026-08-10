@@ -17,10 +17,54 @@ CURRENT_COMMIT = "cf3932dcb43911b2a5f5ff139f6ce07c88caf389"
 
 @pytest.mark.parametrize("ttl", [300, 600, 7200])
 def test_ttl_bounds(ttl: int) -> None:
-    assert subject._parse_arguments(["--ttl-seconds", str(ttl)]) == (ttl, False)
+    assert subject._parse_arguments(["--ttl-seconds", str(ttl)]) == (
+        ttl,
+        False,
+        None,
+    )
     assert subject._parse_arguments(
         ["--preflight-only", "--ttl-seconds", str(ttl)]
-    ) == (ttl, True)
+    ) == (ttl, True, None)
+
+
+def test_owner_marker_is_optional_and_exact() -> None:
+    marker = "callmetric-owner-" + "a" * 32
+    assert subject._parse_arguments(
+        ["--ttl-seconds", "300", "--owner-marker", marker]
+    ) == (300, False, marker)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--ttl-seconds", "300", "--owner-marker", "unsafe"],
+        ["--ttl-seconds", "300", "--owner-marker"],
+        [
+            "--ttl-seconds",
+            "300",
+            "--owner-marker",
+            "callmetric-owner-" + "a" * 32,
+            "--owner-marker",
+            "callmetric-owner-" + "b" * 32,
+        ],
+    ],
+)
+def test_owner_marker_rejects_malformed_or_duplicate_values(
+    arguments: list[str],
+) -> None:
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject._parse_arguments(arguments)
+
+
+def test_owner_marker_never_appears_in_public_failure_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "callmetric-owner-" + "c" * 32
+    assert subject.main(["--ttl-seconds", "300", "--owner-marker", marker, "x"]) == 1
+    captured = capsys.readouterr()
+    assert marker not in captured.out
+    assert marker not in captured.err
+    assert captured.err == "E_PREFLIGHT PR54 PostgreSQL TLS service failed\n"
 
 
 @pytest.mark.parametrize("value", ["299", "7201", "-1", "٣٠٠", "3.0"])

@@ -14,8 +14,10 @@ import subprocess
 import sys
 import threading
 import time
+from ctypes import POINTER, WinDLL, byref, c_int, c_void_p, wintypes
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Protocol, TypeVar
 from urllib.parse import urlsplit
@@ -55,6 +57,7 @@ DOCUMENT_POLL_TIMEOUT_SECONDS = 300.0
 POLL_INTERVAL_SECONDS = 0.2
 ORCHESTRATION_MARGIN_SECONDS = 60.0
 MINIMUM_E2E_OUTPUT_TOKENS = 256
+OWNER_MARKER_PATTERN = re.compile(r"^callmetric-owner-[0-9a-f]{32}$")
 
 PREFLIGHT_OK = "PREFLIGHT_OK"
 E2E_OK = "E2E_OK"
@@ -220,6 +223,15 @@ class _PostgresStartupError(RuntimeError):
 class _TLSChildOutputEvent:
     kind: str
     phase: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WindowsProcessObservation:
+    process_id: int
+    parent_process_id: int
+    executable_path: str | None = field(repr=False)
+    command_line: str | None = field(repr=False)
+    creation_time_utc: str | None = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,6 +592,8 @@ class _ProductionLifecycle:
         self._vector_count = 0
         self._protected_resources: dict[str, frozenset[str]] | None = None
         self._owned_processes: dict[int, int] = {}
+        self._owner_marker: str | None = None
+        self._postgres_launch_boundary: datetime | None = None
         self._tls_child_events: queue.SimpleQueue[_TLSChildOutputEvent] = (
             queue.SimpleQueue()
         )
@@ -656,6 +670,15 @@ class _ProductionLifecycle:
             raise _PostgresStartupError(E_POSTGRES_CONFIG)
         self._postgres_project = project
         environment["CALLMETRIC_POSTGRES_TLS_SERVICE_PROJECT_NAME"] = project
+        owner_marker = self._postgres_startup_call(
+            E_POSTGRES_CONFIG, lambda: f"callmetric-owner-{secrets.token_hex(16)}"
+        )
+        if not OWNER_MARKER_PATTERN.fullmatch(owner_marker):
+            raise _PostgresStartupError(E_POSTGRES_CONFIG)
+        self._owner_marker = owner_marker
+        self._postgres_launch_boundary = self._postgres_startup_call(
+            E_POSTGRES_CLOCK, lambda: datetime.now(timezone.utc)
+        )
         self._service = self._postgres_startup_call(
             E_POSTGRES_LAUNCH,
             lambda: subprocess.Popen(
@@ -665,6 +688,8 @@ class _ProductionLifecycle:
                     "scripts.run_postgres_tls_service",
                     "--ttl-seconds",
                     str(self._postgres_config.ttl_seconds),
+                    "--owner-marker",
+                    owner_marker,
                 ],
                 cwd=REPOSITORY_ROOT,
                 env=environment,
@@ -1356,9 +1381,12 @@ class _ProductionLifecycle:
         graceful_recovery_trigger: BaseException | None = None
         if service is not None:
             try:
-                self._refresh_owned_process_ledger()
+                if self._owner_marker is None:
+                    self._refresh_owned_process_ledger()
+                else:
+                    self._owned_processes.update(self._discover_marker_processes())
                 owned_processes = dict(self._owned_processes)
-                if service.pid not in owned_processes:
+                if self._owner_marker is None and service.pid not in owned_processes:
                     raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
             except BaseException as error:
                 graceful_recovery_trigger = error
@@ -1420,7 +1448,7 @@ class _ProductionLifecycle:
             raise cleanup_error
 
     @staticmethod
-    def _windows_process_table() -> dict[int, int]:
+    def _windows_process_observations() -> tuple[_WindowsProcessObservation, ...]:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
         if powershell is None:
             raise RuntimeError
@@ -1430,8 +1458,13 @@ class _ProductionLifecycle:
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "Get-CimInstance Win32_Process | Select-Object ProcessId,"
-                "ParentProcessId | ConvertTo-Json -Compress",
+                "Get-CimInstance Win32_Process | ForEach-Object { "
+                "[PSCustomObject]@{ProcessId=$_.ProcessId;"
+                "ParentProcessId=$_.ParentProcessId;"
+                "ExecutablePath=$_.ExecutablePath;CommandLine=$_.CommandLine;"
+                "CreationDate=$(if ($null -eq $_.CreationDate) {$null} else "
+                "{$_.CreationDate.ToUniversalTime().ToString('o')})}} | "
+                "ConvertTo-Json -Compress",
             ],
             cwd=REPOSITORY_ROOT,
             check=True,
@@ -1442,7 +1475,8 @@ class _ProductionLifecycle:
         )
         payload = json.loads(result.stdout)
         rows = payload if isinstance(payload, list) else [payload]
-        table: dict[int, int] = {}
+        observations: list[_WindowsProcessObservation] = []
+        seen: set[int] = set()
         for row in rows:
             if not isinstance(row, dict):
                 raise RuntimeError
@@ -1453,15 +1487,129 @@ class _ProductionLifecycle:
                 or type(parent_id) is not int
                 or process_id <= 0
                 or parent_id < 0
-                or process_id in table
+                or process_id in seen
             ):
                 raise RuntimeError
-            table[process_id] = parent_id
-        return table
+            executable_path = row.get("ExecutablePath")
+            command_line = row.get("CommandLine")
+            creation_time = row.get("CreationDate")
+            if executable_path is not None and not isinstance(executable_path, str):
+                raise RuntimeError
+            if command_line is not None and not isinstance(command_line, str):
+                raise RuntimeError
+            if creation_time is not None and not isinstance(creation_time, str):
+                raise RuntimeError
+            seen.add(process_id)
+            observations.append(
+                _WindowsProcessObservation(
+                    process_id,
+                    parent_id,
+                    executable_path,
+                    command_line,
+                    creation_time,
+                )
+            )
+        return tuple(observations)
+
+    @staticmethod
+    def _parse_windows_command_line(command_line: str) -> tuple[str, ...]:
+        shell32 = WinDLL("shell32", use_last_error=True)
+        kernel32 = WinDLL("kernel32", use_last_error=True)
+        parser = shell32.CommandLineToArgvW
+        parser.argtypes = [wintypes.LPCWSTR, POINTER(c_int)]
+        parser.restype = POINTER(wintypes.LPWSTR)
+        local_free = kernel32.LocalFree
+        local_free.argtypes = [c_void_p]
+        local_free.restype = c_void_p
+        count = c_int()
+        arguments = parser(command_line, byref(count))
+        if not arguments or count.value <= 0:
+            raise RuntimeError
+        try:
+            return tuple(arguments[index] for index in range(count.value))
+        finally:
+            local_free(arguments)
+
+    @staticmethod
+    def _reviewed_python_executables() -> frozenset[str]:
+        candidates = [sys.executable]
+        base = getattr(sys, "_base_executable", None)
+        if isinstance(base, str) and base:
+            candidates.append(base)
+        return frozenset(
+            os.path.normcase(str(Path(candidate).resolve(strict=True)))
+            for candidate in candidates
+        )
+
+    def _discover_marker_processes(self) -> dict[int, int]:
+        marker = self._owner_marker
+        launch_boundary = self._postgres_launch_boundary
+        if marker is None or launch_boundary is None:
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+        reviewed_executables = self._reviewed_python_executables()
+        owned: dict[int, int] = {}
+        for observation in self._windows_process_observations():
+            command_line = observation.command_line
+            if command_line is None or marker not in command_line:
+                continue
+            try:
+                arguments = self._parse_windows_command_line(command_line)
+            except BaseException:
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY) from None
+            marker_indexes = [
+                index
+                for index, argument in enumerate(arguments)
+                if argument == "--owner-marker"
+            ]
+            if len(marker_indexes) != 1:
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            marker_index = marker_indexes[0]
+            if (
+                marker_index + 1 >= len(arguments)
+                or arguments[marker_index + 1] != marker
+                or arguments.count(marker) != 1
+            ):
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            if observation.process_id == os.getpid():
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            executable_path = observation.executable_path
+            creation_time = observation.creation_time_utc
+            if executable_path is None or creation_time is None:
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            try:
+                canonical_executable = os.path.normcase(
+                    str(Path(executable_path).resolve(strict=True))
+                )
+                created = datetime.fromisoformat(creation_time.replace("Z", "+00:00"))
+                if created.tzinfo is None:
+                    raise ValueError
+                created = created.astimezone(timezone.utc)
+            except (OSError, ValueError):
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY) from None
+            if (
+                canonical_executable not in reviewed_executables
+                or created < launch_boundary
+            ):
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            owned[observation.process_id] = observation.parent_process_id
+        return owned
+
+    @classmethod
+    def _windows_process_table(cls) -> dict[int, int]:
+        return {
+            item.process_id: item.parent_process_id
+            for item in cls._windows_process_observations()
+        }
 
     def _refresh_owned_process_ledger(self) -> None:
         service = self._service
         if service is None:
+            return
+        if self._owner_marker is not None:
+            discovered = self._discover_marker_processes()
+            if not discovered:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+            self._owned_processes.update(discovered)
             return
         root = service.pid
         current = self._windows_process_table()
@@ -1507,6 +1655,9 @@ class _ProductionLifecycle:
         service: subprocess.Popen[bytes],
         initial_processes: Mapping[int, int],
     ) -> None:
+        if self._owner_marker is not None:
+            self._terminate_marker_processes(service)
+            return
         root = service.pid
         if type(root) is not int or root <= 0 or root not in initial_processes:
             raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
@@ -1619,6 +1770,57 @@ class _ProductionLifecycle:
         if service.poll() is None:
             raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
 
+    def _terminate_marker_processes(self, service: subprocess.Popen[bytes]) -> None:
+        taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
+        if taskkill is None:
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            owned = self._discover_marker_processes()
+            self._owned_processes.update(owned)
+            if not owned:
+                break
+
+            def depth(process_id: int) -> int:
+                current = process_id
+                seen: set[int] = set()
+                result = 0
+                while owned.get(current) in owned:
+                    if current in seen:
+                        raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+                    seen.add(current)
+                    current = owned[current]
+                    result += 1
+                return result
+
+            for process_id in sorted(
+                owned, key=lambda item: (depth(item), item), reverse=True
+            ):
+                try:
+                    subprocess.run(
+                        [taskkill, "/PID", str(process_id), "/F"],
+                        cwd=REPOSITORY_ROOT,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        shell=False,
+                        timeout=30,
+                    )
+                except BaseException:
+                    if process_id in self._discover_marker_processes():
+                        raise _CleanupPhaseError(E_CLEANUP_PROCESS_ACTION) from None
+        else:
+            raise _CleanupPhaseError(E_CLEANUP_PROCESS_ACTION)
+        if self._discover_marker_processes():
+            raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+        try:
+            if service.poll() is None:
+                service.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except BaseException:
+            pass
+        if service.poll() is None:
+            raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+
     @classmethod
     def _is_descendant(
         cls, table: Mapping[int, int], process_id: int, root: int
@@ -1699,19 +1901,20 @@ class _ProductionLifecycle:
         service = self._service
         if service is not None:
             try:
-                table = self._windows_process_table()
                 running = service.poll() is None
+                if self._owner_marker is not None:
+                    marker_processes = self._discover_marker_processes()
+                    process_residue = bool(marker_processes)
+                else:
+                    table = self._windows_process_table()
+                    process_residue = service.pid in table or any(
+                        self._is_descendant(table, process_id, service.pid)
+                        for process_id in table
+                        if process_id != service.pid
+                    )
             except BaseException:
                 raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
-            if (
-                running
-                or service.pid in table
-                or any(
-                    self._is_descendant(table, process_id, service.pid)
-                    for process_id in table
-                    if process_id != service.pid
-                )
-            ):
+            if running or process_residue:
                 raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
 
     def _require_initial_processes_absent(
@@ -1719,6 +1922,12 @@ class _ProductionLifecycle:
     ) -> None:
         service = self._service
         if not initial_processes or service is None:
+            if self._owner_marker is not None and self._discover_marker_processes():
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            return
+        if self._owner_marker is not None:
+            if self._discover_marker_processes():
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
             return
         root = service.pid
         owned = {

@@ -44,6 +44,7 @@ POSTGRES_READINESS_TIMEOUT_SECONDS = smoke.HEALTH_TIMEOUT_SECONDS
 MIGRATION_PROOF_TIMEOUT_SECONDS = 180.0
 CLEANUP_TIMEOUT_SECONDS = 120.0
 PROJECT_PATTERN = smoke.PROJECT_NAME_PATTERN
+OWNER_MARKER_PATTERN = re.compile(r"^callmetric-owner-[0-9a-f]{32}$")
 HANDOFF_PATTERN = re.compile(r"^callmetric-postgres-tls-[a-z0-9_]{8}$")
 HANDOFF_FILES = frozenset({"application.dsn", "ca.crt", "connection.json"})
 MAX_HANDOFF_FILE_BYTES = 65_536
@@ -169,7 +170,7 @@ def _bounded_smoke_call(timeout: float, operation: Callable[[], T]) -> T:
         return operation()
 
 
-def _parse_arguments(arguments: list[str]) -> tuple[int, bool]:
+def _parse_arguments(arguments: list[str]) -> tuple[int, bool, str | None]:
     preflight = False
     values = list(arguments)
     if "--preflight-only" in values:
@@ -177,6 +178,17 @@ def _parse_arguments(arguments: list[str]) -> tuple[int, bool]:
             raise PostgreSQLTLSServiceError()
         values.remove("--preflight-only")
         preflight = True
+    owner_marker: str | None = None
+    if "--owner-marker" in values:
+        if values.count("--owner-marker") != 1:
+            raise PostgreSQLTLSServiceError()
+        marker_index = values.index("--owner-marker")
+        if marker_index + 1 >= len(values):
+            raise PostgreSQLTLSServiceError()
+        owner_marker = values[marker_index + 1]
+        del values[marker_index : marker_index + 2]
+        if not OWNER_MARKER_PATTERN.fullmatch(owner_marker):
+            raise PostgreSQLTLSServiceError()
     if len(values) != 2 or values[0] != "--ttl-seconds":
         raise PostgreSQLTLSServiceError()
     raw = values[1]
@@ -185,7 +197,7 @@ def _parse_arguments(arguments: list[str]) -> tuple[int, bool]:
     ttl = int(raw)
     if not MINIMUM_TTL_SECONDS <= ttl <= MAXIMUM_TTL_SECONDS:
         raise PostgreSQLTLSServiceError()
-    return ttl, preflight
+    return ttl, preflight, owner_marker
 
 
 def _validate_repository() -> None:
@@ -860,7 +872,7 @@ def run(ttl: int, *, preflight_only: bool = False) -> None:
 
 def main(arguments: list[str] | None = None) -> int:
     try:
-        ttl, preflight = _parse_arguments(
+        ttl, preflight, _owner_marker = _parse_arguments(
             sys.argv[1:] if arguments is None else arguments
         )
         run(ttl, preflight_only=preflight)

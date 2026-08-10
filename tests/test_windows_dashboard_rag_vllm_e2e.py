@@ -1163,14 +1163,14 @@ def test_postgres_start_uses_safe_child_pipe_and_requires_ready_handoff(
             "volume": frozenset(),
         },
     )
-    process_table_calls = 0
+    ownership_calls = 0
 
-    def process_table() -> dict[int, int]:
-        nonlocal process_table_calls
-        process_table_calls += 1
+    def discover() -> dict[int, int]:
+        nonlocal ownership_calls
+        ownership_calls += 1
         return {process.pid: 1}
 
-    monkeypatch.setattr(lifecycle, "_windows_process_table", process_table)
+    monkeypatch.setattr(lifecycle, "_discover_marker_processes", discover)
     handoff = (
         Path(values[subject.HANDOFF_ROOT_ENV]) / "callmetric-postgres-tls-abcdefgh"
     )
@@ -1201,7 +1201,10 @@ def test_postgres_start_uses_safe_child_pipe_and_requires_ready_handoff(
     )
     assert child_environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"] == HEAD
     assert subject.POSTGRES_CHILD_PHASES
-    assert process_table_calls == 1
+    arguments = cast(list[str], captured["arguments"])
+    marker_index = arguments.index("--owner-marker")
+    assert subject.OWNER_MARKER_PATTERN.fullmatch(arguments[marker_index + 1])
+    assert ownership_calls == 1
 
 
 def test_postgres_start_propagates_recognized_child_failure(
@@ -1276,6 +1279,169 @@ def test_postgres_ownership_initialization_failure_is_distinct_after_ready(
         lifecycle._postgres_start()
 
     assert lifecycle._handoff == handoff
+
+
+def _marker_observation(
+    *,
+    process_id: int,
+    parent_process_id: int,
+    marker: str,
+    executable_path: str | None = None,
+    creation_time_utc: str = "2026-08-10T12:00:01+00:00",
+) -> subject._WindowsProcessObservation:
+    return subject._WindowsProcessObservation(
+        process_id=process_id,
+        parent_process_id=parent_process_id,
+        executable_path=executable_path or subject.sys.executable,
+        command_line=(
+            f'python -m scripts.run_postgres_tls_service --owner-marker "{marker}" '
+            "--ttl-seconds 300"
+        ),
+        creation_time_utc=creation_time_utc,
+    )
+
+
+def test_marker_ownership_finds_reparented_tls_interpreters_without_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    marker = "callmetric-owner-" + "a" * 32
+    lifecycle._owner_marker = marker
+    lifecycle._service = cast(subprocess.Popen[bytes], FakeServiceProcess())
+    lifecycle._postgres_launch_boundary = subject.datetime.fromisoformat(
+        "2026-08-10T12:00:00+00:00"
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_windows_process_observations",
+        lambda: (
+            _marker_observation(
+                process_id=6052, parent_process_id=30240, marker=marker
+            ),
+            _marker_observation(
+                process_id=32448, parent_process_id=6052, marker=marker
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_parse_windows_command_line",
+        lambda line: tuple(line.replace('"', "").split()),
+    )
+
+    assert lifecycle._discover_marker_processes() == {6052: 30240, 32448: 6052}
+    lifecycle._refresh_owned_process_ledger()
+
+    assert lifecycle._owned_processes == {6052: 30240, 32448: 6052}
+
+
+def test_marker_ownership_preserves_unmarked_and_different_marker_processes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    marker = "callmetric-owner-" + "a" * 32
+    lifecycle._owner_marker = marker
+    lifecycle._postgres_launch_boundary = subject.datetime.fromisoformat(
+        "2026-08-10T12:00:00+00:00"
+    )
+    observations = (
+        _marker_observation(process_id=101, parent_process_id=1, marker=marker),
+        _marker_observation(
+            process_id=102,
+            parent_process_id=1,
+            marker="callmetric-owner-" + "b" * 32,
+        ),
+        subject._WindowsProcessObservation(
+            103,
+            1,
+            subject.sys.executable,
+            "python -m scripts.run_postgres_tls_service --ttl-seconds 300",
+            "2026-08-10T12:00:01+00:00",
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle, "_windows_process_observations", lambda: observations
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_parse_windows_command_line",
+        lambda line: tuple(line.replace('"', "").split()),
+    )
+
+    assert lifecycle._discover_marker_processes() == {101: 1}
+
+
+@pytest.mark.parametrize(
+    ("executable_path", "creation_time"),
+    [
+        ("C:/not-reviewed/python.exe", "2026-08-10T12:00:01+00:00"),
+        (None, "2026-08-10T11:59:59+00:00"),
+    ],
+)
+def test_marker_ownership_rejects_invalid_executable_or_creation_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    executable_path: str | None,
+    creation_time: str,
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    marker = "callmetric-owner-" + "a" * 32
+    lifecycle._owner_marker = marker
+    lifecycle._postgres_launch_boundary = subject.datetime.fromisoformat(
+        "2026-08-10T12:00:00+00:00"
+    )
+    observation = _marker_observation(
+        process_id=101,
+        parent_process_id=1,
+        marker=marker,
+        executable_path=executable_path,
+        creation_time_utc=creation_time,
+    )
+    monkeypatch.setattr(
+        lifecycle, "_windows_process_observations", lambda: (observation,)
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_parse_windows_command_line",
+        lambda line: tuple(line.replace('"', "").split()),
+    )
+
+    with pytest.raises(subject._CleanupPhaseError):
+        lifecycle._discover_marker_processes()
+
+
+def test_marker_candidate_with_unparsable_command_line_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    marker = "callmetric-owner-" + "a" * 32
+    lifecycle._owner_marker = marker
+    lifecycle._postgres_launch_boundary = subject.datetime.fromisoformat(
+        "2026-08-10T12:00:00+00:00"
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_windows_process_observations",
+        lambda: (
+            _marker_observation(process_id=101, parent_process_id=1, marker=marker),
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_parse_windows_command_line",
+        lambda _line: (_ for _ in ()).throw(ValueError("private-command-line")),
+    )
+
+    with pytest.raises(subject._CleanupPhaseError):
+        lifecycle._discover_marker_processes()
 
 
 class FailingChildStream(BytesIO):
@@ -1762,6 +1928,50 @@ def test_owned_process_tree_is_terminated_descendant_first(
         {100: 1, 200: 100, 300: 200, 900: 1},
     )
     assert terminated == [300, 200, 100]
+
+
+def test_marker_cleanup_rediscovers_and_terminates_reparented_processes_deepest_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    lifecycle._owner_marker = "callmetric-owner-" + "a" * 32
+    lifecycle._postgres_launch_boundary = subject.datetime.fromisoformat(
+        "2026-08-10T12:00:00+00:00"
+    )
+    process = FakeServiceProcess(poll_result=0)
+    active = {6052: 30240, 32448: 6052}
+    monkeypatch.setattr(lifecycle, "_discover_marker_processes", lambda: dict(active))
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "taskkill")
+    terminated: list[int] = []
+
+    def run(
+        arguments: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        process_id = int(arguments[2])
+        terminated.append(process_id)
+        active.pop(process_id)
+        if process_id == 32448:
+            active[777] = 6052
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
+
+    lifecycle._terminate_marker_processes(cast(subprocess.Popen[bytes], process))
+
+    assert terminated == [32448, 6052, 777]
+
+
+def test_windows_command_line_parser_preserves_exact_marker_argument() -> None:
+    marker = "callmetric-owner-" + "a" * 32
+    parsed = subject._ProductionLifecycle._parse_windows_command_line(
+        f'"{subject.sys.executable}" -m scripts.run_postgres_tls_service '
+        f'--owner-marker "{marker}" --ttl-seconds 300'
+    )
+
+    marker_index = parsed.index("--owner-marker")
+    assert parsed[marker_index + 1] == marker
 
 
 def test_final_owned_process_check_ignores_unrelated_initial_processes(
