@@ -904,6 +904,7 @@ class _ProductionLifecycle:
         if graceful_recovery_trigger is None:
             try:
                 self._require_postgres_residue_absent()
+                self._require_initial_processes_absent(initial_processes)
             except BaseException as error:
                 graceful_recovery_trigger = error
         if graceful_recovery_trigger is not None:
@@ -931,6 +932,10 @@ class _ProductionLifecycle:
             final_verification_error = final_verification_error or error
         try:
             self._require_protected_resources_unchanged()
+        except BaseException as error:
+            final_verification_error = final_verification_error or error
+        try:
+            self._release_service_handle()
         except BaseException as error:
             final_verification_error = final_verification_error or error
         cleanup_error = fallback_action_error or final_verification_error
@@ -998,20 +1003,16 @@ class _ProductionLifecycle:
         initial_processes: Mapping[int, int],
     ) -> None:
         root = service.pid
-        if type(root) is not int or root <= 0:
-            raise RuntimeError
-        descendants = tuple(
-            sorted(
-                (
-                    (self._descendant_depth(initial_processes, item, root), item)
-                    for item in initial_processes
-                    if item != root
-                    and self._is_descendant(initial_processes, item, root)
-                ),
-                reverse=True,
-            )
-        )
-        failure: BaseException | None = None
+        if type(root) is not int or root <= 0 or root not in initial_processes:
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+        owned = {
+            process_id: parent_id
+            for process_id, parent_id in initial_processes.items()
+            if process_id == root
+            or self._is_descendant(initial_processes, process_id, root)
+        }
+        validation_failure: BaseException | None = None
+        deadline = time.monotonic() + 30.0
 
         def taskkill_path() -> str:
             taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
@@ -1019,75 +1020,116 @@ class _ProductionLifecycle:
                 raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
             return taskkill
 
-        for _depth, process_id in descendants:
+        def observe() -> dict[int, int]:
             try:
-                current = self._windows_process_table()
-                if process_id not in current:
-                    continue
-                if not self._same_owned_chain(
-                    initial_processes, current, process_id, root
+                return self._windows_process_table()
+            except BaseException:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
+
+        def record_current_descendants(current: Mapping[int, int]) -> None:
+            nonlocal validation_failure
+            for process_id in current:
+                if process_id == root or not self._is_descendant(
+                    current, process_id, root
                 ):
-                    raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
-                try:
-                    subprocess.run(
-                        [taskkill_path(), "/PID", str(process_id), "/F"],
-                        cwd=REPOSITORY_ROOT,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        shell=False,
-                        timeout=30,
-                    )
-                except BaseException:
-                    observed = self._windows_process_table()
-                    if process_id in observed:
-                        if not self._same_owned_chain(
-                            initial_processes, observed, process_id, root
-                        ):
-                            raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY) from None
-                        raise _CleanupPhaseError(E_CLEANUP_PROCESS_ACTION) from None
-            except BaseException as error:
-                failure = failure or error
-        if service.poll() is None:
-            try:
-                current = self._windows_process_table()
-                if root in current:
-                    if (
-                        root not in initial_processes
-                        or current[root] != initial_processes[root]
-                    ):
-                        raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
-                    try:
-                        subprocess.run(
-                            [taskkill_path(), "/PID", str(root), "/F"],
-                            cwd=REPOSITORY_ROOT,
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            shell=False,
-                            timeout=30,
+                    continue
+                candidate = process_id
+                while candidate != root:
+                    parent = current.get(candidate)
+                    if parent is None:
+                        validation_failure = validation_failure or _CleanupPhaseError(
+                            E_CLEANUP_PROCESS_VERIFY
                         )
-                    except BaseException:
-                        observed = self._windows_process_table()
-                        if root in observed:
-                            if observed[root] != initial_processes[root]:
-                                raise _CleanupPhaseError(
-                                    E_CLEANUP_PROCESS_VERIFY
-                                ) from None
-                            raise _CleanupPhaseError(E_CLEANUP_PROCESS_ACTION) from None
-                service.wait(timeout=30)
-            except BaseException as error:
-                failure = failure or error
+                        break
+                    if candidate in owned and owned[candidate] != parent:
+                        validation_failure = validation_failure or _CleanupPhaseError(
+                            E_CLEANUP_PROCESS_VERIFY
+                        )
+                        break
+                    owned[candidate] = parent
+                    candidate = parent
+
+        def terminate(process_id: int, current: Mapping[int, int]) -> None:
+            nonlocal validation_failure
+            if process_id not in current:
+                return
+            if process_id == root:
+                identity_matches = current[root] == owned[root]
+            else:
+                identity_matches = self._same_owned_chain(
+                    owned, current, process_id, root
+                )
+            if not identity_matches:
+                validation_failure = validation_failure or _CleanupPhaseError(
+                    E_CLEANUP_PROCESS_VERIFY
+                )
+                return
+            try:
+                subprocess.run(
+                    [taskkill_path(), "/PID", str(process_id), "/F"],
+                    cwd=REPOSITORY_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    shell=False,
+                    timeout=30,
+                )
+            except BaseException:
+                observed = observe()
+                if process_id not in observed:
+                    return
+                if process_id == root:
+                    identity_matches = observed[root] == owned[root]
+                else:
+                    identity_matches = self._same_owned_chain(
+                        owned, observed, process_id, root
+                    )
+                validation_failure = validation_failure or _CleanupPhaseError(
+                    E_CLEANUP_PROCESS_VERIFY
+                    if not identity_matches
+                    else E_CLEANUP_PROCESS_ACTION
+                )
+
+        while time.monotonic() < deadline:
+            current = observe()
+            record_current_descendants(current)
+            descendants = sorted(
+                (
+                    (self._descendant_depth(current, process_id, root), process_id)
+                    for process_id in current
+                    if process_id != root
+                    and self._is_descendant(current, process_id, root)
+                ),
+                reverse=True,
+            )
+            if not descendants:
+                break
+            for _depth, process_id in descendants:
+                terminate(process_id, current)
+            if validation_failure is not None:
+                break
+        else:
+            validation_failure = validation_failure or _CleanupPhaseError(
+                E_CLEANUP_PROCESS_ACTION
+            )
+
+        current = observe()
+        if validation_failure is None:
+            terminate(root, current)
         try:
-            observed = self._windows_process_table()
-            if any(process_id in observed for _depth, process_id in descendants):
-                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
-            if root in observed or service.poll() is None:
-                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
-        except BaseException as error:
-            failure = failure or error
-        if failure is not None:
-            raise failure
+            if service.poll() is None:
+                service.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except BaseException:
+            pass
+
+        observed = observe()
+        record_current_descendants(observed)
+        if validation_failure is not None:
+            raise validation_failure
+        if root in observed or any(process_id in observed for process_id in owned):
+            raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+        if service.poll() is None:
+            raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
 
     @classmethod
     def _is_descendant(
@@ -1209,14 +1251,38 @@ class _ProductionLifecycle:
     def _require_initial_processes_absent(
         self, initial_processes: Mapping[int, int]
     ) -> None:
-        if not initial_processes:
+        service = self._service
+        if not initial_processes or service is None:
             return
+        root = service.pid
+        owned = {
+            process_id
+            for process_id in initial_processes
+            if process_id == root
+            or self._is_descendant(initial_processes, process_id, root)
+        }
+        if root not in owned:
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
         try:
             observed = self._windows_process_table()
         except BaseException:
             raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
-        if any(process_id in observed for process_id in initial_processes):
+        if any(process_id in observed for process_id in owned):
             raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+
+    def _release_service_handle(self) -> None:
+        service = self._service
+        if service is None:
+            return
+        try:
+            if service.poll() is None:
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+            service.wait(timeout=0)
+        except _CleanupPhaseError:
+            raise
+        except BaseException:
+            raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
+        self._service = None
 
 
 def main(arguments: list[str] | None = None) -> int:

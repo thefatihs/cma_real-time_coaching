@@ -468,10 +468,56 @@ def test_production_cleanup_requests_graceful_service_signal_only(
     lifecycle.cleanup()
 
     assert process.signals == [signal.CTRL_BREAK_EVENT]
-    assert process.waits == [150]
+    assert process.waits == [150, 0]
+    assert lifecycle._service is None
     assert len(commands) == 6
     assert all("--filter" in command for command in commands)
     assert all("prune" not in command and "rm" not in command for command in commands)
+
+
+def test_graceful_signal_waits_for_tls_root_and_python_wrapper_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.pid = 100
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    lifecycle._postgres_project = "callmetric-pgvector-tls-123-abcdef123456"
+    process_tables = [
+        {100: 1, 200: 100, 900: 1},
+        {900: 1},
+        {900: 1},
+        {900: 1},
+        {900: 1},
+    ]
+    monkeypatch.setattr(
+        lifecycle, "_windows_process_table", lambda: process_tables.pop(0)
+    )
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout="", stderr=""
+        ),
+    )
+    lifecycle._protected_resources = {
+        "container": frozenset({"unrelated-container"}),
+        "network": frozenset({"unrelated-network"}),
+        "volume": frozenset({"unrelated-volume"}),
+    }
+    monkeypatch.setattr(
+        lifecycle, "_require_protected_resources_unchanged", lambda: None
+    )
+
+    lifecycle.cleanup()
+
+    assert process.signals == [signal.CTRL_BREAK_EVENT]
+    assert process.waits == [150, 0]
+    assert lifecycle._service is None
+    assert process_tables == []
 
 
 @pytest.mark.parametrize("resource", ["container", "network", "volume"])
@@ -541,7 +587,7 @@ def test_graceful_failure_modes_each_trigger_every_fallback(
             super().send_signal(signal_number)
 
         def wait(self, timeout: float | None = None) -> int:
-            if failure == "timeout":
+            if failure == "timeout" and timeout == 150:
                 raise subprocess.TimeoutExpired([], 150)
             return super().wait(timeout)
 
@@ -559,11 +605,12 @@ def test_graceful_failure_modes_each_trigger_every_fallback(
         lifecycle, "_require_protected_resources_unchanged", lambda: None
     )
     fallbacks: list[str] = []
-    monkeypatch.setattr(
-        lifecycle,
-        "_terminate_owned_process_tree",
-        lambda *_args: fallbacks.append("process"),
-    )
+
+    def terminate(*_args: object) -> None:
+        fallbacks.append("process")
+        process.poll_result = 0
+
+    monkeypatch.setattr(lifecycle, "_terminate_owned_process_tree", terminate)
     monkeypatch.setattr(
         lifecycle,
         "_cleanup_exact_postgres_project",
@@ -710,10 +757,10 @@ def test_owned_process_tree_is_terminated_descendant_first(
     process = FakeServiceProcess()
     process.pid = 100
     tables = [
-        {100: 1, 200: 100, 300: 200},
-        {100: 1, 200: 100, 300: 200},
-        {100: 1, 200: 100},
-        {},
+        {100: 1, 200: 100, 300: 200, 900: 1},
+        {100: 1, 900: 1},
+        {100: 1, 900: 1},
+        {900: 1},
     ]
     monkeypatch.setattr(
         lifecycle,
@@ -731,9 +778,24 @@ def test_owned_process_tree_is_terminated_descendant_first(
 
     monkeypatch.setattr(subject.subprocess, "run", run)
     lifecycle._terminate_owned_process_tree(
-        cast(subprocess.Popen[bytes], process), {100: 1, 200: 100, 300: 200}
+        cast(subprocess.Popen[bytes], process),
+        {100: 1, 200: 100, 300: 200, 900: 1},
     )
     assert terminated == [300, 200, 100]
+
+
+def test_final_owned_process_check_ignores_unrelated_initial_processes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess(poll_result=0)
+    process.pid = 100
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {900: 1})
+
+    lifecycle._require_initial_processes_absent({100: 1, 200: 100, 300: 200, 900: 1})
 
 
 def test_descendant_disappearance_before_termination_is_recovered(
@@ -744,7 +806,7 @@ def test_descendant_disappearance_before_termination_is_recovered(
     lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
     process = FakeServiceProcess(poll_result=0)
     process.pid = 100
-    tables = [{}, {}]
+    tables = [{}, {}, {}]
     monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: tables.pop(0))
     monkeypatch.setattr(
         subject.shutil,
@@ -765,7 +827,7 @@ def test_root_disappearance_before_termination_is_recovered(
     lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
     process = FakeServiceProcess()
     process.pid = 100
-    tables = [{}, {}]
+    tables = [{}, {}, {}]
     monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: tables.pop(0))
     monkeypatch.setattr(
         subject.shutil,
