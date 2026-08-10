@@ -11,7 +11,12 @@ from typing import cast
 import pytest
 
 import scripts.run_windows_dashboard_rag_vllm_e2e as subject
-from app.coaching.coordinator import CoachingSourcePresentation, StableCoachingOutcome
+from app.coaching.coordinator import (
+    CoachingCoordinatorResult,
+    CoachingProcessingStatus,
+    CoachingSourcePresentation,
+    StableCoachingOutcome,
+)
 from app.coaching.coordinator import _cooldown_available
 
 HEAD = "4" * 40
@@ -166,8 +171,11 @@ def test_every_phase_failure_cleans_once_and_stays_fixed(
             environment=environment(tmp_path),
             operations_factory=lambda _config: operations,
         )
-    assert caught.value.phase == phase
-    assert str(caught.value) == phase
+    expected = (
+        subject.E_COMPLETION_UNCLASSIFIED if phase == "E_COMPLETION_PUMP" else phase
+    )
+    assert caught.value.phase == expected
+    assert str(caught.value) == expected
     assert operations.events[-1] == "E_CLEANUP"
 
 
@@ -307,6 +315,237 @@ def test_admission_requires_exactly_one_displayed_suggestion(
         lifecycle._admission()
 
 
+class FakeCompletionProcessor:
+    def __init__(self, outcomes: tuple[StableCoachingOutcome, ...]) -> None:
+        self.outcomes = outcomes
+        self.calls = 0
+
+    def drain_completed(
+        self, *, current_seconds: float
+    ) -> tuple[StableCoachingOutcome, ...]:
+        assert current_seconds == 1.0
+        self.calls += 1
+        return self.outcomes
+
+
+def _completion_lifecycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> subject._ProductionLifecycle:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    return subject._ProductionLifecycle(subject.preflight(values), values)
+
+
+def test_completion_pump_accepts_one_authoritative_processed_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    outcome = StableCoachingOutcome(
+        status=CoachingProcessingStatus.PROCESSED,
+        transcript_revision=1,
+        result=cast(
+            CoachingCoordinatorResult,
+            SimpleNamespace(displayed_suggestions=(object(),)),
+        ),
+    )
+    processor = FakeCompletionProcessor((outcome,))
+    lifecycle._processor = cast(subject.RAGCoachingProcessorDecorator, processor)
+
+    lifecycle._completion_pump()
+
+    assert lifecycle._outcome is outcome
+    assert processor.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "phase"),
+    [
+        (
+            (
+                StableCoachingOutcome(
+                    status=CoachingProcessingStatus.FAILED,
+                    transcript_revision=1,
+                    error_type="rag_orchestration",
+                    error_code="background_failure",
+                ),
+            ),
+            subject.E_COMPLETION_BACKGROUND_FAILED,
+        ),
+        (
+            (
+                StableCoachingOutcome(
+                    status=CoachingProcessingStatus.PARTIAL_SKIPPED,
+                    transcript_revision=1,
+                ),
+            ),
+            subject.E_COMPLETION_NOT_PROCESSED,
+        ),
+        (
+            (
+                StableCoachingOutcome(
+                    status=CoachingProcessingStatus.PROCESSED,
+                    transcript_revision=1,
+                ),
+            ),
+            subject.E_COMPLETION_RESULT_MISSING,
+        ),
+    ],
+)
+def test_completion_pump_reports_fixed_public_outcome_status(
+    outcomes: tuple[StableCoachingOutcome, ...],
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    lifecycle._processor = cast(
+        subject.RAGCoachingProcessorDecorator, FakeCompletionProcessor(outcomes)
+    )
+
+    with pytest.raises(subject._CompletionPumpError, match=f"^{phase}$"):
+        lifecycle._completion_pump()
+
+
+def test_completion_pump_rejects_multiple_authoritative_outcomes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    outcome = StableCoachingOutcome(
+        status=CoachingProcessingStatus.PROCESSED,
+        transcript_revision=1,
+        result=cast(
+            CoachingCoordinatorResult,
+            SimpleNamespace(displayed_suggestions=(object(),)),
+        ),
+    )
+    lifecycle._processor = cast(
+        subject.RAGCoachingProcessorDecorator,
+        FakeCompletionProcessor((outcome, outcome)),
+    )
+
+    with pytest.raises(
+        subject._CompletionPumpError, match=f"^{subject.E_COMPLETION_CARDINALITY}$"
+    ):
+        lifecycle._completion_pump()
+
+
+def test_completion_deadline_uses_provider_timeouts_and_bounded_margin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    assert lifecycle._completion_timeout_seconds() == 300.0
+    lifecycle._processor = cast(
+        subject.RAGCoachingProcessorDecorator, FakeCompletionProcessor(())
+    )
+    monotonic_values = iter((10.0, 310.0))
+    monkeypatch.setattr(subject.time, "monotonic", lambda: next(monotonic_values))
+
+    with pytest.raises(
+        subject._CompletionPumpError,
+        match=f"^{subject.E_COMPLETION_NO_AUTHORITATIVE_OUTCOME}$",
+    ):
+        lifecycle._completion_pump()
+
+
+def test_completion_deadline_accounts_for_every_maximum_http_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    values["CALLMETRIC_VLLM_CONNECT_TIMEOUT_SECONDS"] = "60"
+    values["CALLMETRIC_VLLM_READ_TIMEOUT_SECONDS"] = "600"
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+
+    assert lifecycle._completion_timeout_seconds() == 1_380.0
+
+
+def test_completion_arriving_just_before_legacy_deadline_is_accepted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    outcome = StableCoachingOutcome(
+        status=CoachingProcessingStatus.PROCESSED,
+        transcript_revision=1,
+        result=cast(
+            CoachingCoordinatorResult,
+            SimpleNamespace(displayed_suggestions=(object(),)),
+        ),
+    )
+    processor = FakeCompletionProcessor((outcome,))
+    lifecycle._processor = cast(subject.RAGCoachingProcessorDecorator, processor)
+    monotonic_values = iter((0.0, 299.999))
+    monkeypatch.setattr(subject.time, "monotonic", lambda: next(monotonic_values))
+
+    lifecycle._completion_pump()
+
+    assert processor.calls == 1
+
+
+def test_completion_at_exact_deadline_exhausts_without_an_extra_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    processor = FakeCompletionProcessor(())
+    lifecycle._processor = cast(subject.RAGCoachingProcessorDecorator, processor)
+    monotonic_values = iter((0.0, 300.0))
+    monkeypatch.setattr(subject.time, "monotonic", lambda: next(monotonic_values))
+
+    with pytest.raises(
+        subject._CompletionPumpError,
+        match=f"^{subject.E_COMPLETION_NO_AUTHORITATIVE_OUTCOME}$",
+    ):
+        lifecycle._completion_pump()
+
+    assert processor.calls == 0
+
+
+def test_terminal_failure_stops_without_a_second_wait_or_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    outcome = StableCoachingOutcome(
+        status=CoachingProcessingStatus.FAILED,
+        transcript_revision=1,
+        error_type="rag_orchestration",
+        error_code="background_failure",
+    )
+    processor = FakeCompletionProcessor((outcome,))
+    lifecycle._processor = cast(subject.RAGCoachingProcessorDecorator, processor)
+    monotonic_calls = 0
+
+    def monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        return 0.0
+
+    monkeypatch.setattr(subject.time, "monotonic", monotonic)
+    monkeypatch.setattr(
+        subject.time,
+        "sleep",
+        lambda _seconds: pytest.fail("terminal outcome must not sleep"),
+    )
+
+    with pytest.raises(
+        subject._CompletionPumpError,
+        match=f"^{subject.E_COMPLETION_BACKGROUND_FAILED}$",
+    ):
+        lifecycle._completion_pump()
+
+    assert processor.calls == 1
+    assert monotonic_calls == 2
+
+
+def test_completion_processor_must_exist_before_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    with pytest.raises(
+        subject._CompletionPumpError,
+        match=f"^{subject.E_COMPLETION_PROCESSOR_MISSING}$",
+    ):
+        lifecycle._completion_pump()
+
+
 def test_e2e_zero_cooldown_allows_same_label_after_positive_cooldown_suppresses() -> (
     None
 ):
@@ -349,6 +588,7 @@ def test_citation_projection_rejects_internal_identity_leakage(
         ("CALLMETRIC_VLLM_VERIFY_TLS", "false"),
         (subject.TTL_ENV, "True"),
         (subject.TTL_ENV, "299"),
+        ("CALLMETRIC_VLLM_MAX_OUTPUT_TOKENS", "255"),
     ],
 )
 def test_unsafe_configuration_fails_closed(
@@ -401,6 +641,88 @@ def test_main_prints_only_fixed_phase(
     )
     assert subject.main([]) == 1
     assert capsys.readouterr().out.strip() == "E_ORCHESTRATION"
+
+
+@pytest.mark.parametrize(
+    "completion_phase",
+    sorted(subject.COMPLETION_FAILURE_PHASES - {subject.E_COMPLETION_UNCLASSIFIED}),
+)
+def test_public_main_prints_exact_safe_completion_category(
+    completion_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+    secret_like_detail = "private-token-path-endpoint-dsn"
+
+    class CompletionOperations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            self.events.append(phase)
+            if phase == "E_COMPLETION_PUMP":
+                raise subject._CompletionPumpError(completion_phase)
+
+    operations = CompletionOperations()
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject,
+        "_ProductionLifecycle",
+        lambda _config, _environment: operations,
+    )
+    monkeypatch.setenv("SYNTHETIC_SECRET_LIKE_VALUE", secret_like_detail)
+
+    assert subject.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == completion_phase
+    assert captured.err == ""
+    assert secret_like_detail not in captured.out
+
+
+@pytest.mark.parametrize("typed_error", [False, True])
+def test_public_main_maps_unexpected_completion_exception_to_fixed_fallback(
+    typed_error: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+    secret_like_detail = "raw-private-provider-exception"
+
+    class UnexpectedCompletionOperations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            self.events.append(phase)
+            if phase == "E_COMPLETION_PUMP":
+                if typed_error:
+                    raise subject._CompletionPumpError(secret_like_detail)
+                raise RuntimeError(secret_like_detail)
+
+    operations = UnexpectedCompletionOperations()
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject,
+        "_ProductionLifecycle",
+        lambda _config, _environment: operations,
+    )
+
+    assert subject.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == subject.E_COMPLETION_UNCLASSIFIED
+    assert captured.err == ""
+    assert secret_like_detail not in captured.out
+
+
+def test_e2e_fixture_submits_exactly_one_orchestration_identity() -> None:
+    source = Path(subject.__file__).read_text(encoding="utf-8")
+    orchestration = source.split("def _orchestration", 1)[1].split("def _admission", 1)[
+        0
+    ]
+    assert orchestration.count("processor.process_safely(") == 1
 
 
 class FakeServiceProcess:
@@ -838,6 +1160,76 @@ def test_root_disappearance_before_termination_is_recovered(
     lifecycle._terminate_owned_process_tree(
         cast(subprocess.Popen[bytes], process), {100: 1}
     )
+
+
+def test_owned_descendants_are_terminated_after_root_disappears(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess(poll_result=0)
+    process.pid = 100
+    tables = [
+        {200: 100, 300: 200, 900: 1},
+        {900: 1},
+        {900: 1},
+        {900: 1},
+    ]
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: tables.pop(0))
+    monkeypatch.setattr(subject.shutil, "which", lambda name: name)
+    terminated: list[int] = []
+
+    def run(
+        arguments: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        terminated.append(int(arguments[2]))
+        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
+
+    lifecycle._terminate_owned_process_tree(
+        cast(subprocess.Popen[bytes], process), {100: 1, 200: 100, 300: 200}
+    )
+
+    assert terminated == [300, 200]
+
+
+def test_process_ledger_captures_evolving_descendants_without_unrelated_processes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.pid = 100
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    tables = iter(({100: 1, 200: 100, 900: 1}, {100: 1, 200: 100, 300: 200, 900: 1}))
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: next(tables))
+
+    lifecycle._refresh_owned_process_ledger()
+    lifecycle._refresh_owned_process_ledger()
+
+    assert lifecycle._owned_processes == {100: 1, 200: 100, 300: 200}
+
+
+def test_process_ledger_rejects_changed_lineage_or_pid_reuse(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.pid = 100
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    lifecycle._owned_processes = {100: 1, 200: 100}
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {100: 1, 200: 999})
+
+    with pytest.raises(
+        subject._CleanupPhaseError,
+        match=f"^{subject.E_CLEANUP_PROCESS_VERIFY}$",
+    ):
+        lifecycle._refresh_owned_process_ledger()
 
 
 def test_pid_reuse_or_non_descendant_is_never_terminated(

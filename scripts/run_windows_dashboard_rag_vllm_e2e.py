@@ -29,7 +29,7 @@ from app.composition.postgres_document_ingestion import (
     PostgreSQLDocumentIngestionRuntime,
 )
 from app.composition.postgres_rag_background import BoundedPostgreSQLRAGManager
-from app.coaching.coordinator import StableCoachingOutcome
+from app.coaching.coordinator import CoachingProcessingStatus, StableCoachingOutcome
 from app.ingestion.registry_models import DocumentRegistryEntry
 from app.integration.rag_coaching import RAGCoachingProcessorDecorator
 from app.integration.policy import RAGCoachingIntegrationPolicy
@@ -49,8 +49,10 @@ COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 MINIMUM_TTL_SECONDS = 300
 MAXIMUM_TTL_SECONDS = 7_200
-POLL_TIMEOUT_SECONDS = 300.0
+DOCUMENT_POLL_TIMEOUT_SECONDS = 300.0
 POLL_INTERVAL_SECONDS = 0.2
+ORCHESTRATION_MARGIN_SECONDS = 60.0
+MINIMUM_E2E_OUTPUT_TOKENS = 256
 
 PREFLIGHT_OK = "PREFLIGHT_OK"
 E2E_OK = "E2E_OK"
@@ -62,6 +64,24 @@ E_CLEANUP_PROJECT_VERIFY = "E_CLEANUP_PROJECT_VERIFY"
 E_CLEANUP_HANDOFF_VERIFY = "E_CLEANUP_HANDOFF_VERIFY"
 E_CLEANUP_PROTECTED_VERIFY = "E_CLEANUP_PROTECTED_VERIFY"
 E_CLEANUP_UNVERIFIABLE = "E_CLEANUP_UNVERIFIABLE"
+E_COMPLETION_PROCESSOR_MISSING = "E_COMPLETION_PROCESSOR_MISSING"
+E_COMPLETION_NO_AUTHORITATIVE_OUTCOME = "E_COMPLETION_NO_AUTHORITATIVE_OUTCOME"
+E_COMPLETION_CARDINALITY = "E_COMPLETION_CARDINALITY"
+E_COMPLETION_BACKGROUND_FAILED = "E_COMPLETION_BACKGROUND_FAILED"
+E_COMPLETION_NOT_PROCESSED = "E_COMPLETION_NOT_PROCESSED"
+E_COMPLETION_RESULT_MISSING = "E_COMPLETION_RESULT_MISSING"
+E_COMPLETION_UNCLASSIFIED = "E_COMPLETION_UNCLASSIFIED"
+COMPLETION_FAILURE_PHASES = frozenset(
+    {
+        E_COMPLETION_PROCESSOR_MISSING,
+        E_COMPLETION_NO_AUTHORITATIVE_OUTCOME,
+        E_COMPLETION_CARDINALITY,
+        E_COMPLETION_BACKGROUND_FAILED,
+        E_COMPLETION_NOT_PROCESSED,
+        E_COMPLETION_RESULT_MISSING,
+        E_COMPLETION_UNCLASSIFIED,
+    }
+)
 PHASES = (
     "E_PREFLIGHT",
     "E_POSTGRES_START",
@@ -87,11 +107,21 @@ class DashboardRAGVLLME2EError(RuntimeError):
     """A fixed phase-only E2E failure."""
 
     def __init__(self, phase: str) -> None:
-        self.phase = phase if phase in PHASES else "E_PREFLIGHT"
+        self.phase = (
+            phase
+            if phase in PHASES or phase in COMPLETION_FAILURE_PHASES
+            else "E_PREFLIGHT"
+        )
         super().__init__(self.phase)
 
 
 class _CleanupPhaseError(RuntimeError):
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__(phase)
+
+
+class _CompletionPumpError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase
         super().__init__(phase)
@@ -284,6 +314,8 @@ def _preflight(environment: Mapping[str, str] | None = None) -> ControllerConfig
             temperature=_strict_float(source, "CALLMETRIC_VLLM_TEMPERATURE"),
             verify_tls=True,
         )
+        if vllm.max_output_tokens < MINIMUM_E2E_OUTPUT_TOKENS:
+            raise ValueError
     except (ValueError, TypeError):
         raise DashboardRAGVLLME2EError("E_PREFLIGHT") from None
     parsed = urlsplit(vllm.base_url)
@@ -330,7 +362,15 @@ def run(
         for phase in PHASES[1:-1]:
             try:
                 operations.run_phase(phase)
-            except BaseException:
+            except BaseException as error:
+                if phase == "E_COMPLETION_PUMP":
+                    completion_phase = (
+                        error.phase
+                        if isinstance(error, _CompletionPumpError)
+                        and error.phase in COMPLETION_FAILURE_PHASES
+                        else E_COMPLETION_UNCLASSIFIED
+                    )
+                    raise DashboardRAGVLLME2EError(completion_phase) from None
                 raise DashboardRAGVLLME2EError(phase) from None
     except BaseException as error:
         functional_primary_error = error
@@ -364,6 +404,7 @@ class _ProductionLifecycle:
         self._processor: RAGCoachingProcessorDecorator | None = None
         self._vector_count = 0
         self._protected_resources: dict[str, frozenset[str]] | None = None
+        self._owned_processes: dict[int, int] = {}
 
     def run_phase(self, phase: str) -> None:
         getattr(self, f"_{phase.removeprefix('E_').lower()}")()
@@ -402,8 +443,10 @@ class _ProductionLifecycle:
             shell=False,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+        self._refresh_owned_process_ledger()
         deadline = time.monotonic() + 240
         while time.monotonic() < deadline:
+            self._refresh_owned_process_ledger()
             created = set(self._config.handoff_root.iterdir()) - before
             ready = [item for item in created if (item / "application.dsn").is_file()]
             if len(ready) == 1:
@@ -535,7 +578,7 @@ class _ProductionLifecycle:
         runtime = self._document_runtime
         if runtime is None:
             raise RuntimeError
-        deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
+        deadline = time.monotonic() + DOCUMENT_POLL_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             entries = runtime.registry.list_documents(
                 tenant_id=runtime.tenant_id,
@@ -721,19 +764,41 @@ class _ProductionLifecycle:
             raise RuntimeError
 
     def _completion_pump(self) -> None:
-        deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
+        processor = self._processor
+        if processor is None:
+            raise _CompletionPumpError(E_COMPLETION_PROCESSOR_MISSING)
+        deadline = time.monotonic() + self._completion_timeout_seconds()
         while time.monotonic() < deadline:
-            processor = self._processor
-            if processor is None:
-                raise RuntimeError
             completed = processor.drain_completed(current_seconds=1.0)
             if completed:
-                self._outcome = completed[0]
-                if self._outcome.result is None:
-                    raise RuntimeError
+                if len(completed) != 1:
+                    raise _CompletionPumpError(E_COMPLETION_CARDINALITY)
+                outcome = completed[0]
+                if not isinstance(outcome, StableCoachingOutcome):
+                    raise _CompletionPumpError(E_COMPLETION_NOT_PROCESSED)
+                if outcome.status is CoachingProcessingStatus.FAILED:
+                    raise _CompletionPumpError(E_COMPLETION_BACKGROUND_FAILED)
+                if outcome.status is not CoachingProcessingStatus.PROCESSED:
+                    raise _CompletionPumpError(E_COMPLETION_NOT_PROCESSED)
+                if outcome.result is None:
+                    raise _CompletionPumpError(E_COMPLETION_RESULT_MISSING)
+                self._outcome = outcome
                 return
             time.sleep(POLL_INTERVAL_SECONDS)
-        raise RuntimeError
+        raise _CompletionPumpError(E_COMPLETION_NO_AUTHORITATIVE_OUTCOME)
+
+    def _completion_timeout_seconds(self) -> float:
+        settings = self._config.vllm
+        http_phase_bound = (
+            settings.connect_timeout_seconds  # pool acquisition
+            + settings.connect_timeout_seconds  # connection establishment
+            + settings.read_timeout_seconds  # request write
+            + settings.read_timeout_seconds  # response read
+        )
+        return max(
+            DOCUMENT_POLL_TIMEOUT_SECONDS,
+            http_phase_bound + ORCHESTRATION_MARGIN_SECONDS,
+        )
 
     def _citation_projection(self) -> None:
         from live_dashboard.view_models import suggestion_card
@@ -878,11 +943,14 @@ class _ProductionLifecycle:
         except BaseException as error:
             fallback_action_error = fallback_action_error or error
         service = self._service
-        initial_processes: dict[int, int] = {}
+        owned_processes = dict(self._owned_processes)
         graceful_recovery_trigger: BaseException | None = None
         if service is not None:
             try:
-                initial_processes = self._windows_process_table()
+                self._refresh_owned_process_ledger()
+                owned_processes = dict(self._owned_processes)
+                if service.pid not in owned_processes:
+                    raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
             except BaseException as error:
                 graceful_recovery_trigger = error
                 fallback_action_error = fallback_action_error or _CleanupPhaseError(
@@ -904,13 +972,13 @@ class _ProductionLifecycle:
         if graceful_recovery_trigger is None:
             try:
                 self._require_postgres_residue_absent()
-                self._require_initial_processes_absent(initial_processes)
+                self._require_initial_processes_absent(owned_processes)
             except BaseException as error:
                 graceful_recovery_trigger = error
         if graceful_recovery_trigger is not None:
             try:
                 if service is not None:
-                    self._terminate_owned_process_tree(service, initial_processes)
+                    self._terminate_owned_process_tree(service, owned_processes)
             except BaseException as error:
                 fallback_action_error = fallback_action_error or error
             try:
@@ -927,7 +995,7 @@ class _ProductionLifecycle:
         except BaseException as error:
             final_verification_error = error
         try:
-            self._require_initial_processes_absent(initial_processes)
+            self._require_initial_processes_absent(owned_processes)
         except BaseException as error:
             final_verification_error = final_verification_error or error
         try:
@@ -982,6 +1050,34 @@ class _ProductionLifecycle:
             table[process_id] = parent_id
         return table
 
+    def _refresh_owned_process_ledger(self) -> None:
+        service = self._service
+        if service is None:
+            return
+        root = service.pid
+        current = self._windows_process_table()
+        if not self._owned_processes:
+            if root not in current:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+            self._owned_processes = {
+                process_id: parent_id
+                for process_id, parent_id in current.items()
+                if process_id == root or self._is_descendant(current, process_id, root)
+            }
+            return
+        for process_id, parent_id in self._owned_processes.items():
+            if process_id in current and current[process_id] != parent_id:
+                raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
+        changed = True
+        while changed:
+            changed = False
+            for process_id, parent_id in current.items():
+                if process_id in self._owned_processes:
+                    continue
+                if parent_id in self._owned_processes and parent_id in current:
+                    self._owned_processes[process_id] = parent_id
+                    changed = True
+
     @staticmethod
     def _descendant_depth(table: Mapping[int, int], process_id: int, root: int) -> int:
         current = process_id
@@ -1028,37 +1124,26 @@ class _ProductionLifecycle:
 
         def record_current_descendants(current: Mapping[int, int]) -> None:
             nonlocal validation_failure
-            for process_id in current:
-                if process_id == root or not self._is_descendant(
-                    current, process_id, root
-                ):
-                    continue
-                candidate = process_id
-                while candidate != root:
-                    parent = current.get(candidate)
-                    if parent is None:
-                        validation_failure = validation_failure or _CleanupPhaseError(
-                            E_CLEANUP_PROCESS_VERIFY
-                        )
-                        break
-                    if candidate in owned and owned[candidate] != parent:
-                        validation_failure = validation_failure or _CleanupPhaseError(
-                            E_CLEANUP_PROCESS_VERIFY
-                        )
-                        break
-                    owned[candidate] = parent
-                    candidate = parent
+            for process_id, parent_id in owned.items():
+                if process_id in current and current[process_id] != parent_id:
+                    validation_failure = validation_failure or _CleanupPhaseError(
+                        E_CLEANUP_PROCESS_VERIFY
+                    )
+            changed = True
+            while changed:
+                changed = False
+                for process_id, parent_id in current.items():
+                    if process_id in owned:
+                        continue
+                    if parent_id in owned and parent_id in current:
+                        owned[process_id] = parent_id
+                        changed = True
 
         def terminate(process_id: int, current: Mapping[int, int]) -> None:
             nonlocal validation_failure
             if process_id not in current:
                 return
-            if process_id == root:
-                identity_matches = current[root] == owned[root]
-            else:
-                identity_matches = self._same_owned_chain(
-                    owned, current, process_id, root
-                )
+            identity_matches = current[process_id] == owned[process_id]
             if not identity_matches:
                 validation_failure = validation_failure or _CleanupPhaseError(
                     E_CLEANUP_PROCESS_VERIFY
@@ -1078,12 +1163,7 @@ class _ProductionLifecycle:
                 observed = observe()
                 if process_id not in observed:
                     return
-                if process_id == root:
-                    identity_matches = observed[root] == owned[root]
-                else:
-                    identity_matches = self._same_owned_chain(
-                        owned, observed, process_id, root
-                    )
+                identity_matches = observed[process_id] == owned[process_id]
                 validation_failure = validation_failure or _CleanupPhaseError(
                     E_CLEANUP_PROCESS_VERIFY
                     if not identity_matches
@@ -1095,10 +1175,9 @@ class _ProductionLifecycle:
             record_current_descendants(current)
             descendants = sorted(
                 (
-                    (self._descendant_depth(current, process_id, root), process_id)
-                    for process_id in current
-                    if process_id != root
-                    and self._is_descendant(current, process_id, root)
+                    (self._descendant_depth(owned, process_id, root), process_id)
+                    for process_id in owned
+                    if process_id != root and process_id in current
                 ),
                 reverse=True,
             )
@@ -1139,28 +1218,6 @@ class _ProductionLifecycle:
             return cls._descendant_depth(table, process_id, root) > 0
         except RuntimeError:
             return False
-
-    @classmethod
-    def _same_owned_chain(
-        cls,
-        initial: Mapping[int, int],
-        current: Mapping[int, int],
-        process_id: int,
-        root: int,
-    ) -> bool:
-        candidate = process_id
-        seen: set[int] = set()
-        while candidate != root:
-            if (
-                candidate in seen
-                or candidate not in initial
-                or candidate not in current
-                or initial[candidate] != current[candidate]
-            ):
-                return False
-            seen.add(candidate)
-            candidate = current[candidate]
-        return True
 
     def _cleanup_exact_postgres_project(self) -> None:
         from scripts.run_postgres_tls_service import cleanup_exact_project_resources
