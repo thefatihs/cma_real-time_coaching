@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
 import signal
@@ -717,6 +718,195 @@ def test_public_main_maps_unexpected_completion_exception_to_fixed_fallback(
     assert secret_like_detail not in captured.out
 
 
+@pytest.mark.parametrize(
+    ("child_phase", "parent_phase"), sorted(subject.POSTGRES_CHILD_PHASES.items())
+)
+def test_public_main_propagates_exact_safe_tls_child_failure_and_cleans(
+    child_phase: str,
+    parent_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+
+    class ChildFailureOperations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            self.events.append(phase)
+            if phase == "E_POSTGRES_START":
+                raise subject._PostgresChildError(parent_phase)
+
+    operations = ChildFailureOperations()
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject,
+        "_ProductionLifecycle",
+        lambda _config, _environment: operations,
+    )
+
+    assert subject.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == parent_phase
+    assert captured.err == ""
+    assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
+    assert child_phase not in captured.out
+
+
+def test_public_main_never_emits_unrecognized_tls_child_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+    secret_like_detail = "private-dsn-token-certificate-path"
+
+    class UnknownChildOperations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            self.events.append(phase)
+            if phase == "E_POSTGRES_START":
+                raise subject._PostgresChildError(secret_like_detail)
+
+    operations = UnknownChildOperations()
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject,
+        "_ProductionLifecycle",
+        lambda _config, _environment: operations,
+    )
+
+    assert subject.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == subject.E_POSTGRES_CHILD_UNCLASSIFIED
+    assert captured.err == ""
+    assert secret_like_detail not in captured.out
+    assert operations.events[-1] == "E_CLEANUP"
+
+
+def test_tls_child_reader_accepts_only_fixed_bounded_lines(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    payload = (
+        b"PR54 PostgreSQL TLS READY; TTL remaining: 300 seconds\n"
+        b"E_STARTUP PR54 PostgreSQL TLS service failed\n"
+        b"arbitrary-private-output\n"
+        + b"x" * (subject._TLS_CHILD_LINE_LIMIT + 1)
+        + b"\n"
+    )
+
+    lifecycle._read_tls_child_output(BytesIO(payload))
+
+    events = lifecycle._drain_tls_child_events()
+    assert events[:2] == (
+        subject._TLSChildOutputEvent("ready"),
+        subject._TLSChildOutputEvent("failure", subject.E_POSTGRES_CHILD_STARTUP),
+    )
+    assert all(event.kind == "malformed" for event in events[2:])
+    assert all(event.phase is None for event in events[2:])
+
+
+@pytest.mark.parametrize(
+    ("ready_count", "failures", "malformed", "expected"),
+    [
+        (0, (), False, subject.E_POSTGRES_CHILD_UNCLASSIFIED),
+        (0, (subject.E_POSTGRES_CHILD_TLS,), False, subject.E_POSTGRES_CHILD_TLS),
+        (0, (), True, subject.E_POSTGRES_CHILD_UNCLASSIFIED),
+        (
+            0,
+            (subject.E_POSTGRES_CHILD_TLS,) * 2,
+            False,
+            subject.E_POSTGRES_CHILD_UNCLASSIFIED,
+        ),
+        (1, (), False, subject.E_POSTGRES_CHILD_READY_EXIT),
+        (
+            1,
+            (subject.E_POSTGRES_CHILD_TLS,),
+            False,
+            subject.E_POSTGRES_CHILD_UNCLASSIFIED,
+        ),
+    ],
+)
+def test_exited_tls_child_classification_is_fixed(
+    ready_count: int,
+    failures: tuple[str, ...],
+    malformed: bool,
+    expected: str,
+) -> None:
+    assert (
+        subject._ProductionLifecycle._classify_exited_tls_child(
+            ready_count, failures, malformed
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("ready_count", "failures", "malformed", "expected"),
+    [
+        (0, (), False, subject.E_POSTGRES_CHILD_TIMEOUT),
+        (1, (), False, subject.E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED),
+        (
+            0,
+            (subject.E_POSTGRES_CHILD_HANDOFF,),
+            False,
+            subject.E_POSTGRES_CHILD_HANDOFF,
+        ),
+        (2, (), False, subject.E_POSTGRES_CHILD_UNCLASSIFIED),
+        (0, (), True, subject.E_POSTGRES_CHILD_UNCLASSIFIED),
+    ],
+)
+def test_tls_child_timeout_classification_is_fixed(
+    ready_count: int,
+    failures: tuple[str, ...],
+    malformed: bool,
+    expected: str,
+) -> None:
+    assert (
+        subject._ProductionLifecycle._classify_tls_child_timeout(
+            ready_count, failures, malformed
+        )
+        == expected
+    )
+
+
+def test_tls_ready_requires_fixed_line_handoff_and_live_child() -> None:
+    ready = subject._ProductionLifecycle._tls_child_startup_ready
+    assert ready(
+        ready_count=1,
+        failure_count=0,
+        malformed=False,
+        handoff_count=1,
+        child_running=True,
+    )
+    assert not ready(
+        ready_count=0,
+        failure_count=0,
+        malformed=False,
+        handoff_count=1,
+        child_running=True,
+    )
+    assert not ready(
+        ready_count=1,
+        failure_count=0,
+        malformed=False,
+        handoff_count=0,
+        child_running=True,
+    )
+    assert not ready(
+        ready_count=1,
+        failure_count=0,
+        malformed=False,
+        handoff_count=1,
+        child_running=False,
+    )
+
+
 def test_e2e_fixture_submits_exactly_one_orchestration_identity() -> None:
     source = Path(subject.__file__).read_text(encoding="utf-8")
     orchestration = source.split("def _orchestration", 1)[1].split("def _admission", 1)[
@@ -732,6 +922,7 @@ class FakeServiceProcess:
         self.poll_result = poll_result
         self.return_code = return_code
         self.pid = 123
+        self.stdout: BytesIO | None = None
 
     def poll(self) -> int | None:
         return self.poll_result
@@ -743,6 +934,118 @@ class FakeServiceProcess:
         self.waits.append(timeout)
         self.poll_result = self.return_code
         return self.return_code
+
+
+class SynchronousThread:
+    def __init__(
+        self,
+        *,
+        target: object,
+        args: tuple[object, ...],
+        name: str,
+        daemon: bool,
+    ) -> None:
+        self._target = cast(object, target)
+        self._args = args
+        self.name = name
+        self.daemon = daemon
+
+    def start(self) -> None:
+        target = cast(object, self._target)
+        assert callable(target)
+        target(*self._args)
+
+    def join(self, timeout: float | None = None) -> None:
+        assert timeout is not None
+
+    def is_alive(self) -> bool:
+        return False
+
+
+def test_postgres_start_uses_safe_child_pipe_and_requires_ready_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.stdout = BytesIO(b"PR54 PostgreSQL TLS READY; TTL remaining: 300 seconds\n")
+    captured: dict[str, object] = {}
+
+    def popen(arguments: list[str], **kwargs: object) -> FakeServiceProcess:
+        captured["arguments"] = arguments
+        captured.update(kwargs)
+        return process
+
+    monkeypatch.setattr(subject.subprocess, "Popen", popen)
+    monkeypatch.setattr(subject.threading, "Thread", SynchronousThread)
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        "scripts.run_postgres_tls_service.snapshot_protected_resources",
+        lambda _docker: {
+            "container": frozenset(),
+            "network": frozenset(),
+            "volume": frozenset(),
+        },
+    )
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {process.pid: 1})
+    handoff = (
+        Path(values[subject.HANDOFF_ROOT_ENV]) / "callmetric-postgres-tls-abcdefgh"
+    )
+    monotonic_calls = 0
+
+    def monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        if monotonic_calls == 2:
+            handoff.mkdir()
+            (handoff / "application.dsn").write_text("private", encoding="utf-8")
+        return float(monotonic_calls)
+
+    monkeypatch.setattr(subject.time, "monotonic", monotonic)
+
+    lifecycle._postgres_start()
+
+    assert lifecycle._handoff == handoff
+    assert captured["cwd"] == subject.REPOSITORY_ROOT
+    assert captured["stdout"] is subprocess.PIPE
+    assert captured["stderr"] is subprocess.STDOUT
+    assert captured["stdin"] is subprocess.DEVNULL
+    assert captured["shell"] is False
+    assert captured["creationflags"] == subprocess.CREATE_NEW_PROCESS_GROUP
+    child_environment = cast(dict[str, str], captured["env"])
+    assert (
+        child_environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH"] == BRANCH
+    )
+    assert child_environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"] == HEAD
+    assert subject.POSTGRES_CHILD_PHASES
+
+
+def test_postgres_start_propagates_recognized_child_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess(poll_result=1, return_code=1)
+    process.stdout = BytesIO(b"E_TLS PR54 PostgreSQL TLS service failed\n")
+    monkeypatch.setattr(subject.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(subject.threading, "Thread", SynchronousThread)
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        "scripts.run_postgres_tls_service.snapshot_protected_resources",
+        lambda _docker: {
+            "container": frozenset(),
+            "network": frozenset(),
+            "volume": frozenset(),
+        },
+    )
+    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {process.pid: 1})
+
+    with pytest.raises(
+        subject._PostgresChildError, match=f"^{subject.E_POSTGRES_CHILD_TLS}$"
+    ):
+        lifecycle._postgres_start()
 
 
 def _fake_process_tables(

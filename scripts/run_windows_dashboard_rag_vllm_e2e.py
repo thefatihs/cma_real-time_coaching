@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import re
 import secrets
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 from urllib.parse import urlsplit
 
 from app.composition.postgres_document_ingestion import (
@@ -71,6 +73,44 @@ E_COMPLETION_BACKGROUND_FAILED = "E_COMPLETION_BACKGROUND_FAILED"
 E_COMPLETION_NOT_PROCESSED = "E_COMPLETION_NOT_PROCESSED"
 E_COMPLETION_RESULT_MISSING = "E_COMPLETION_RESULT_MISSING"
 E_COMPLETION_UNCLASSIFIED = "E_COMPLETION_UNCLASSIFIED"
+E_POSTGRES_CHILD_REPOSITORY = "E_POSTGRES_CHILD_REPOSITORY"
+E_POSTGRES_CHILD_PREFLIGHT = "E_POSTGRES_CHILD_PREFLIGHT"
+E_POSTGRES_CHILD_TLS = "E_POSTGRES_CHILD_TLS"
+E_POSTGRES_CHILD_STARTUP = "E_POSTGRES_CHILD_STARTUP"
+E_POSTGRES_CHILD_MIGRATION = "E_POSTGRES_CHILD_MIGRATION"
+E_POSTGRES_CHILD_READINESS = "E_POSTGRES_CHILD_READINESS"
+E_POSTGRES_CHILD_HANDOFF = "E_POSTGRES_CHILD_HANDOFF"
+E_POSTGRES_CHILD_CLEANUP = "E_POSTGRES_CHILD_CLEANUP"
+E_POSTGRES_CHILD_PROTECTED_RESOURCES = "E_POSTGRES_CHILD_PROTECTED_RESOURCES"
+E_POSTGRES_CHILD_UNCLASSIFIED = "E_POSTGRES_CHILD_UNCLASSIFIED"
+E_POSTGRES_CHILD_TIMEOUT = "E_POSTGRES_CHILD_TIMEOUT"
+E_POSTGRES_CHILD_READY_EXIT = "E_POSTGRES_CHILD_READY_EXIT"
+E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED = "E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED"
+POSTGRES_CHILD_PHASES = {
+    "E_REPOSITORY": E_POSTGRES_CHILD_REPOSITORY,
+    "E_PREFLIGHT": E_POSTGRES_CHILD_PREFLIGHT,
+    "E_TLS": E_POSTGRES_CHILD_TLS,
+    "E_STARTUP": E_POSTGRES_CHILD_STARTUP,
+    "E_MIGRATION": E_POSTGRES_CHILD_MIGRATION,
+    "E_READINESS": E_POSTGRES_CHILD_READINESS,
+    "E_HANDOFF": E_POSTGRES_CHILD_HANDOFF,
+    "E_CLEANUP": E_POSTGRES_CHILD_CLEANUP,
+    "E_PROTECTED_RESOURCES": E_POSTGRES_CHILD_PROTECTED_RESOURCES,
+}
+POSTGRES_CHILD_FAILURE_PHASES = frozenset(
+    {
+        *POSTGRES_CHILD_PHASES.values(),
+        E_POSTGRES_CHILD_UNCLASSIFIED,
+        E_POSTGRES_CHILD_TIMEOUT,
+        E_POSTGRES_CHILD_READY_EXIT,
+        E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED,
+    }
+)
+_TLS_CHILD_FAILURE_SUFFIX = " PR54 PostgreSQL TLS service failed"
+_TLS_CHILD_READY_PATTERN = re.compile(
+    r"PR54 PostgreSQL TLS READY; TTL remaining: [0-9]+ seconds"
+)
+_TLS_CHILD_LINE_LIMIT = 256
 COMPLETION_FAILURE_PHASES = frozenset(
     {
         E_COMPLETION_PROCESSOR_MISSING,
@@ -109,7 +149,9 @@ class DashboardRAGVLLME2EError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = (
             phase
-            if phase in PHASES or phase in COMPLETION_FAILURE_PHASES
+            if phase in PHASES
+            or phase in COMPLETION_FAILURE_PHASES
+            or phase in POSTGRES_CHILD_FAILURE_PHASES
             else "E_PREFLIGHT"
         )
         super().__init__(self.phase)
@@ -125,6 +167,22 @@ class _CompletionPumpError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase
         super().__init__(phase)
+
+
+class _PostgresChildError(RuntimeError):
+    def __init__(self, phase: str) -> None:
+        self.phase = (
+            phase
+            if phase in POSTGRES_CHILD_FAILURE_PHASES
+            else E_POSTGRES_CHILD_UNCLASSIFIED
+        )
+        super().__init__(self.phase)
+
+
+@dataclass(frozen=True, slots=True)
+class _TLSChildOutputEvent:
+    kind: str
+    phase: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +421,10 @@ def run(
             try:
                 operations.run_phase(phase)
             except BaseException as error:
+                if phase == "E_POSTGRES_START" and isinstance(
+                    error, _PostgresChildError
+                ):
+                    raise DashboardRAGVLLME2EError(error.phase) from None
                 if phase == "E_COMPLETION_PUMP":
                     completion_phase = (
                         error.phase
@@ -405,12 +467,25 @@ class _ProductionLifecycle:
         self._vector_count = 0
         self._protected_resources: dict[str, frozenset[str]] | None = None
         self._owned_processes: dict[int, int] = {}
+        self._tls_child_events: queue.SimpleQueue[_TLSChildOutputEvent] = (
+            queue.SimpleQueue()
+        )
+        self._tls_child_output_thread: threading.Thread | None = None
 
     def run_phase(self, phase: str) -> None:
         getattr(self, f"_{phase.removeprefix('E_').lower()}")()
 
     def _postgres_start(self) -> None:
-        from scripts.run_postgres_tls_service import snapshot_protected_resources
+        from scripts.run_postgres_tls_service import (
+            CERTIFICATE_TIMEOUT_SECONDS,
+            COMPOSE_CONFIG_TIMEOUT_SECONDS,
+            COMPOSE_STARTUP_TIMEOUT_SECONDS,
+            IDENTITY_ACL_TIMEOUT_SECONDS,
+            MIGRATION_PROOF_TIMEOUT_SECONDS,
+            READINESS_COMMAND_TIMEOUT_SECONDS,
+            VALIDATION_TIMEOUT_SECONDS,
+            snapshot_protected_resources,
+        )
 
         before = set(self._config.handoff_root.iterdir())
         docker = shutil.which("docker")
@@ -438,24 +513,170 @@ class _ProductionLifecycle:
             cwd=REPOSITORY_ROOT,
             env=environment,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             shell=False,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+        output = self._service.stdout
+        if output is None:
+            raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
+        self._tls_child_output_thread = threading.Thread(
+            target=self._read_tls_child_output,
+            args=(output,),
+            name="postgres-tls-safe-output",
+            daemon=True,
+        )
+        self._tls_child_output_thread.start()
         self._refresh_owned_process_ledger()
-        deadline = time.monotonic() + 240
+        validation_command_count = 11
+        startup_timeout = (
+            validation_command_count * VALIDATION_TIMEOUT_SECONDS
+            + COMPOSE_CONFIG_TIMEOUT_SECONDS
+            + 2 * CERTIFICATE_TIMEOUT_SECONDS
+            + COMPOSE_STARTUP_TIMEOUT_SECONDS
+            + 2 * READINESS_COMMAND_TIMEOUT_SECONDS
+            + MIGRATION_PROOF_TIMEOUT_SECONDS
+            + 2 * IDENTITY_ACL_TIMEOUT_SECONDS
+            + 60.0
+        )
+        deadline = time.monotonic() + startup_timeout
+        ready_count = 0
+        failure_phases: list[str] = []
+        malformed = False
         while time.monotonic() < deadline:
             self._refresh_owned_process_ledger()
+            for event in self._drain_tls_child_events():
+                if event.kind == "ready":
+                    ready_count += 1
+                elif event.kind == "failure" and event.phase is not None:
+                    failure_phases.append(event.phase)
+                else:
+                    malformed = True
             created = set(self._config.handoff_root.iterdir()) - before
             ready = [item for item in created if (item / "application.dsn").is_file()]
-            if len(ready) == 1:
+            if malformed or ready_count > 1 or len(failure_phases) > 1:
+                raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
+            if failure_phases and ready_count:
+                raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
+            child_running = self._service.poll() is None
+            if self._tls_child_startup_ready(
+                ready_count=ready_count,
+                failure_count=len(failure_phases),
+                malformed=malformed,
+                handoff_count=len(ready),
+                child_running=child_running,
+            ):
                 self._handoff = ready[0]
                 return
-            if self._service.poll() is not None:
-                break
+            if not child_running:
+                self._join_tls_child_output_thread()
+                for event in self._drain_tls_child_events():
+                    if event.kind == "ready":
+                        ready_count += 1
+                    elif event.kind == "failure" and event.phase is not None:
+                        failure_phases.append(event.phase)
+                    else:
+                        malformed = True
+                raise _PostgresChildError(
+                    self._classify_exited_tls_child(
+                        ready_count, tuple(failure_phases), malformed
+                    )
+                )
             time.sleep(POLL_INTERVAL_SECONDS)
-        raise RuntimeError
+        raise _PostgresChildError(
+            self._classify_tls_child_timeout(
+                ready_count, tuple(failure_phases), malformed
+            )
+        )
+
+    def _read_tls_child_output(self, stream: BinaryIO) -> None:
+        try:
+            while raw_line := stream.readline(_TLS_CHILD_LINE_LIMIT + 1):
+                if len(raw_line) > _TLS_CHILD_LINE_LIMIT:
+                    self._tls_child_events.put(_TLSChildOutputEvent("malformed"))
+                    continue
+                try:
+                    line = raw_line.decode("utf-8", errors="strict").rstrip("\r\n")
+                except UnicodeDecodeError:
+                    self._tls_child_events.put(_TLSChildOutputEvent("malformed"))
+                    continue
+                if _TLS_CHILD_READY_PATTERN.fullmatch(line):
+                    self._tls_child_events.put(_TLSChildOutputEvent("ready"))
+                    continue
+                child_phase = next(
+                    (
+                        parent_phase
+                        for phase, parent_phase in POSTGRES_CHILD_PHASES.items()
+                        if line == f"{phase}{_TLS_CHILD_FAILURE_SUFFIX}"
+                    ),
+                    None,
+                )
+                if child_phase is None:
+                    self._tls_child_events.put(_TLSChildOutputEvent("malformed"))
+                else:
+                    self._tls_child_events.put(
+                        _TLSChildOutputEvent("failure", child_phase)
+                    )
+        except BaseException:
+            self._tls_child_events.put(_TLSChildOutputEvent("malformed"))
+
+    def _drain_tls_child_events(self) -> tuple[_TLSChildOutputEvent, ...]:
+        events: list[_TLSChildOutputEvent] = []
+        while True:
+            try:
+                events.append(self._tls_child_events.get_nowait())
+            except queue.Empty:
+                return tuple(events)
+
+    @staticmethod
+    def _classify_exited_tls_child(
+        ready_count: int, failure_phases: tuple[str, ...], malformed: bool
+    ) -> str:
+        if malformed or ready_count > 1 or len(failure_phases) > 1:
+            return E_POSTGRES_CHILD_UNCLASSIFIED
+        if ready_count == 0 and len(failure_phases) == 1:
+            return failure_phases[0]
+        if ready_count == 1 and not failure_phases:
+            return E_POSTGRES_CHILD_READY_EXIT
+        return E_POSTGRES_CHILD_UNCLASSIFIED
+
+    @staticmethod
+    def _tls_child_startup_ready(
+        *,
+        ready_count: int,
+        failure_count: int,
+        malformed: bool,
+        handoff_count: int,
+        child_running: bool,
+    ) -> bool:
+        return (
+            ready_count == 1
+            and failure_count == 0
+            and not malformed
+            and handoff_count == 1
+            and child_running
+        )
+
+    @staticmethod
+    def _classify_tls_child_timeout(
+        ready_count: int, failure_phases: tuple[str, ...], malformed: bool
+    ) -> str:
+        if malformed or ready_count > 1 or len(failure_phases) > 1:
+            return E_POSTGRES_CHILD_UNCLASSIFIED
+        if ready_count == 0 and len(failure_phases) == 1:
+            return failure_phases[0]
+        if ready_count == 1 and not failure_phases:
+            return E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED
+        return E_POSTGRES_CHILD_TIMEOUT
+
+    def _join_tls_child_output_thread(self) -> None:
+        thread = self._tls_child_output_thread
+        if thread is None:
+            return
+        thread.join(timeout=5.0)
+        if thread.is_alive():
+            raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
 
     def _application_dsn(self) -> str:
         if self._handoff is None:
@@ -1335,11 +1556,16 @@ class _ProductionLifecycle:
             if service.poll() is None:
                 raise _CleanupPhaseError(E_CLEANUP_PROCESS_VERIFY)
             service.wait(timeout=0)
+            self._join_tls_child_output_thread()
+            output = getattr(service, "stdout", None)
+            if output is not None:
+                output.close()
         except _CleanupPhaseError:
             raise
         except BaseException:
             raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
         self._service = None
+        self._tls_child_output_thread = None
 
 
 def main(arguments: list[str] | None = None) -> int:
