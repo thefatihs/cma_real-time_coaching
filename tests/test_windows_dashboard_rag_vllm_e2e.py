@@ -172,9 +172,10 @@ def test_every_phase_failure_cleans_once_and_stays_fixed(
             environment=environment(tmp_path),
             operations_factory=lambda _config: operations,
         )
-    expected = (
-        subject.E_COMPLETION_UNCLASSIFIED if phase == "E_COMPLETION_PUMP" else phase
-    )
+    expected = {
+        "E_COMPLETION_PUMP": subject.E_COMPLETION_UNCLASSIFIED,
+        "E_POSTGRES_START": subject.E_POSTGRES_UNCLASSIFIED,
+    }.get(phase, phase)
     assert caught.value.phase == expected
     assert str(caught.value) == expected
     assert operations.events[-1] == "E_CLEANUP"
@@ -788,6 +789,180 @@ def test_public_main_never_emits_unrecognized_tls_child_output(
     assert operations.events[-1] == "E_CLEANUP"
 
 
+@pytest.mark.parametrize(
+    "startup_phase", sorted(subject.POSTGRES_STARTUP_FAILURE_PHASES)
+)
+def test_public_main_preserves_every_fixed_postgres_startup_phase(
+    startup_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+
+    class StartupFailureOperations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            self.events.append(phase)
+            if phase == "E_POSTGRES_START":
+                raise subject._PostgresStartupError(startup_phase)
+
+    operations = StartupFailureOperations()
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject,
+        "_ProductionLifecycle",
+        lambda _config, _environment: operations,
+    )
+
+    assert subject.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out.strip() == startup_phase
+    assert captured.err == ""
+    assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
+
+
+def test_unexpected_postgres_startup_exception_never_emits_generic_start_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+    secret_like_detail = "private-startup-path-token-dsn"
+
+    class UnexpectedStartupOperations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            if phase == "E_POSTGRES_START":
+                raise RuntimeError(secret_like_detail)
+            super().run_phase(phase)
+
+    operations = UnexpectedStartupOperations()
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject,
+        "_ProductionLifecycle",
+        lambda _config, _environment: operations,
+    )
+
+    assert subject.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out.strip() == subject.E_POSTGRES_UNCLASSIFIED
+    assert captured.out.strip() != "E_POSTGRES_START"
+    assert captured.err == ""
+    assert secret_like_detail not in captured.out
+    assert secret_like_detail not in captured.err
+
+
+@pytest.mark.parametrize("phase", sorted(subject.POSTGRES_STARTUP_FAILURE_PHASES))
+def test_startup_boundary_maps_every_unexpected_source_to_its_fixed_phase(
+    phase: str,
+) -> None:
+    def fail() -> None:
+        raise RuntimeError("private-boundary-detail")
+
+    with pytest.raises(subject._PostgresStartupError, match=f"^{phase}$"):
+        subject._ProductionLifecycle._postgres_startup_call(phase, fail)
+
+
+def test_postgres_startup_only_uses_postgres_preflight_and_same_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    for key in (
+        subject.PROVIDER_ENV,
+        subject.POLICY_ENV,
+        subject.TOKEN_ENV,
+        subject.CA_ENV,
+        "CALLMETRIC_VLLM_BASE_URL",
+        "CALLMETRIC_VLLM_MODEL_ID",
+        "CALLMETRIC_VLLM_CONNECT_TIMEOUT_SECONDS",
+        "CALLMETRIC_VLLM_READ_TIMEOUT_SECONDS",
+        "CALLMETRIC_VLLM_MAX_OUTPUT_TOKENS",
+        "CALLMETRIC_VLLM_TEMPERATURE",
+        "CALLMETRIC_VLLM_VERIFY_TLS",
+    ):
+        values.pop(key)
+    monkeypatch.setattr(
+        subject,
+        "validate_local_minilm_snapshot",
+        lambda _value: pytest.fail("startup-only must not validate a model"),
+    )
+    monkeypatch.setattr(
+        subject,
+        "_read_json",
+        lambda *_args: pytest.fail("startup-only must not read provider policy"),
+    )
+    operations = FakeOperations()
+
+    assert (
+        subject.run_postgres_startup_only(
+            environment=values,
+            operations_factory=lambda _config: operations,
+        )
+        == subject.POSTGRES_STARTUP_OK
+    )
+    assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
+
+
+def test_postgres_startup_only_dispatches_production_start_and_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    events: list[str] = []
+    monkeypatch.setattr(
+        subject._ProductionLifecycle,
+        "_postgres_start",
+        lambda _self: events.append("start"),
+    )
+    monkeypatch.setattr(
+        subject._ProductionLifecycle,
+        "cleanup",
+        lambda _self: events.append("cleanup"),
+    )
+
+    assert (
+        subject.run_postgres_startup_only(environment=environment(tmp_path))
+        == subject.POSTGRES_STARTUP_OK
+    )
+    assert events == ["start", "cleanup"]
+
+
+def test_postgres_startup_only_failure_cleans_and_preserves_exact_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+
+    class OwnershipFailureOperations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            self.events.append(phase)
+            raise subject._PostgresStartupError(subject.E_POSTGRES_OWNERSHIP)
+
+    operations = OwnershipFailureOperations(cleanup_failure=True)
+    with pytest.raises(subject.DashboardRAGVLLME2EError) as caught:
+        subject.run_postgres_startup_only(
+            environment=environment(tmp_path),
+            operations_factory=lambda _config: operations,
+        )
+    assert caught.value.phase == subject.E_POSTGRES_OWNERSHIP
+    assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
+
+
+def test_main_postgres_startup_only_prints_only_fixed_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        subject, "run_postgres_startup_only", lambda: subject.POSTGRES_STARTUP_OK
+    )
+    assert subject.main(["--postgres-startup-only"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == subject.POSTGRES_STARTUP_OK
+    assert captured.err == ""
+
+
 def test_tls_child_reader_accepts_only_fixed_bounded_lines(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1054,6 +1229,53 @@ def test_postgres_start_propagates_recognized_child_failure(
         subject._PostgresChildError, match=f"^{subject.E_POSTGRES_CHILD_TLS}$"
     ):
         lifecycle._postgres_start()
+
+
+def test_postgres_ownership_initialization_failure_is_distinct_after_ready(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess()
+    process.stdout = BytesIO(b"PR54 PostgreSQL TLS READY; TTL remaining: 300 seconds\n")
+    monkeypatch.setattr(subject.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(subject.threading, "Thread", SynchronousThread)
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        "scripts.run_postgres_tls_service.snapshot_protected_resources",
+        lambda _docker: {
+            "container": frozenset(),
+            "network": frozenset(),
+            "volume": frozenset(),
+        },
+    )
+    handoff = (
+        Path(values[subject.HANDOFF_ROOT_ENV]) / "callmetric-postgres-tls-abcdefgh"
+    )
+    monotonic_calls = 0
+
+    def monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        if monotonic_calls == 2:
+            handoff.mkdir()
+            (handoff / "application.dsn").write_text("private", encoding="utf-8")
+        return float(monotonic_calls)
+
+    monkeypatch.setattr(subject.time, "monotonic", monotonic)
+    monkeypatch.setattr(
+        lifecycle,
+        "_windows_process_table",
+        lambda: (_ for _ in ()).throw(RuntimeError("private-wmi-detail")),
+    )
+
+    with pytest.raises(
+        subject._PostgresStartupError, match=f"^{subject.E_POSTGRES_OWNERSHIP}$"
+    ):
+        lifecycle._postgres_start()
+
+    assert lifecycle._handoff == handoff
 
 
 class FailingChildStream(BytesIO):

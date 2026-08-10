@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, TypeVar
 from urllib.parse import urlsplit
 
 from app.composition.postgres_document_ingestion import (
@@ -58,6 +58,7 @@ MINIMUM_E2E_OUTPUT_TOKENS = 256
 
 PREFLIGHT_OK = "PREFLIGHT_OK"
 E2E_OK = "E2E_OK"
+POSTGRES_STARTUP_OK = "POSTGRES_STARTUP_OK"
 E_CLEANUP_PROCESS_ACTION = "E_CLEANUP_PROCESS_ACTION"
 E_CLEANUP_PROJECT_ACTION = "E_CLEANUP_PROJECT_ACTION"
 E_CLEANUP_HANDOFF_ACTION = "E_CLEANUP_HANDOFF_ACTION"
@@ -86,6 +87,16 @@ E_POSTGRES_CHILD_UNCLASSIFIED = "E_POSTGRES_CHILD_UNCLASSIFIED"
 E_POSTGRES_CHILD_TIMEOUT = "E_POSTGRES_CHILD_TIMEOUT"
 E_POSTGRES_CHILD_READY_EXIT = "E_POSTGRES_CHILD_READY_EXIT"
 E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED = "E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED"
+E_POSTGRES_CONFIG = "E_POSTGRES_CONFIG"
+E_POSTGRES_DOCKER = "E_POSTGRES_DOCKER"
+E_POSTGRES_LAUNCH = "E_POSTGRES_LAUNCH"
+E_POSTGRES_READER = "E_POSTGRES_READER"
+E_POSTGRES_CLOCK = "E_POSTGRES_CLOCK"
+E_POSTGRES_POLL = "E_POSTGRES_POLL"
+E_POSTGRES_EVENTS = "E_POSTGRES_EVENTS"
+E_POSTGRES_HANDOFF = "E_POSTGRES_HANDOFF"
+E_POSTGRES_OWNERSHIP = "E_POSTGRES_OWNERSHIP"
+E_POSTGRES_UNCLASSIFIED = "E_POSTGRES_UNCLASSIFIED"
 POSTGRES_CHILD_PHASES = {
     "E_REPOSITORY": E_POSTGRES_CHILD_REPOSITORY,
     "E_PREFLIGHT": E_POSTGRES_CHILD_PREFLIGHT,
@@ -106,11 +117,26 @@ POSTGRES_CHILD_FAILURE_PHASES = frozenset(
         E_POSTGRES_CHILD_HANDOFF_NOT_PRODUCED,
     }
 )
+POSTGRES_STARTUP_FAILURE_PHASES = frozenset(
+    {
+        E_POSTGRES_CONFIG,
+        E_POSTGRES_DOCKER,
+        E_POSTGRES_LAUNCH,
+        E_POSTGRES_READER,
+        E_POSTGRES_CLOCK,
+        E_POSTGRES_POLL,
+        E_POSTGRES_EVENTS,
+        E_POSTGRES_HANDOFF,
+        E_POSTGRES_OWNERSHIP,
+        E_POSTGRES_UNCLASSIFIED,
+    }
+)
 _TLS_CHILD_FAILURE_SUFFIX = " PR54 PostgreSQL TLS service failed"
 _TLS_CHILD_READY_PATTERN = re.compile(
     r"PR54 PostgreSQL TLS READY; TTL remaining: [0-9]+ seconds"
 )
 _TLS_CHILD_LINE_LIMIT = 256
+_StartupT = TypeVar("_StartupT")
 COMPLETION_FAILURE_PHASES = frozenset(
     {
         E_COMPLETION_PROCESSOR_MISSING,
@@ -152,6 +178,7 @@ class DashboardRAGVLLME2EError(RuntimeError):
             if phase in PHASES
             or phase in COMPLETION_FAILURE_PHASES
             or phase in POSTGRES_CHILD_FAILURE_PHASES
+            or phase in POSTGRES_STARTUP_FAILURE_PHASES
             else "E_PREFLIGHT"
         )
         super().__init__(self.phase)
@@ -179,6 +206,16 @@ class _PostgresChildError(RuntimeError):
         super().__init__(self.phase)
 
 
+class _PostgresStartupError(RuntimeError):
+    def __init__(self, phase: str) -> None:
+        self.phase = (
+            phase
+            if phase in POSTGRES_STARTUP_FAILURE_PHASES
+            else E_POSTGRES_UNCLASSIFIED
+        )
+        super().__init__(self.phase)
+
+
 @dataclass(frozen=True, slots=True)
 class _TLSChildOutputEvent:
     kind: str
@@ -194,6 +231,15 @@ class ControllerConfig:
     provider: KnowledgeBaseRAGProviderSettings = field(repr=False)
     policy: RAGCoachingIntegrationPolicy = field(repr=False)
     vllm: VLLMOpenAICompatibleSettings = field(repr=False)
+    ttl_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLStartupConfig:
+    branch: str
+    head: str
+    baseline: str
+    handoff_root: Path = field(repr=False)
     ttl_seconds: int
 
 
@@ -271,7 +317,20 @@ def preflight(environment: Mapping[str, str] | None = None) -> ControllerConfig:
         raise DashboardRAGVLLME2EError("E_PREFLIGHT") from None
 
 
-def _preflight(environment: Mapping[str, str] | None = None) -> ControllerConfig:
+def postgres_preflight(
+    environment: Mapping[str, str] | None = None,
+) -> PostgreSQLStartupConfig:
+    try:
+        return _postgres_preflight(environment)
+    except DashboardRAGVLLME2EError:
+        raise
+    except Exception:
+        raise DashboardRAGVLLME2EError("E_PREFLIGHT") from None
+
+
+def _postgres_preflight(
+    environment: Mapping[str, str] | None = None,
+) -> PostgreSQLStartupConfig:
     source = os.environ if environment is None else environment
     if sys.platform != "win32" or Path.cwd().resolve() != REPOSITORY_ROOT:
         raise DashboardRAGVLLME2EError("E_PREFLIGHT")
@@ -309,6 +368,18 @@ def _preflight(environment: Mapping[str, str] | None = None) -> ControllerConfig
         or REPOSITORY_ROOT in handoff_root.resolve(strict=True).parents
     ):
         raise DashboardRAGVLLME2EError("E_PREFLIGHT")
+    raw_ttl = _required(source, TTL_ENV)
+    if not raw_ttl.isascii() or not raw_ttl.isdigit():
+        raise DashboardRAGVLLME2EError("E_PREFLIGHT")
+    ttl = int(raw_ttl)
+    if not MINIMUM_TTL_SECONDS <= ttl <= MAXIMUM_TTL_SECONDS:
+        raise DashboardRAGVLLME2EError("E_PREFLIGHT")
+    return PostgreSQLStartupConfig(branch, head, baseline, handoff_root, ttl)
+
+
+def _preflight(environment: Mapping[str, str] | None = None) -> ControllerConfig:
+    source = os.environ if environment is None else environment
+    postgres = _postgres_preflight(source)
     provider = KnowledgeBaseRAGProviderSettings.model_validate(
         _read_json(
             _required(source, PROVIDER_ENV),
@@ -390,14 +461,15 @@ def _preflight(environment: Mapping[str, str] | None = None) -> ControllerConfig
         or not ca_path.is_file()
     ):
         raise DashboardRAGVLLME2EError("E_PREFLIGHT")
-    raw_ttl = _required(source, TTL_ENV)
-    if not raw_ttl.isascii() or not raw_ttl.isdigit():
-        raise DashboardRAGVLLME2EError("E_PREFLIGHT")
-    ttl = int(raw_ttl)
-    if not MINIMUM_TTL_SECONDS <= ttl <= MAXIMUM_TTL_SECONDS:
-        raise DashboardRAGVLLME2EError("E_PREFLIGHT")
     return ControllerConfig(
-        branch, head, baseline, handoff_root, provider, policy, vllm, ttl
+        postgres.branch,
+        postgres.head,
+        postgres.baseline,
+        postgres.handoff_root,
+        provider,
+        policy,
+        vllm,
+        postgres.ttl_seconds,
     )
 
 
@@ -422,9 +494,11 @@ def run(
                 operations.run_phase(phase)
             except BaseException as error:
                 if phase == "E_POSTGRES_START" and isinstance(
-                    error, _PostgresChildError
+                    error, (_PostgresChildError, _PostgresStartupError)
                 ):
                     raise DashboardRAGVLLME2EError(error.phase) from None
+                if phase == "E_POSTGRES_START":
+                    raise DashboardRAGVLLME2EError(E_POSTGRES_UNCLASSIFIED) from None
                 if phase == "E_COMPLETION_PUMP":
                     completion_phase = (
                         error.phase
@@ -446,13 +520,52 @@ def run(
     return E2E_OK
 
 
+def run_postgres_startup_only(
+    *,
+    environment: Mapping[str, str] | None = None,
+    operations_factory: (
+        Callable[[PostgreSQLStartupConfig], LifecycleOperations] | None
+    ) = None,
+) -> str:
+    config = postgres_preflight(environment)
+    operations = (
+        _ProductionLifecycle(config, os.environ if environment is None else environment)
+        if operations_factory is None
+        else operations_factory(config)
+    )
+    functional_primary_error: BaseException | None = None
+    try:
+        operations.run_phase("E_POSTGRES_START")
+    except (_PostgresChildError, _PostgresStartupError) as error:
+        functional_primary_error = DashboardRAGVLLME2EError(error.phase)
+    except BaseException:
+        functional_primary_error = DashboardRAGVLLME2EError(E_POSTGRES_UNCLASSIFIED)
+    try:
+        operations.cleanup()
+    except BaseException:
+        if functional_primary_error is None:
+            functional_primary_error = DashboardRAGVLLME2EError("E_CLEANUP")
+    if functional_primary_error is not None:
+        raise functional_primary_error
+    return POSTGRES_STARTUP_OK
+
+
 class _ProductionLifecycle:
     """Stateful adapter around existing production boundaries."""
 
     def __init__(
-        self, config: ControllerConfig, environment: Mapping[str, str]
+        self,
+        config: ControllerConfig | PostgreSQLStartupConfig,
+        environment: Mapping[str, str],
     ) -> None:
-        self._config = config
+        self._postgres_config = PostgreSQLStartupConfig(
+            config.branch,
+            config.head,
+            config.baseline,
+            config.handoff_root,
+            config.ttl_seconds,
+        )
+        self._config = config if isinstance(config, ControllerConfig) else None
         self._environment = dict(environment)
         self._service: subprocess.Popen[bytes] | None = None
         self._postgres_project: str | None = None
@@ -475,59 +588,108 @@ class _ProductionLifecycle:
     def run_phase(self, phase: str) -> None:
         getattr(self, f"_{phase.removeprefix('E_').lower()}")()
 
-    def _postgres_start(self) -> None:
-        from scripts.run_postgres_tls_service import (
-            CERTIFICATE_TIMEOUT_SECONDS,
-            COMPOSE_CONFIG_TIMEOUT_SECONDS,
-            COMPOSE_STARTUP_TIMEOUT_SECONDS,
-            IDENTITY_ACL_TIMEOUT_SECONDS,
-            MIGRATION_PROOF_TIMEOUT_SECONDS,
-            READINESS_COMMAND_TIMEOUT_SECONDS,
-            VALIDATION_TIMEOUT_SECONDS,
-            snapshot_protected_resources,
-        )
+    def _full_config(self) -> ControllerConfig:
+        if self._config is None:
+            raise RuntimeError
+        return self._config
 
-        before = set(self._config.handoff_root.iterdir())
-        docker = shutil.which("docker")
-        if docker is None:
-            raise RuntimeError
-        self._protected_resources = snapshot_protected_resources(docker)
-        environment = dict(self._environment)
-        environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH"] = (
-            self._config.branch
+    def _postgres_start(self) -> None:
+        try:
+            self._start_postgres_service()
+        except (_PostgresChildError, _PostgresStartupError):
+            raise
+        except BaseException:
+            raise _PostgresStartupError(E_POSTGRES_UNCLASSIFIED) from None
+
+    @staticmethod
+    def _postgres_startup_call(
+        phase: str, operation: Callable[[], _StartupT]
+    ) -> _StartupT:
+        try:
+            return operation()
+        except (_PostgresChildError, _PostgresStartupError):
+            raise
+        except BaseException:
+            raise _PostgresStartupError(phase) from None
+
+    def _start_postgres_service(self) -> None:
+        try:
+            from scripts.run_postgres_tls_service import (
+                CERTIFICATE_TIMEOUT_SECONDS,
+                COMPOSE_CONFIG_TIMEOUT_SECONDS,
+                COMPOSE_STARTUP_TIMEOUT_SECONDS,
+                IDENTITY_ACL_TIMEOUT_SECONDS,
+                MIGRATION_PROOF_TIMEOUT_SECONDS,
+                READINESS_COMMAND_TIMEOUT_SECONDS,
+                VALIDATION_TIMEOUT_SECONDS,
+                snapshot_protected_resources,
+            )
+        except BaseException:
+            raise _PostgresStartupError(E_POSTGRES_CONFIG) from None
+
+        before = self._postgres_startup_call(
+            E_POSTGRES_CONFIG,
+            lambda: set(self._postgres_config.handoff_root.iterdir()),
         )
-        environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"] = self._config.head
-        project = f"callmetric-pgvector-tls-{os.getpid()}-{secrets.token_hex(6)}"
+        docker = self._postgres_startup_call(
+            E_POSTGRES_DOCKER, lambda: shutil.which("docker")
+        )
+        if docker is None:
+            raise _PostgresStartupError(E_POSTGRES_DOCKER)
+        self._protected_resources = self._postgres_startup_call(
+            E_POSTGRES_DOCKER, lambda: snapshot_protected_resources(docker)
+        )
+        environment = self._postgres_startup_call(
+            E_POSTGRES_CONFIG, lambda: dict(self._environment)
+        )
+        environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_BRANCH"] = (
+            self._postgres_config.branch
+        )
+        environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"] = (
+            self._postgres_config.head
+        )
+        project = self._postgres_startup_call(
+            E_POSTGRES_CONFIG,
+            lambda: f"callmetric-pgvector-tls-{os.getpid()}-{secrets.token_hex(6)}",
+        )
         if not re.fullmatch(r"callmetric-pgvector-tls-[0-9]+-[a-f0-9]{12}", project):
-            raise RuntimeError
+            raise _PostgresStartupError(E_POSTGRES_CONFIG)
         self._postgres_project = project
         environment["CALLMETRIC_POSTGRES_TLS_SERVICE_PROJECT_NAME"] = project
-        self._service = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "scripts.run_postgres_tls_service",
-                "--ttl-seconds",
-                str(self._config.ttl_seconds),
-            ],
-            cwd=REPOSITORY_ROOT,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            shell=False,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        self._service = self._postgres_startup_call(
+            E_POSTGRES_LAUNCH,
+            lambda: subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "scripts.run_postgres_tls_service",
+                    "--ttl-seconds",
+                    str(self._postgres_config.ttl_seconds),
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            ),
         )
         output = self._service.stdout
         if output is None:
-            raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
-        self._tls_child_output_thread = threading.Thread(
-            target=self._read_tls_child_output,
-            args=(output,),
-            name="postgres-tls-safe-output",
-            daemon=True,
+            raise _PostgresStartupError(E_POSTGRES_READER)
+        self._tls_child_output_thread = self._postgres_startup_call(
+            E_POSTGRES_READER,
+            lambda: threading.Thread(
+                target=self._read_tls_child_output,
+                args=(output,),
+                name="postgres-tls-safe-output",
+                daemon=True,
+            ),
         )
-        self._tls_child_output_thread.start()
+        self._postgres_startup_call(
+            E_POSTGRES_READER, self._tls_child_output_thread.start
+        )
         validation_command_count = 11
         startup_timeout = (
             validation_command_count * VALIDATION_TIMEOUT_SECONDS
@@ -539,13 +701,19 @@ class _ProductionLifecycle:
             + 2 * IDENTITY_ACL_TIMEOUT_SECONDS
             + 60.0
         )
-        deadline = time.monotonic() + startup_timeout
+        deadline = self._postgres_startup_call(
+            E_POSTGRES_CLOCK, lambda: time.monotonic() + startup_timeout
+        )
         ready_count = 0
         failure_phases: list[str] = []
         malformed = False
-        while time.monotonic() < deadline:
-            child_running = self._service.poll() is None
-            for event in self._drain_tls_child_events():
+        while self._postgres_startup_call(E_POSTGRES_CLOCK, time.monotonic) < deadline:
+            child_running = (
+                self._postgres_startup_call(E_POSTGRES_POLL, self._service.poll) is None
+            )
+            for event in self._postgres_startup_call(
+                E_POSTGRES_EVENTS, self._drain_tls_child_events
+            ):
                 if event.kind == "ready":
                     ready_count += 1
                 elif event.kind == "failure" and event.phase is not None:
@@ -553,8 +721,12 @@ class _ProductionLifecycle:
                 else:
                     malformed = True
             if not child_running:
-                self._join_tls_child_output_thread()
-                for event in self._drain_tls_child_events():
+                self._postgres_startup_call(
+                    E_POSTGRES_READER, self._join_tls_child_output_thread
+                )
+                for event in self._postgres_startup_call(
+                    E_POSTGRES_EVENTS, self._drain_tls_child_events
+                ):
                     if event.kind == "ready":
                         ready_count += 1
                     elif event.kind == "failure" and event.phase is not None:
@@ -572,9 +744,16 @@ class _ProductionLifecycle:
                 raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
             if len(failure_phases) == 1:
                 raise _PostgresChildError(failure_phases[0])
-            self._refresh_owned_process_ledger()
-            created = set(self._config.handoff_root.iterdir()) - before
-            ready = [item for item in created if (item / "application.dsn").is_file()]
+            created = self._postgres_startup_call(
+                E_POSTGRES_HANDOFF,
+                lambda: set(self._postgres_config.handoff_root.iterdir()) - before,
+            )
+            ready = self._postgres_startup_call(
+                E_POSTGRES_HANDOFF,
+                lambda: [
+                    item for item in created if (item / "application.dsn").is_file()
+                ],
+            )
             if self._tls_child_startup_ready(
                 ready_count=ready_count,
                 failure_count=len(failure_phases),
@@ -583,8 +762,13 @@ class _ProductionLifecycle:
                 child_running=child_running,
             ):
                 self._handoff = ready[0]
+                self._postgres_startup_call(
+                    E_POSTGRES_OWNERSHIP, self._refresh_owned_process_ledger
+                )
                 return
-            time.sleep(POLL_INTERVAL_SECONDS)
+            self._postgres_startup_call(
+                E_POSTGRES_CLOCK, lambda: time.sleep(POLL_INTERVAL_SECONDS)
+            )
         raise _PostgresChildError(
             self._classify_tls_child_timeout(
                 ready_count, tuple(failure_phases), malformed
@@ -736,7 +920,7 @@ class _ProductionLifecycle:
 
         provision_profile_bound_postgres_rag(
             postgres_settings=self._settings(),
-            knowledge_base_settings=self._config.provider,
+            knowledge_base_settings=self._full_config().provider,
             psycopg_connect=connect,
         )
 
@@ -746,12 +930,12 @@ class _ProductionLifecycle:
 
         composition = compose_profile_bound_postgres_rag(
             postgres_settings=self._settings(),
-            knowledge_base_settings=self._config.provider,
+            knowledge_base_settings=self._full_config().provider,
             psycopg_connect=connect,
         )
         vector = composition.embedder.embed_query(
-            tenant_id=self._config.provider.tenant_id,
-            knowledge_base_id=self._config.provider.knowledge_base_id,
+            tenant_id=self._full_config().provider.tenant_id,
+            knowledge_base_id=self._full_config().provider.knowledge_base_id,
             text="Synthetic bounded product question.",
         )
         norm = math.sqrt(sum(value * value for value in vector))
@@ -772,7 +956,7 @@ class _ProductionLifecycle:
 
         runtime = compose_postgres_document_ingestion(
             postgres_settings=self._settings(),
-            knowledge_base_settings=self._config.provider,
+            knowledge_base_settings=self._full_config().provider,
             ingestion_settings=PostgreSQLDocumentIngestionSettings(capacity=2),
             psycopg_connect=connect,
         )
@@ -882,13 +1066,14 @@ class _ProductionLifecycle:
         from live_dashboard.demo_data import tenant_demos
         from psycopg import connect
 
-        provider = self._config.provider
+        controller_config = self._full_config()
+        provider = controller_config.provider
         composition = compose_profile_bound_postgres_rag_orchestration(
             postgres_settings=self._settings(),
             knowledge_base_settings=provider,
             psycopg_connect=connect,
             llm_gateway_factory=lambda: VLLMOpenAICompatibleGateway(
-                self._config.vllm,
+                controller_config.vllm,
                 structured_output_json_schema=coaching_wire_json_schema(),
             ),
         )
@@ -906,8 +1091,8 @@ class _ProductionLifecycle:
         manager.start()
         self._rag_manager = manager
         demo = tenant_demos()[provider.tenant_id]
-        config = demo.config.model_copy(deep=True)
-        config.rag = config.rag.model_copy(
+        tenant_config = demo.config.model_copy(deep=True)
+        tenant_config.rag = tenant_config.rag.model_copy(
             update={
                 "enabled": True,
                 "knowledge_base_id": provider.knowledge_base_id,
@@ -915,10 +1100,10 @@ class _ProductionLifecycle:
                 "minimum_score": 0.0,
             }
         )
-        config.coaching = config.coaching.model_copy(
+        tenant_config.coaching = tenant_config.coaching.model_copy(
             update={"enable_llm": True, "cooldown_seconds": 0.0}
         )
-        config = TenantConfig.model_validate(config.model_dump())
+        tenant_config = TenantConfig.model_validate(tenant_config.model_dump())
         now = datetime.now(UTC)
         event = TranscriptEvent(
             tenant_id=provider.tenant_id,
@@ -937,7 +1122,7 @@ class _ProductionLifecycle:
             transcript_event_id=event.event_id,
             labels=[
                 ClassificationLabel(
-                    name=self._config.policy.rag_llm_enabled_labels[0], score=1.0
+                    name=controller_config.policy.rag_llm_enabled_labels[0], score=1.0
                 )
             ],
             action=CoachingAction.RAG_ACTION,
@@ -950,17 +1135,19 @@ class _ProductionLifecycle:
             classification, transcript_revision=1, source_sequence=None
         )
         coordinator = CoachingCoordinator(
-            config, state, RuleBasedCoachingEngine(config, demo.rules)
+            tenant_config,
+            state,
+            RuleBasedCoachingEngine(tenant_config, demo.rules),
         )
         runtime = self._document_runtime
         if runtime is None:
             raise RuntimeError
         processor = compose_rag_coaching_processor(
             coordinator=coordinator,
-            tenant_config=config,
+            tenant_config=tenant_config,
             integration=RAGCoachingIntegrationDependencies(
                 background_manager=manager,
-                policy=self._config.policy,
+                policy=controller_config.policy,
                 suggestion_id_factory=lambda: uuid4().hex,
                 utc_datetime_factory=lambda: datetime.now(UTC),
                 citation_projector=SafeCoachingCitationProjector(runtime.registry),
@@ -972,7 +1159,7 @@ class _ProductionLifecycle:
             event,
             1.0,
             classification_event=classification,
-            active_labels=(self._config.policy.rag_llm_enabled_labels[0],),
+            active_labels=(controller_config.policy.rag_llm_enabled_labels[0],),
         )
         self._processor = processor
 
@@ -1010,7 +1197,7 @@ class _ProductionLifecycle:
         raise _CompletionPumpError(E_COMPLETION_NO_AUTHORITATIVE_OUTCOME)
 
     def _completion_timeout_seconds(self) -> float:
-        settings = self._config.vllm
+        settings = self._full_config().vllm
         http_phase_bound = (
             settings.connect_timeout_seconds  # pool acquisition
             + settings.connect_timeout_seconds  # connection establishment
@@ -1460,7 +1647,7 @@ class _ProductionLifecycle:
         if handoff is None:
             return
         try:
-            cleanup_exact_handoff_child(self._config.handoff_root, handoff)
+            cleanup_exact_handoff_child(self._postgres_config.handoff_root, handoff)
         except BaseException:
             raise _CleanupPhaseError(E_CLEANUP_HANDOFF_ACTION) from None
 
@@ -1571,11 +1758,14 @@ class _ProductionLifecycle:
 
 def main(arguments: list[str] | None = None) -> int:
     values = sys.argv[1:] if arguments is None else arguments
-    if values not in ([], ["--preflight-only"]):
+    if values not in ([], ["--preflight-only"], ["--postgres-startup-only"]):
         print("E_PREFLIGHT")
         return 1
     try:
-        print(run(preflight_only=bool(values)))
+        if values == ["--postgres-startup-only"]:
+            print(run_postgres_startup_only())
+        else:
+            print(run(preflight_only=bool(values)))
     except DashboardRAGVLLME2EError as error:
         print(error.phase)
         return 1
