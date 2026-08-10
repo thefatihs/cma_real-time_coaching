@@ -988,7 +988,14 @@ def test_postgres_start_uses_safe_child_pipe_and_requires_ready_handoff(
             "volume": frozenset(),
         },
     )
-    monkeypatch.setattr(lifecycle, "_windows_process_table", lambda: {process.pid: 1})
+    process_table_calls = 0
+
+    def process_table() -> dict[int, int]:
+        nonlocal process_table_calls
+        process_table_calls += 1
+        return {process.pid: 1}
+
+    monkeypatch.setattr(lifecycle, "_windows_process_table", process_table)
     handoff = (
         Path(values[subject.HANDOFF_ROOT_ENV]) / "callmetric-postgres-tls-abcdefgh"
     )
@@ -1019,6 +1026,7 @@ def test_postgres_start_uses_safe_child_pipe_and_requires_ready_handoff(
     )
     assert child_environment["CALLMETRIC_POSTGRES_TLS_SERVICE_EXPECTED_HEAD"] == HEAD
     assert subject.POSTGRES_CHILD_PHASES
+    assert process_table_calls == 1
 
 
 def test_postgres_start_propagates_recognized_child_failure(
@@ -1046,6 +1054,131 @@ def test_postgres_start_propagates_recognized_child_failure(
         subject._PostgresChildError, match=f"^{subject.E_POSTGRES_CHILD_TLS}$"
     ):
         lifecycle._postgres_start()
+
+
+class FailingChildStream(BytesIO):
+    def readline(self, size: int | None = -1) -> bytes:
+        raise OSError("private-reader-detail")
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            b"E_TLS PR54 PostgreSQL TLS service failed\n",
+            subject.E_POSTGRES_CHILD_TLS,
+        ),
+        (b"private-unknown-child-line\n", subject.E_POSTGRES_CHILD_UNCLASSIFIED),
+        (b"\xff\n", subject.E_POSTGRES_CHILD_UNCLASSIFIED),
+        (
+            b"E_TLS PR54 PostgreSQL TLS service failed\n"
+            b"E_STARTUP PR54 PostgreSQL TLS service failed\n",
+            subject.E_POSTGRES_CHILD_UNCLASSIFIED,
+        ),
+        (b"", subject.E_POSTGRES_CHILD_UNCLASSIFIED),
+        (
+            b"PR54 PostgreSQL TLS READY; TTL remaining: 300 seconds\n",
+            subject.E_POSTGRES_CHILD_READY_EXIT,
+        ),
+    ],
+)
+def test_public_main_classifies_buffered_child_output_before_absent_root_lookup(
+    payload: bytes,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+    lifecycle = subject._ProductionLifecycle(config, values)
+    process = FakeServiceProcess(poll_result=1, return_code=1)
+    process.stdout = BytesIO(payload)
+    cleanup_calls = 0
+
+    def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        raise RuntimeError("private-cleanup-detail")
+
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject, "_ProductionLifecycle", lambda _config, _environment: lifecycle
+    )
+    monkeypatch.setattr(subject.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(subject.threading, "Thread", SynchronousThread)
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        "scripts.run_postgres_tls_service.snapshot_protected_resources",
+        lambda _docker: {
+            "container": frozenset(),
+            "network": frozenset(),
+            "volume": frozenset(),
+        },
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_windows_process_table",
+        lambda: pytest.fail("exited child must be classified before WMI lookup"),
+    )
+    monkeypatch.setattr(lifecycle, "cleanup", cleanup)
+
+    assert subject.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == expected
+    assert captured.err == ""
+    assert "private" not in captured.out
+    assert cleanup_calls == 1
+
+
+def test_public_main_classifies_reader_failure_before_absent_root_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    config = subject.preflight(values)
+    lifecycle = subject._ProductionLifecycle(config, values)
+    process = FakeServiceProcess(poll_result=1, return_code=1)
+    process.stdout = FailingChildStream()
+    cleanup_calls = 0
+
+    def cleanup() -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+
+    monkeypatch.setattr(subject, "_preflight", lambda _environment=None: config)
+    monkeypatch.setattr(
+        subject, "_ProductionLifecycle", lambda _config, _environment: lifecycle
+    )
+    monkeypatch.setattr(subject.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(subject.threading, "Thread", SynchronousThread)
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        "scripts.run_postgres_tls_service.snapshot_protected_resources",
+        lambda _docker: {
+            "container": frozenset(),
+            "network": frozenset(),
+            "volume": frozenset(),
+        },
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_windows_process_table",
+        lambda: pytest.fail("reader failure must be classified before WMI lookup"),
+    )
+    monkeypatch.setattr(lifecycle, "cleanup", cleanup)
+
+    assert subject.main([]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.strip() == subject.E_POSTGRES_CHILD_UNCLASSIFIED
+    assert captured.err == ""
+    assert "private-reader-detail" not in captured.out
+    assert cleanup_calls == 1
 
 
 def _fake_process_tables(

@@ -528,7 +528,6 @@ class _ProductionLifecycle:
             daemon=True,
         )
         self._tls_child_output_thread.start()
-        self._refresh_owned_process_ledger()
         validation_command_count = 11
         startup_timeout = (
             validation_command_count * VALIDATION_TIMEOUT_SECONDS
@@ -545,7 +544,7 @@ class _ProductionLifecycle:
         failure_phases: list[str] = []
         malformed = False
         while time.monotonic() < deadline:
-            self._refresh_owned_process_ledger()
+            child_running = self._service.poll() is None
             for event in self._drain_tls_child_events():
                 if event.kind == "ready":
                     ready_count += 1
@@ -553,22 +552,6 @@ class _ProductionLifecycle:
                     failure_phases.append(event.phase)
                 else:
                     malformed = True
-            created = set(self._config.handoff_root.iterdir()) - before
-            ready = [item for item in created if (item / "application.dsn").is_file()]
-            if malformed or ready_count > 1 or len(failure_phases) > 1:
-                raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
-            if failure_phases and ready_count:
-                raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
-            child_running = self._service.poll() is None
-            if self._tls_child_startup_ready(
-                ready_count=ready_count,
-                failure_count=len(failure_phases),
-                malformed=malformed,
-                handoff_count=len(ready),
-                child_running=child_running,
-            ):
-                self._handoff = ready[0]
-                return
             if not child_running:
                 self._join_tls_child_output_thread()
                 for event in self._drain_tls_child_events():
@@ -583,6 +566,24 @@ class _ProductionLifecycle:
                         ready_count, tuple(failure_phases), malformed
                     )
                 )
+            if malformed or ready_count > 1 or len(failure_phases) > 1:
+                raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
+            if failure_phases and ready_count:
+                raise _PostgresChildError(E_POSTGRES_CHILD_UNCLASSIFIED)
+            if len(failure_phases) == 1:
+                raise _PostgresChildError(failure_phases[0])
+            self._refresh_owned_process_ledger()
+            created = set(self._config.handoff_root.iterdir()) - before
+            ready = [item for item in created if (item / "application.dsn").is_file()]
+            if self._tls_child_startup_ready(
+                ready_count=ready_count,
+                failure_count=len(failure_phases),
+                malformed=malformed,
+                handoff_count=len(ready),
+                child_running=child_running,
+            ):
+                self._handoff = ready[0]
+                return
             time.sleep(POLL_INTERVAL_SECONDS)
         raise _PostgresChildError(
             self._classify_tls_child_timeout(
