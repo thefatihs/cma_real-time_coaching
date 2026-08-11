@@ -11,6 +11,11 @@ import pytest
 
 import app.composition as composition_exports
 import app.composition.postgres_rag_background as background_module
+from app.composition.postgres_rag import (
+    BoundedRAGDiagnosticObserver,
+    RAGDiagnosticStage,
+    RAGDiagnosticStatus,
+)
 from app.composition.postgres_rag_background import (
     BoundedPostgreSQLRAGManager,
     RAGOrchestrationCompletion,
@@ -131,6 +136,7 @@ def _manager(
     *,
     max_workers: int = 1,
     capacity: int = 2,
+    observer: BoundedRAGDiagnosticObserver | None = None,
 ) -> tuple[BoundedPostgreSQLRAGManager, FakeRunner]:
     selected = FakeRunner() if runner is None else runner
     return (
@@ -138,6 +144,7 @@ def _manager(
             runner=selected,
             max_workers=max_workers,
             capacity=capacity,
+            diagnostic_observer=observer,
         ),
         selected,
     )
@@ -547,6 +554,77 @@ def test_close_wait_false_discards_late_work_and_is_idempotent() -> None:
     assert manager.submit(_request()).status is (
         RAGOrchestrationSubmissionStatus.CLOSED
     )
+
+
+def test_observer_records_run_callback_and_authoritative_publication() -> None:
+    observer = BoundedRAGDiagnosticObserver()
+    manager, _runner = _manager(observer=observer)
+    manager.start()
+    _announce(manager)
+    manager.submit(_request())
+
+    completion = _poll_until(manager, _identity())
+    snapshot = observer.snapshot()
+
+    assert completion.status is RAGOrchestrationCompletionStatus.SUCCEEDED
+    assert tuple((event.stage, event.status) for event in snapshot.events) == (
+        (RAGDiagnosticStage.RUN, RAGDiagnosticStatus.ENTER),
+        (RAGDiagnosticStage.RUN, RAGDiagnosticStatus.OK),
+        (RAGDiagnosticStage.CALLBACK, RAGDiagnosticStatus.ENTER),
+        (RAGDiagnosticStage.CALLBACK, RAGDiagnosticStatus.OK),
+    )
+    assert snapshot.future_terminal is True
+    assert snapshot.callback_entered is True
+    assert snapshot.authoritative_completion_published is True
+    manager.close()
+
+
+def test_close_wait_false_reports_running_future_without_waiting() -> None:
+    entered = Event()
+    release = Event()
+    observer = BoundedRAGDiagnosticObserver()
+    runner = FakeRunner(run_entered=entered, run_release=release)
+    manager, _runner = _manager(runner, observer=observer)
+    manager.start()
+    _announce(manager)
+    manager.submit(_request())
+    assert entered.wait(timeout=5)
+
+    manager.close(wait=False)
+    snapshot = observer.snapshot()
+
+    assert snapshot.worker_live is True
+    assert snapshot.running_after_close is True
+    assert snapshot.authoritative_completion_published is False
+    release.set()
+
+
+def test_observer_snapshot_is_bounded_immutable_and_concurrent() -> None:
+    observer = BoundedRAGDiagnosticObserver()
+
+    def record() -> None:
+        for _index in range(20):
+            observer.record(RAGDiagnosticStage.RUN, RAGDiagnosticStatus.ENTER)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        tuple(executor.map(lambda _index: record(), range(4)))
+
+    first = observer.snapshot()
+    second = observer.snapshot()
+    assert first == second
+    assert len(first.events) == len(RAGDiagnosticStage) * 3
+    assert first.unclassified is True
+
+
+def test_observer_invalid_input_fails_closed_without_raising() -> None:
+    observer = BoundedRAGDiagnosticObserver()
+
+    observer.record(cast(Any, "injected-secret"), RAGDiagnosticStatus.ENTER)
+
+    snapshot = observer.snapshot()
+    assert snapshot.events == ()
+    assert snapshot.unclassified is True
+    assert "injected-secret" not in repr(snapshot)
 
 
 def test_public_exports_and_no_deferred_features_are_exact() -> None:

@@ -5,7 +5,9 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from enum import Enum
+from threading import Lock
+from typing import Any, Literal, TypeVar
 
 from psycopg import Connection
 from pydantic import (
@@ -40,11 +42,210 @@ from app.vector_store.postgres.runner import (
 from app.vector_store.postgres.transaction import (
     PsycopgPostgreSQLVectorTransaction,
 )
+from app.vector_store.models import (
+    SearchRequest,
+    SearchResult,
+    VectorBatchWriteRequest,
+    VectorBatchWriteResult,
+    VectorRecord,
+)
 
 PsycopgConnect = Callable[..., Connection[Any]]
 SecureSSLMode = Literal["require", "verify-ca", "verify-full"]
 
 _APPLICATION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_ResultT = TypeVar("_ResultT")
+
+
+class RAGDiagnosticStage(str, Enum):
+    RUN = "D_RUN"
+    EMBED = "D_EMBED"
+    VECTOR = "D_VECTOR"
+    PROMPT = "D_PROMPT"
+    GATEWAY_FACTORY = "D_GATEWAY_FACTORY"
+    HTTP = "D_HTTP"
+    CALLBACK = "D_CALLBACK"
+
+
+class RAGDiagnosticStatus(str, Enum):
+    ENTER = "ENTER"
+    OK = "OK"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class RAGDiagnosticEvent:
+    stage: RAGDiagnosticStage
+    status: RAGDiagnosticStatus
+
+
+@dataclass(frozen=True, slots=True)
+class RAGDiagnosticSnapshot:
+    events: tuple[RAGDiagnosticEvent, ...]
+    worker_live: bool
+    future_terminal: bool
+    callback_entered: bool
+    authoritative_completion_published: bool
+    running_after_close: bool
+    unclassified: bool
+
+
+class BoundedRAGDiagnosticObserver:
+    """Thread-safe, value-free diagnostics for one bounded orchestration."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._events: list[RAGDiagnosticEvent] = []
+        self._worker_live = False
+        self._future_terminal = False
+        self._callback_entered = False
+        self._completion_published = False
+        self._running_after_close = False
+        self._unclassified = False
+
+    def record(self, stage: RAGDiagnosticStage, status: RAGDiagnosticStatus) -> None:
+        try:
+            if not isinstance(stage, RAGDiagnosticStage) or not isinstance(
+                status, RAGDiagnosticStatus
+            ):
+                raise ValueError
+            with self._lock:
+                if len(self._events) >= len(RAGDiagnosticStage) * 3:
+                    self._unclassified = True
+                    return
+                self._events.append(RAGDiagnosticEvent(stage, status))
+        except BaseException:
+            self._mark_unclassified()
+
+    def update_execution(
+        self,
+        *,
+        worker_live: bool | None = None,
+        future_terminal: bool | None = None,
+        callback_entered: bool | None = None,
+        completion_published: bool | None = None,
+        running_after_close: bool | None = None,
+    ) -> None:
+        values = (
+            worker_live,
+            future_terminal,
+            callback_entered,
+            completion_published,
+            running_after_close,
+        )
+        if any(value is not None and type(value) is not bool for value in values):
+            self._mark_unclassified()
+            return
+        try:
+            with self._lock:
+                if worker_live is not None:
+                    self._worker_live = worker_live
+                if future_terminal is not None:
+                    self._future_terminal = future_terminal
+                if callback_entered is not None:
+                    self._callback_entered = callback_entered
+                if completion_published is not None:
+                    self._completion_published = completion_published
+                if running_after_close is not None:
+                    self._running_after_close = running_after_close
+        except BaseException:
+            self._mark_unclassified()
+
+    def snapshot(self) -> RAGDiagnosticSnapshot:
+        with self._lock:
+            return RAGDiagnosticSnapshot(
+                events=tuple(self._events),
+                worker_live=self._worker_live,
+                future_terminal=self._future_terminal,
+                callback_entered=self._callback_entered,
+                authoritative_completion_published=self._completion_published,
+                running_after_close=self._running_after_close,
+                unclassified=self._unclassified,
+            )
+
+    def _mark_unclassified(self) -> None:
+        try:
+            with self._lock:
+                self._unclassified = True
+        except BaseException:
+            pass
+
+
+def observe_rag_stage(
+    observer: BoundedRAGDiagnosticObserver | None,
+    stage: RAGDiagnosticStage,
+    operation: Callable[[], _ResultT],
+) -> _ResultT:
+    """Run an unchanged operation with optional fixed-value observation."""
+    if observer is None:
+        return operation()
+    observer.record(stage, RAGDiagnosticStatus.ENTER)
+    try:
+        result = operation()
+    except BaseException:
+        observer.record(stage, RAGDiagnosticStatus.FAILED)
+        raise
+    observer.record(stage, RAGDiagnosticStatus.OK)
+    return result
+
+
+class _ObservedEmbedder(SentenceTransformerQueryEmbedder):
+    def __init__(
+        self,
+        delegate: SentenceTransformerQueryEmbedder,
+        observer: BoundedRAGDiagnosticObserver,
+    ) -> None:
+        self._delegate = delegate
+        self._observer = observer
+
+    def embed_query(
+        self, *, tenant_id: str, knowledge_base_id: str, text: str
+    ) -> tuple[float, ...]:
+        return observe_rag_stage(
+            self._observer,
+            RAGDiagnosticStage.EMBED,
+            lambda: self._delegate.embed_query(
+                tenant_id=tenant_id,
+                knowledge_base_id=knowledge_base_id,
+                text=text,
+            ),
+        )
+
+    def embed_documents(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        texts: tuple[str, ...],
+    ) -> tuple[tuple[float, ...], ...]:
+        return self._delegate.embed_documents(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            texts=texts,
+        )
+
+
+class _ObservedVectorStore(ProfileBoundPostgreSQLVectorStore):
+    def __init__(
+        self,
+        delegate: ProfileBoundPostgreSQLVectorStore,
+        observer: BoundedRAGDiagnosticObserver,
+    ) -> None:
+        self._delegate = delegate
+        self._observer = observer
+
+    def upsert(self, record: VectorRecord) -> None:
+        self._delegate.upsert(record)
+
+    def search(self, request: SearchRequest) -> SearchResult:
+        return observe_rag_stage(
+            self._observer,
+            RAGDiagnosticStage.VECTOR,
+            lambda: self._delegate.search(request),
+        )
+
+    def admit_batch(self, request: VectorBatchWriteRequest) -> VectorBatchWriteResult:
+        return self._delegate.admit_batch(request)
 
 
 class PostgreSQLVectorStoreSettings(BaseSettings):
@@ -160,6 +361,7 @@ def compose_profile_bound_postgres_rag(
     knowledge_base_settings: KnowledgeBaseRAGProviderSettings,
     psycopg_connect: PsycopgConnect,
     embedding_backend_factory: BackendFactory | None = None,
+    diagnostic_observer: BoundedRAGDiagnosticObserver | None = None,
 ) -> PostgreSQLRAGComposition:
     """Construct dependencies without opening connections or loading models."""
     if not isinstance(postgres_settings, PostgreSQLVectorStoreSettings):
@@ -176,6 +378,10 @@ def compose_profile_bound_postgres_rag(
         embedding_backend_factory
     ):
         raise ValueError("embedding_backend_factory must be callable")
+    if diagnostic_observer is not None and not isinstance(
+        diagnostic_observer, BoundedRAGDiagnosticObserver
+    ):
+        raise ValueError("diagnostic_observer is invalid")
 
     def base_connection_factory() -> Connection[Any]:
         return psycopg_connect(
@@ -218,13 +424,20 @@ def compose_profile_bound_postgres_rag(
         embedder_config,
         backend_factory=embedding_backend_factory,
     )
-    ingestion_service = DocumentIngestionService(embedder, vector_store)
-    retriever = VectorBackedRetriever(embedder, vector_store)
+    effective_embedder = embedder
+    effective_vector_store = vector_store
+    if diagnostic_observer is not None:
+        effective_embedder = _ObservedEmbedder(embedder, diagnostic_observer)
+        effective_vector_store = _ObservedVectorStore(vector_store, diagnostic_observer)
+    ingestion_service = DocumentIngestionService(
+        effective_embedder, effective_vector_store
+    )
+    retriever = VectorBackedRetriever(effective_embedder, effective_vector_store)
     return PostgreSQLRAGComposition(
         profile=profile,
         profile_repository=profile_repository,
-        vector_store=vector_store,
-        embedder=embedder,
+        vector_store=effective_vector_store,
+        embedder=effective_embedder,
         ingestion_service=ingestion_service,
         retriever=retriever,
     )

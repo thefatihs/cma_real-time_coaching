@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from threading import Event, Lock
 
+from app.composition.postgres_rag import (
+    BoundedRAGDiagnosticObserver,
+    RAGDiagnosticSnapshot,
+    RAGDiagnosticStage,
+    RAGDiagnosticStatus,
+    observe_rag_stage,
+)
 from app.composition.postgres_rag_runtime import (
     ProfileVerifiedPostgreSQLRAGRunner,
 )
@@ -101,6 +108,7 @@ class BoundedPostgreSQLRAGManager:
         runner: ProfileVerifiedPostgreSQLRAGRunner,
         max_workers: int,
         capacity: int,
+        diagnostic_observer: BoundedRAGDiagnosticObserver | None = None,
     ) -> None:
         if not isinstance(runner, ProfileVerifiedPostgreSQLRAGRunner):
             raise ValueError("runner must be ProfileVerifiedPostgreSQLRAGRunner")
@@ -108,7 +116,12 @@ class BoundedPostgreSQLRAGManager:
         self._capacity = _strict_positive_integer(capacity, "capacity")
         if self._capacity < self._max_workers:
             raise ValueError("capacity must be greater than or equal to max_workers")
+        if diagnostic_observer is not None and not isinstance(
+            diagnostic_observer, BoundedRAGDiagnosticObserver
+        ):
+            raise ValueError("diagnostic_observer is invalid")
         self._runner = runner
+        self._diagnostic_observer = diagnostic_observer
         self._lock = Lock()
         self._executor: ThreadPoolExecutor | None = None
         self._start_attempt: _StartAttempt | None = None
@@ -255,7 +268,7 @@ class BoundedPostgreSQLRAGManager:
             self._reservations += 1
             self._submitted_identities.add(identity)
             try:
-                future = executor.submit(self._runner.run, request)
+                future = executor.submit(self._run_observed, request)
             except BaseException:
                 self._submitted_identities.remove(identity)
                 self._release_reservation()
@@ -304,6 +317,12 @@ class BoundedPostgreSQLRAGManager:
             self._reservations = 0
         for future in futures:
             future.cancel()
+        observer = self._diagnostic_observer
+        if observer is not None:
+            observer.update_execution(
+                future_terminal=all(future.done() for future in futures),
+                running_after_close=any(not future.done() for future in futures),
+            )
         if executor is not None:
             executor.shutdown(wait=wait, cancel_futures=True)
 
@@ -312,6 +331,10 @@ class BoundedPostgreSQLRAGManager:
         identity: RAGOrchestrationIdentity,
         future: Future[OrchestrationResult | None],
     ) -> None:
+        observer = self._diagnostic_observer
+        if observer is not None:
+            observer.record(RAGDiagnosticStage.CALLBACK, RAGDiagnosticStatus.ENTER)
+            observer.update_execution(future_terminal=True, callback_entered=True)
         if future.cancelled():
             completion: RAGOrchestrationCompletion | None = None
         else:
@@ -337,6 +360,38 @@ class BoundedPostgreSQLRAGManager:
                 self._release_reservation()
                 return
             self._completions[identity] = completion
+            if observer is not None:
+                observer.update_execution(completion_published=True)
+                observer.record(RAGDiagnosticStage.CALLBACK, RAGDiagnosticStatus.OK)
+
+    def diagnostic_snapshot(self) -> RAGDiagnosticSnapshot | None:
+        observer = self._diagnostic_observer
+        if observer is None:
+            return None
+        with self._lock:
+            futures = tuple(self._futures.values())
+        if futures:
+            observer.update_execution(
+                future_terminal=all(future.done() for future in futures)
+            )
+        return observer.snapshot()
+
+    def _run_observed(
+        self,
+        request: OrchestrationRequest,
+    ) -> OrchestrationResult | None:
+        observer = self._diagnostic_observer
+        if observer is not None:
+            observer.update_execution(worker_live=True)
+        try:
+            return observe_rag_stage(
+                observer,
+                RAGDiagnosticStage.RUN,
+                lambda: self._runner.run(request),
+            )
+        finally:
+            if observer is not None:
+                observer.update_execution(worker_live=False)
 
     def _release_reservation(self) -> None:
         if self._reservations <= 0:

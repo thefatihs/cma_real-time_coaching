@@ -13,11 +13,17 @@ from psycopg import Connection
 from pydantic import SecretStr, ValidationError
 
 import app.composition as composition_exports
+import app.composition.postgres_rag as rag_composition
 from app.composition import (
     KnowledgeBaseRAGProviderSettings,
     PostgreSQLRAGComposition,
     PostgreSQLVectorStoreSettings,
     compose_profile_bound_postgres_rag,
+)
+from app.composition.postgres_rag import (
+    BoundedRAGDiagnosticObserver,
+    RAGDiagnosticStage,
+    RAGDiagnosticStatus,
 )
 from app.embeddings.sentence_transformers import SentenceTransformerQueryEmbedder
 from app.vector_store.embedding_profile import EmbeddingDistanceMetric
@@ -58,6 +64,30 @@ class BackendFactory:
         del config
         self.calls += 1
         raise AssertionError("backend factory must remain deferred")
+
+
+class FakeObservedEmbedder:
+    def embed_query(
+        self, *, tenant_id: str, knowledge_base_id: str, text: str
+    ) -> tuple[float, ...]:
+        del tenant_id, knowledge_base_id, text
+        return (1.0,)
+
+    def embed_documents(
+        self,
+        *,
+        tenant_id: str,
+        knowledge_base_id: str,
+        texts: tuple[str, ...],
+    ) -> tuple[tuple[float, ...], ...]:
+        del tenant_id, knowledge_base_id
+        return tuple((1.0,) for _text in texts)
+
+
+class FakeObservedVectorStore:
+    def search(self, request: object) -> str:
+        del request
+        return "synthetic-result"
 
 
 def _postgres_settings() -> PostgreSQLVectorStoreSettings:
@@ -115,6 +145,31 @@ def test_postgres_settings_load_exact_environment_and_are_frozen(
     assert settings.application_name == "callmetric-rag"
     with pytest.raises(ValidationError):
         settings.connect_timeout_seconds = 6
+
+
+def test_observed_embed_and_vector_boundaries_delegate_exactly() -> None:
+    observer = BoundedRAGDiagnosticObserver()
+    embedder = rag_composition._ObservedEmbedder(
+        cast(SentenceTransformerQueryEmbedder, FakeObservedEmbedder()), observer
+    )
+    vector_store = rag_composition._ObservedVectorStore(
+        cast(Any, FakeObservedVectorStore()), observer
+    )
+
+    assert embedder.embed_query(
+        tenant_id="tenant-synthetic",
+        knowledge_base_id="kb-synthetic",
+        text="Synthetic question",
+    ) == (1.0,)
+    assert vector_store.search(cast(Any, object())) == "synthetic-result"
+    assert tuple(
+        (event.stage, event.status) for event in observer.snapshot().events
+    ) == (
+        (RAGDiagnosticStage.EMBED, RAGDiagnosticStatus.ENTER),
+        (RAGDiagnosticStage.EMBED, RAGDiagnosticStatus.OK),
+        (RAGDiagnosticStage.VECTOR, RAGDiagnosticStatus.ENTER),
+        (RAGDiagnosticStage.VECTOR, RAGDiagnosticStatus.OK),
+    )
 
 
 def test_postgres_settings_do_not_load_dotenv(

@@ -19,6 +19,12 @@ from app.coaching.coordinator import (
     CoachingSourcePresentation,
     StableCoachingOutcome,
 )
+from app.composition.postgres_rag import (
+    RAGDiagnosticEvent,
+    RAGDiagnosticSnapshot,
+    RAGDiagnosticStage,
+    RAGDiagnosticStatus,
+)
 from app.coaching.coordinator import _cooldown_available
 
 HEAD = "4" * 40
@@ -500,6 +506,108 @@ def test_completion_at_exact_deadline_exhausts_without_an_extra_poll(
         lifecycle._completion_pump()
 
     assert processor.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("stage", "phase"),
+    [
+        (RAGDiagnosticStage.RUN, subject.E_COMPLETION_STALLED_RUN_ENTER),
+        (RAGDiagnosticStage.EMBED, subject.E_COMPLETION_STALLED_EMBED_ENTER),
+        (RAGDiagnosticStage.VECTOR, subject.E_COMPLETION_STALLED_VECTOR_ENTER),
+        (RAGDiagnosticStage.PROMPT, subject.E_COMPLETION_STALLED_PROMPT_ENTER),
+        (
+            RAGDiagnosticStage.GATEWAY_FACTORY,
+            subject.E_COMPLETION_STALLED_GATEWAY_FACTORY_ENTER,
+        ),
+        (RAGDiagnosticStage.HTTP, subject.E_COMPLETION_STALLED_HTTP_ENTER),
+        (RAGDiagnosticStage.CALLBACK, subject.E_COMPLETION_STALLED_CALLBACK_ENTER),
+    ],
+)
+def test_completion_stall_reports_exact_last_entered_stage(
+    stage: RAGDiagnosticStage, phase: str
+) -> None:
+    snapshot = RAGDiagnosticSnapshot(
+        events=(RAGDiagnosticEvent(stage, RAGDiagnosticStatus.ENTER),),
+        worker_live=True,
+        future_terminal=False,
+        callback_entered=False,
+        authoritative_completion_published=False,
+        running_after_close=False,
+        unclassified=False,
+    )
+
+    assert subject._stalled_completion_phase(snapshot) == phase
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "phase"),
+    [
+        (
+            RAGDiagnosticSnapshot((), False, True, False, False, False, False),
+            subject.E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED,
+        ),
+        (
+            RAGDiagnosticSnapshot((), False, True, True, False, False, False),
+            subject.E_COMPLETION_STALLED_CALLBACK_ENTER,
+        ),
+        (
+            RAGDiagnosticSnapshot((), False, False, False, False, False, False),
+            subject.E_COMPLETION_STALLED_NO_STAGE,
+        ),
+        (
+            RAGDiagnosticSnapshot(
+                (
+                    RAGDiagnosticEvent(
+                        RAGDiagnosticStage.RUN, RAGDiagnosticStatus.FAILED
+                    ),
+                ),
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ),
+            subject.E_COMPLETION_STALLED_FAILED,
+        ),
+        (
+            RAGDiagnosticSnapshot(
+                (RAGDiagnosticEvent(RAGDiagnosticStage.RUN, RAGDiagnosticStatus.OK),),
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ),
+            subject.E_COMPLETION_STALLED_WORKER_NOT_LIVE,
+        ),
+    ],
+)
+def test_completion_stall_distinguishes_terminal_and_publication_states(
+    snapshot: RAGDiagnosticSnapshot, phase: str
+) -> None:
+    assert subject._stalled_completion_phase(snapshot) == phase
+
+
+def test_completion_diagnostic_snapshot_never_contains_injected_secret() -> None:
+    snapshot = RAGDiagnosticSnapshot(
+        events=(
+            RAGDiagnosticEvent(RAGDiagnosticStage.HTTP, RAGDiagnosticStatus.FAILED),
+        ),
+        worker_live=False,
+        future_terminal=True,
+        callback_entered=True,
+        authoritative_completion_published=False,
+        running_after_close=True,
+        unclassified=True,
+    )
+
+    phase = subject._stalled_completion_phase(snapshot)
+
+    assert phase == subject.E_COMPLETION_STALLED_UNCLASSIFIED
+    assert "injected-secret" not in repr(snapshot)
+    assert "injected-secret" not in phase
 
 
 def test_terminal_failure_stops_without_a_second_wait_or_poll(

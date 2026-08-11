@@ -27,8 +27,14 @@ from app.composition.postgres_document_ingestion import (
     MINILM_MODEL,
     validate_local_minilm_snapshot,
 )
-from app.composition.postgres_rag import KnowledgeBaseRAGProviderSettings
-from app.composition.postgres_rag import PostgreSQLVectorStoreSettings
+from app.composition.postgres_rag import (
+    BoundedRAGDiagnosticObserver,
+    KnowledgeBaseRAGProviderSettings,
+    PostgreSQLVectorStoreSettings,
+    RAGDiagnosticSnapshot,
+    RAGDiagnosticStage,
+    RAGDiagnosticStatus,
+)
 from app.composition.postgres_document_ingestion import (
     PostgreSQLDocumentIngestionRuntime,
 )
@@ -89,6 +95,29 @@ E_COMPLETION_BACKGROUND_FAILED = "E_COMPLETION_BACKGROUND_FAILED"
 E_COMPLETION_NOT_PROCESSED = "E_COMPLETION_NOT_PROCESSED"
 E_COMPLETION_RESULT_MISSING = "E_COMPLETION_RESULT_MISSING"
 E_COMPLETION_UNCLASSIFIED = "E_COMPLETION_UNCLASSIFIED"
+E_COMPLETION_STALLED_RUN_ENTER = "E_COMPLETION_STALLED_RUN_ENTER"
+E_COMPLETION_STALLED_EMBED_ENTER = "E_COMPLETION_STALLED_EMBED_ENTER"
+E_COMPLETION_STALLED_VECTOR_ENTER = "E_COMPLETION_STALLED_VECTOR_ENTER"
+E_COMPLETION_STALLED_PROMPT_ENTER = "E_COMPLETION_STALLED_PROMPT_ENTER"
+E_COMPLETION_STALLED_GATEWAY_FACTORY_ENTER = (
+    "E_COMPLETION_STALLED_GATEWAY_FACTORY_ENTER"
+)
+E_COMPLETION_STALLED_HTTP_ENTER = "E_COMPLETION_STALLED_HTTP_ENTER"
+E_COMPLETION_STALLED_CALLBACK_ENTER = "E_COMPLETION_STALLED_CALLBACK_ENTER"
+E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED = "E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED"
+E_COMPLETION_STALLED_NO_STAGE = "E_COMPLETION_STALLED_NO_STAGE"
+E_COMPLETION_STALLED_FAILED = "E_COMPLETION_STALLED_FAILED"
+E_COMPLETION_STALLED_WORKER_NOT_LIVE = "E_COMPLETION_STALLED_WORKER_NOT_LIVE"
+E_COMPLETION_STALLED_UNCLASSIFIED = "E_COMPLETION_STALLED_UNCLASSIFIED"
+_STALLED_STAGE_PHASES = {
+    RAGDiagnosticStage.RUN: E_COMPLETION_STALLED_RUN_ENTER,
+    RAGDiagnosticStage.EMBED: E_COMPLETION_STALLED_EMBED_ENTER,
+    RAGDiagnosticStage.VECTOR: E_COMPLETION_STALLED_VECTOR_ENTER,
+    RAGDiagnosticStage.PROMPT: E_COMPLETION_STALLED_PROMPT_ENTER,
+    RAGDiagnosticStage.GATEWAY_FACTORY: E_COMPLETION_STALLED_GATEWAY_FACTORY_ENTER,
+    RAGDiagnosticStage.HTTP: E_COMPLETION_STALLED_HTTP_ENTER,
+    RAGDiagnosticStage.CALLBACK: E_COMPLETION_STALLED_CALLBACK_ENTER,
+}
 E_POSTGRES_CHILD_REPOSITORY = "E_POSTGRES_CHILD_REPOSITORY"
 E_POSTGRES_CHILD_PREFLIGHT = "E_POSTGRES_CHILD_PREFLIGHT"
 E_POSTGRES_CHILD_TLS = "E_POSTGRES_CHILD_TLS"
@@ -161,6 +190,18 @@ COMPLETION_FAILURE_PHASES = frozenset(
         E_COMPLETION_NOT_PROCESSED,
         E_COMPLETION_RESULT_MISSING,
         E_COMPLETION_UNCLASSIFIED,
+        E_COMPLETION_STALLED_RUN_ENTER,
+        E_COMPLETION_STALLED_EMBED_ENTER,
+        E_COMPLETION_STALLED_VECTOR_ENTER,
+        E_COMPLETION_STALLED_PROMPT_ENTER,
+        E_COMPLETION_STALLED_GATEWAY_FACTORY_ENTER,
+        E_COMPLETION_STALLED_HTTP_ENTER,
+        E_COMPLETION_STALLED_CALLBACK_ENTER,
+        E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED,
+        E_COMPLETION_STALLED_NO_STAGE,
+        E_COMPLETION_STALLED_FAILED,
+        E_COMPLETION_STALLED_WORKER_NOT_LIVE,
+        E_COMPLETION_STALLED_UNCLASSIFIED,
     }
 )
 PHASES = (
@@ -210,6 +251,45 @@ class _CompletionPumpError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase
         super().__init__(phase)
+
+
+def _stalled_completion_phase(snapshot: RAGDiagnosticSnapshot) -> str:
+    if not isinstance(snapshot, RAGDiagnosticSnapshot) or snapshot.unclassified:
+        return E_COMPLETION_STALLED_UNCLASSIFIED
+    if snapshot.authoritative_completion_published:
+        return E_COMPLETION_NO_AUTHORITATIVE_OUTCOME
+    if snapshot.future_terminal:
+        if not snapshot.callback_entered:
+            return E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED
+        return E_COMPLETION_STALLED_CALLBACK_ENTER
+    active: set[RAGDiagnosticStage] = set()
+    last_failed = False
+    try:
+        for event in snapshot.events:
+            if event.status is RAGDiagnosticStatus.ENTER:
+                active.add(event.stage)
+                last_failed = False
+            elif event.status is RAGDiagnosticStatus.OK:
+                active.discard(event.stage)
+                last_failed = False
+            elif event.status is RAGDiagnosticStatus.FAILED:
+                active.discard(event.stage)
+                last_failed = True
+            else:
+                return E_COMPLETION_STALLED_UNCLASSIFIED
+    except BaseException:
+        return E_COMPLETION_STALLED_UNCLASSIFIED
+    if active:
+        for event in reversed(snapshot.events):
+            if event.stage in active:
+                return _STALLED_STAGE_PHASES[event.stage]
+    if last_failed:
+        return E_COMPLETION_STALLED_FAILED
+    if not snapshot.events:
+        return E_COMPLETION_STALLED_NO_STAGE
+    if not snapshot.worker_live:
+        return E_COMPLETION_STALLED_WORKER_NOT_LIVE
+    return E_COMPLETION_STALLED_UNCLASSIFIED
 
 
 class _PostgresChildError(RuntimeError):
@@ -610,6 +690,7 @@ class _ProductionLifecycle:
         self._postgres_settings: PostgreSQLVectorStoreSettings | None = None
         self._document_runtime: PostgreSQLDocumentIngestionRuntime | None = None
         self._rag_manager: BoundedPostgreSQLRAGManager | None = None
+        self._rag_diagnostic_observer: BoundedRAGDiagnosticObserver | None = None
         self._target_entry: DocumentRegistryEntry | None = None
         self._other_entry: DocumentRegistryEntry | None = None
         self._outcome: StableCoachingOutcome | None = None
@@ -1120,6 +1201,8 @@ class _ProductionLifecycle:
 
         controller_config = self._full_config()
         provider = controller_config.provider
+        observer = BoundedRAGDiagnosticObserver()
+        self._rag_diagnostic_observer = observer
         composition = compose_profile_bound_postgres_rag_orchestration(
             postgres_settings=self._settings(),
             knowledge_base_settings=provider,
@@ -1128,6 +1211,7 @@ class _ProductionLifecycle:
                 controller_config.vllm,
                 structured_output_json_schema=coaching_wire_json_schema(),
             ),
+            diagnostic_observer=observer,
         )
         settings = self._settings()
         readiness = PostgreSQLSchemaReadinessChecker(
@@ -1139,7 +1223,12 @@ class _ProductionLifecycle:
         )
         runner = ProfileVerifiedPostgreSQLRAGRunner(composition, readiness)
         runner.prepare()
-        manager = BoundedPostgreSQLRAGManager(runner=runner, max_workers=1, capacity=2)
+        manager = BoundedPostgreSQLRAGManager(
+            runner=runner,
+            max_workers=1,
+            capacity=2,
+            diagnostic_observer=observer,
+        )
         manager.start()
         self._rag_manager = manager
         demo = tenant_demos()[provider.tenant_id]
@@ -1246,7 +1335,19 @@ class _ProductionLifecycle:
                 self._outcome = outcome
                 return
             time.sleep(POLL_INTERVAL_SECONDS)
-        raise _CompletionPumpError(E_COMPLETION_NO_AUTHORITATIVE_OUTCOME)
+        raise _CompletionPumpError(self._stalled_completion_phase())
+
+    def _stalled_completion_phase(self) -> str:
+        manager = self._rag_manager
+        if manager is None or self._rag_diagnostic_observer is None:
+            return E_COMPLETION_NO_AUTHORITATIVE_OUTCOME
+        try:
+            snapshot = manager.diagnostic_snapshot()
+        except BaseException:
+            return E_COMPLETION_STALLED_UNCLASSIFIED
+        if snapshot is None:
+            return E_COMPLETION_STALLED_UNCLASSIFIED
+        return _stalled_completion_phase(snapshot)
 
     def _completion_timeout_seconds(self) -> float:
         settings = self._full_config().vllm

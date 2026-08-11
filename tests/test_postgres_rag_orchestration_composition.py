@@ -19,9 +19,12 @@ from app.composition import (
     compose_profile_bound_postgres_rag_orchestration,
 )
 from app.composition.postgres_rag import (
+    BoundedRAGDiagnosticObserver,
     KnowledgeBaseRAGProviderSettings,
     PostgreSQLRAGComposition,
     PostgreSQLVectorStoreSettings,
+    RAGDiagnosticStage,
+    RAGDiagnosticStatus,
 )
 from app.embeddings.sentence_transformers import BackendFactory
 from app.llm.models import LLMRequest, LLMResponse
@@ -223,6 +226,7 @@ def _compose(
     gateway_factory: LLMGatewayFactory,
     connect: DeferredCallable | None = None,
     embedding_factory: DeferredEmbeddingFactory | None = None,
+    observer: BoundedRAGDiagnosticObserver | None = None,
 ) -> tuple[
     PostgreSQLRAGOrchestrationComposition,
     PostgreSQLRAGComposition,
@@ -239,6 +243,7 @@ def _compose(
         psycopg_connect=selected_connect,
         llm_gateway_factory=gateway_factory,
         embedding_backend_factory=cast(BackendFactory, embedding_factory),
+        diagnostic_observer=observer,
     )
     return result, postgres_rag, calls
 
@@ -487,6 +492,67 @@ def test_provider_exception_identity_propagates(
         result.orchestrator.run(_orchestration_request())
 
     assert raised.value is expected
+
+
+def test_prompt_factory_and_http_use_real_observed_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = BoundedRAGDiagnosticObserver()
+    gateway = FakeGateway()
+    result, _postgres_rag, calls = _compose(
+        monkeypatch,
+        retriever=FakeRetriever(_documents()),
+        gateway_factory=GatewayFactory(gateway),
+        observer=observer,
+    )
+
+    orchestration_result = result.orchestrator.run(_orchestration_request())
+
+    assert orchestration_result is not None
+    assert calls[0]["diagnostic_observer"] is observer
+    assert tuple(
+        (event.stage, event.status) for event in observer.snapshot().events
+    ) == (
+        (RAGDiagnosticStage.PROMPT, RAGDiagnosticStatus.ENTER),
+        (RAGDiagnosticStage.PROMPT, RAGDiagnosticStatus.OK),
+        (RAGDiagnosticStage.GATEWAY_FACTORY, RAGDiagnosticStatus.ENTER),
+        (RAGDiagnosticStage.GATEWAY_FACTORY, RAGDiagnosticStatus.OK),
+        (RAGDiagnosticStage.HTTP, RAGDiagnosticStatus.ENTER),
+        (RAGDiagnosticStage.HTTP, RAGDiagnosticStatus.OK),
+    )
+
+
+@pytest.mark.parametrize(
+    ("factory_error", "gateway_error", "failed_stage"),
+    [
+        (RuntimeError("factory secret"), None, RAGDiagnosticStage.GATEWAY_FACTORY),
+        (None, RuntimeError("gateway secret"), RAGDiagnosticStage.HTTP),
+    ],
+)
+def test_observed_gateway_failures_preserve_identity_without_recording_details(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_error: BaseException | None,
+    gateway_error: BaseException | None,
+    failed_stage: RAGDiagnosticStage,
+) -> None:
+    observer = BoundedRAGDiagnosticObserver()
+    expected = factory_error or gateway_error
+    assert expected is not None
+    result, _postgres_rag, _calls = _compose(
+        monkeypatch,
+        retriever=FakeRetriever(_documents()),
+        gateway_factory=GatewayFactory(FakeGateway(gateway_error), error=factory_error),
+        observer=observer,
+    )
+
+    with pytest.raises(BaseException) as raised:
+        result.orchestrator.run(_orchestration_request())
+
+    assert raised.value is expected
+    snapshot = observer.snapshot()
+    assert snapshot.events[-1].stage is failed_stage
+    assert snapshot.events[-1].status is RAGDiagnosticStatus.FAILED
+    assert "secret" not in repr(snapshot)
 
 
 def test_invalid_factory_result_fails_closed_on_first_generation(
