@@ -951,6 +951,61 @@ def test_postgres_startup_only_failure_cleans_and_preserves_exact_phase(
     assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
 
 
+@pytest.mark.parametrize("phase", sorted(subject.CLEANUP_FAILURE_PHASES))
+def test_postgres_startup_only_preserves_fixed_cleanup_subphase(
+    phase: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+
+    class CleanupFailureOperations(FakeOperations):
+        def cleanup(self) -> None:
+            self.events.append("E_CLEANUP")
+            raise subject._CleanupPhaseError(phase)
+
+    operations = CleanupFailureOperations()
+    with pytest.raises(subject.DashboardRAGVLLME2EError) as caught:
+        subject.run_postgres_startup_only(
+            environment=environment(tmp_path),
+            operations_factory=lambda _config: operations,
+        )
+
+    assert caught.value.phase == phase
+    assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
+
+
+def test_postgres_startup_only_unknown_cleanup_failure_stays_generic_and_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    secret_like_text = "private-cleanup-token-dsn"
+
+    class UnknownCleanupFailureOperations(FakeOperations):
+        def cleanup(self) -> None:
+            self.events.append("E_CLEANUP")
+            raise RuntimeError(secret_like_text)
+
+    operations = UnknownCleanupFailureOperations()
+    run_startup_only = subject.run_postgres_startup_only
+    monkeypatch.setattr(
+        subject,
+        "run_postgres_startup_only",
+        lambda: run_startup_only(
+            environment=values, operations_factory=lambda _config: operations
+        ),
+    )
+
+    assert subject.main(["--postgres-startup-only"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == "E_CLEANUP\n"
+    assert captured.err == ""
+    assert secret_like_text not in captured.out
+    assert secret_like_text not in captured.err
+    assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
+
+
 def test_main_postgres_startup_only_prints_only_fixed_result(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1822,7 +1877,10 @@ def test_remaining_exact_project_resource_fails_cleanup(
     _fake_process_tables(monkeypatch, lifecycle, process)
     monkeypatch.setattr(lifecycle, "_cleanup_exact_postgres_project", lambda: None)
     monkeypatch.setattr(lifecycle, "_cleanup_exact_handoff", lambda: None)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(
+        subject._CleanupPhaseError,
+        match=f"^{subject.E_CLEANUP_PROJECT_VERIFY}$",
+    ):
         lifecycle.cleanup()
 
 
@@ -1848,7 +1906,10 @@ def test_remaining_handoff_fails_cleanup(
     _fake_process_tables(monkeypatch, lifecycle, process)
     monkeypatch.setattr(lifecycle, "_cleanup_exact_postgres_project", lambda: None)
     monkeypatch.setattr(lifecycle, "_cleanup_exact_handoff", lambda: None)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(
+        subject._CleanupPhaseError,
+        match=f"^{subject.E_CLEANUP_HANDOFF_VERIFY}$",
+    ):
         lifecycle.cleanup()
 
 
@@ -1904,6 +1965,79 @@ def test_graceful_failure_modes_each_trigger_every_fallback(
     monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", lambda: None)
     lifecycle.cleanup()
     assert fallbacks == ["process", "project", "handoff"]
+
+
+def test_process_action_race_is_recovered_by_authoritative_final_absence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    process = FakeServiceProcess(return_code=1)
+    lifecycle._service = cast(subprocess.Popen[bytes], process)
+    _fake_process_tables(monkeypatch, lifecycle, process)
+    actions: list[str] = []
+
+    def process_race(*_args: object) -> None:
+        actions.append("process")
+        process.poll_result = 0
+        raise subject._CleanupPhaseError(subject.E_CLEANUP_PROCESS_ACTION)
+
+    monkeypatch.setattr(lifecycle, "_terminate_owned_process_tree", process_race)
+    monkeypatch.setattr(
+        lifecycle,
+        "_cleanup_exact_postgres_project",
+        lambda: actions.append("project-disappeared"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_cleanup_exact_handoff",
+        lambda: actions.append("handoff-disappeared"),
+    )
+    monkeypatch.setattr(lifecycle, "_require_postgres_residue_absent", lambda: None)
+
+    lifecycle.cleanup()
+
+    assert actions == ["process", "project-disappeared", "handoff-disappeared"]
+    assert lifecycle._service is None
+
+
+def test_internal_lifecycle_close_failure_is_never_recovered_by_external_absence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+
+    class FailingManager:
+        def close(self, *, wait: bool) -> None:
+            assert wait is False
+            raise RuntimeError("private-manager-close-detail")
+
+    lifecycle._rag_manager = cast(subject.BoundedPostgreSQLRAGManager, FailingManager())
+    monkeypatch.setattr(
+        lifecycle, "_require_protected_resources_unchanged", lambda: None
+    )
+
+    with pytest.raises(RuntimeError):
+        lifecycle.cleanup()
+
+
+def test_handoff_root_or_sibling_mutation_is_final_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    root = Path(values[subject.HANDOFF_ROOT_ENV])
+    lifecycle._protected_handoff_entries = frozenset(root.iterdir())
+    (root / "unexpected-sibling").mkdir()
+
+    with pytest.raises(
+        subject._CleanupPhaseError,
+        match=f"^{subject.E_CLEANUP_HANDOFF_VERIFY}$",
+    ):
+        lifecycle._require_handoff_root_unchanged()
 
 
 def test_early_owned_residue_triggers_recoverable_fallback(
@@ -1992,10 +2126,15 @@ def test_unverifiable_or_changed_protected_resources_fail_cleanup(
     monkeypatch.setattr(
         lifecycle,
         "_require_protected_resources_unchanged",
-        lambda: (_ for _ in ()).throw(RuntimeError()),
+        lambda: (_ for _ in ()).throw(
+            subject._CleanupPhaseError(subject.E_CLEANUP_PROTECTED_VERIFY)
+        ),
     )
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(
+        subject._CleanupPhaseError,
+        match=f"^{subject.E_CLEANUP_PROTECTED_VERIFY}$",
+    ):
         lifecycle.cleanup()
 
 
@@ -2024,7 +2163,10 @@ def test_remaining_owned_process_after_fallback_fails_cleanup(
         ),
     )
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(
+        subject._CleanupPhaseError,
+        match=f"^{subject.E_CLEANUP_PROCESS_VERIFY}$",
+    ):
         lifecycle.cleanup()
 
 

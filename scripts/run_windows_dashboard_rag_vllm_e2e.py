@@ -70,6 +70,18 @@ E_CLEANUP_PROJECT_VERIFY = "E_CLEANUP_PROJECT_VERIFY"
 E_CLEANUP_HANDOFF_VERIFY = "E_CLEANUP_HANDOFF_VERIFY"
 E_CLEANUP_PROTECTED_VERIFY = "E_CLEANUP_PROTECTED_VERIFY"
 E_CLEANUP_UNVERIFIABLE = "E_CLEANUP_UNVERIFIABLE"
+CLEANUP_FAILURE_PHASES = frozenset(
+    {
+        E_CLEANUP_PROCESS_ACTION,
+        E_CLEANUP_PROJECT_ACTION,
+        E_CLEANUP_HANDOFF_ACTION,
+        E_CLEANUP_PROCESS_VERIFY,
+        E_CLEANUP_PROJECT_VERIFY,
+        E_CLEANUP_HANDOFF_VERIFY,
+        E_CLEANUP_PROTECTED_VERIFY,
+        E_CLEANUP_UNVERIFIABLE,
+    }
+)
 E_COMPLETION_PROCESSOR_MISSING = "E_COMPLETION_PROCESSOR_MISSING"
 E_COMPLETION_NO_AUTHORITATIVE_OUTCOME = "E_COMPLETION_NO_AUTHORITATIVE_OUTCOME"
 E_COMPLETION_CARDINALITY = "E_COMPLETION_CARDINALITY"
@@ -182,6 +194,7 @@ class DashboardRAGVLLME2EError(RuntimeError):
             or phase in COMPLETION_FAILURE_PHASES
             or phase in POSTGRES_CHILD_FAILURE_PHASES
             or phase in POSTGRES_STARTUP_FAILURE_PHASES
+            or phase in CLEANUP_FAILURE_PHASES
             else "E_PREFLIGHT"
         )
         super().__init__(self.phase)
@@ -524,9 +537,15 @@ def run(
         functional_primary_error = error
     try:
         operations.cleanup()
-    except BaseException:
+    except BaseException as error:
         if functional_primary_error is None:
-            functional_primary_error = DashboardRAGVLLME2EError("E_CLEANUP")
+            cleanup_phase = (
+                error.phase
+                if isinstance(error, _CleanupPhaseError)
+                and error.phase in CLEANUP_FAILURE_PHASES
+                else "E_CLEANUP"
+            )
+            functional_primary_error = DashboardRAGVLLME2EError(cleanup_phase)
     if functional_primary_error is not None:
         raise functional_primary_error
     return E2E_OK
@@ -554,9 +573,15 @@ def run_postgres_startup_only(
         functional_primary_error = DashboardRAGVLLME2EError(E_POSTGRES_UNCLASSIFIED)
     try:
         operations.cleanup()
-    except BaseException:
+    except BaseException as error:
         if functional_primary_error is None:
-            functional_primary_error = DashboardRAGVLLME2EError("E_CLEANUP")
+            cleanup_phase = (
+                error.phase
+                if isinstance(error, _CleanupPhaseError)
+                and error.phase in CLEANUP_FAILURE_PHASES
+                else "E_CLEANUP"
+            )
+            functional_primary_error = DashboardRAGVLLME2EError(cleanup_phase)
     if functional_primary_error is not None:
         raise functional_primary_error
     return POSTGRES_STARTUP_OK
@@ -591,6 +616,7 @@ class _ProductionLifecycle:
         self._processor: RAGCoachingProcessorDecorator | None = None
         self._vector_count = 0
         self._protected_resources: dict[str, frozenset[str]] | None = None
+        self._protected_handoff_entries: frozenset[Path] | None = None
         self._owned_processes: dict[int, int] = {}
         self._owner_marker: str | None = None
         self._postgres_launch_boundary: datetime | None = None
@@ -645,6 +671,7 @@ class _ProductionLifecycle:
             E_POSTGRES_CONFIG,
             lambda: set(self._postgres_config.handoff_root.iterdir()),
         )
+        self._protected_handoff_entries = frozenset(before)
         docker = self._postgres_startup_call(
             E_POSTGRES_DOCKER, lambda: shutil.which("docker")
         )
@@ -1358,12 +1385,14 @@ class _ProductionLifecycle:
             raise RuntimeError
 
     def cleanup(self) -> None:
-        fallback_action_error: BaseException | None = None
+        internal_lifecycle_error: BaseException | None = None
+        unrecoverable_cleanup_error: BaseException | None = None
+        recoverable_action_trigger: BaseException | None = None
         try:
             if self._rag_manager is not None:
                 self._rag_manager.close(wait=False)
         except BaseException as error:
-            fallback_action_error = error
+            internal_lifecycle_error = error
         try:
             if self._document_runtime is not None:
                 for entry in (self._target_entry, self._other_entry):
@@ -1375,7 +1404,7 @@ class _ProductionLifecycle:
                         )
                 self._document_runtime.close(wait=False)
         except BaseException as error:
-            fallback_action_error = fallback_action_error or error
+            internal_lifecycle_error = internal_lifecycle_error or error
         service = self._service
         owned_processes = dict(self._owned_processes)
         graceful_recovery_trigger: BaseException | None = None
@@ -1390,8 +1419,9 @@ class _ProductionLifecycle:
                     raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
             except BaseException as error:
                 graceful_recovery_trigger = error
-                fallback_action_error = fallback_action_error or _CleanupPhaseError(
-                    E_CLEANUP_UNVERIFIABLE
+                unrecoverable_cleanup_error = (
+                    unrecoverable_cleanup_error
+                    or _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
                 )
             try:
                 if service.poll() is None:
@@ -1417,15 +1447,21 @@ class _ProductionLifecycle:
                 if service is not None:
                     self._terminate_owned_process_tree(service, owned_processes)
             except BaseException as error:
-                fallback_action_error = fallback_action_error or error
+                if (
+                    isinstance(error, _CleanupPhaseError)
+                    and error.phase == E_CLEANUP_PROCESS_ACTION
+                ):
+                    recoverable_action_trigger = error
+                else:
+                    unrecoverable_cleanup_error = unrecoverable_cleanup_error or error
             try:
                 self._cleanup_exact_postgres_project()
             except BaseException as error:
-                fallback_action_error = fallback_action_error or error
+                unrecoverable_cleanup_error = unrecoverable_cleanup_error or error
             try:
                 self._cleanup_exact_handoff()
             except BaseException as error:
-                fallback_action_error = fallback_action_error or error
+                unrecoverable_cleanup_error = unrecoverable_cleanup_error or error
         final_verification_error: BaseException | None = None
         try:
             self._require_postgres_residue_absent()
@@ -1436,6 +1472,10 @@ class _ProductionLifecycle:
         except BaseException as error:
             final_verification_error = final_verification_error or error
         try:
+            self._require_handoff_root_unchanged()
+        except BaseException as error:
+            final_verification_error = final_verification_error or error
+        try:
             self._require_protected_resources_unchanged()
         except BaseException as error:
             final_verification_error = final_verification_error or error
@@ -1443,9 +1483,14 @@ class _ProductionLifecycle:
             self._release_service_handle()
         except BaseException as error:
             final_verification_error = final_verification_error or error
-        cleanup_error = fallback_action_error or final_verification_error
+        cleanup_error = (
+            internal_lifecycle_error
+            or unrecoverable_cleanup_error
+            or final_verification_error
+        )
         if cleanup_error is not None:
             raise cleanup_error
+        _ = recoverable_action_trigger
 
     @staticmethod
     def _windows_process_observations() -> tuple[_WindowsProcessObservation, ...]:
@@ -1877,6 +1922,20 @@ class _ProductionLifecycle:
             require_protected_resources_unchanged(docker, expected)
         except BaseException:
             raise _CleanupPhaseError(E_CLEANUP_PROTECTED_VERIFY) from None
+
+    def _require_handoff_root_unchanged(self) -> None:
+        expected = self._protected_handoff_entries
+        if expected is None:
+            return
+        root = self._postgres_config.handoff_root
+        try:
+            resolved = root.resolve(strict=True)
+            if root != resolved or root.is_symlink() or not root.is_dir():
+                raise RuntimeError
+            if frozenset(root.iterdir()) != expected:
+                raise RuntimeError
+        except BaseException:
+            raise _CleanupPhaseError(E_CLEANUP_HANDOFF_VERIFY) from None
 
     def _require_postgres_residue_absent(self) -> None:
         project = self._postgres_project
