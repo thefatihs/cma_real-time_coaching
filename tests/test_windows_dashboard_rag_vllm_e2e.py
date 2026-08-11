@@ -21,9 +21,11 @@ from app.coaching.coordinator import (
 )
 from app.composition.postgres_rag import (
     RAGDiagnosticEvent,
+    RAGDiagnosticFutureState,
     RAGDiagnosticSnapshot,
     RAGDiagnosticStage,
     RAGDiagnosticStatus,
+    RAGDiagnosticSubmissionState,
 )
 from app.coaching.coordinator import _cooldown_available
 
@@ -534,59 +536,104 @@ def test_completion_stall_reports_exact_last_entered_stage(
         authoritative_completion_published=False,
         running_after_close=False,
         unclassified=False,
+        submission_state=RAGDiagnosticSubmissionState.ACCEPTED,
+        future_state=RAGDiagnosticFutureState.RUNNING,
+        rag_worker_entered=True,
     )
 
     assert subject._stalled_completion_phase(snapshot) == phase
 
 
 @pytest.mark.parametrize(
-    ("snapshot", "phase"),
+    ("submission_state", "future_state", "phase"),
     [
         (
-            RAGDiagnosticSnapshot((), False, True, False, False, False, False),
-            subject.E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED,
+            RAGDiagnosticSubmissionState.NOT_ATTEMPTED,
+            RAGDiagnosticFutureState.ABSENT,
+            subject.E_COMPLETION_SUBMISSION_NOT_ATTEMPTED,
         ),
         (
-            RAGDiagnosticSnapshot((), False, True, True, False, False, False),
-            subject.E_COMPLETION_STALLED_CALLBACK_ENTER,
+            RAGDiagnosticSubmissionState.ACCEPTED,
+            RAGDiagnosticFutureState.QUEUED,
+            subject.E_COMPLETION_FUTURE_QUEUED,
         ),
         (
-            RAGDiagnosticSnapshot((), False, False, False, False, False, False),
-            subject.E_COMPLETION_STALLED_NO_STAGE,
+            RAGDiagnosticSubmissionState.ACCEPTED,
+            RAGDiagnosticFutureState.RUNNING,
+            subject.E_COMPLETION_FUTURE_RUNNING_NO_STAGE,
         ),
         (
-            RAGDiagnosticSnapshot(
-                (
-                    RAGDiagnosticEvent(
-                        RAGDiagnosticStage.RUN, RAGDiagnosticStatus.FAILED
-                    ),
-                ),
-                False,
-                False,
-                False,
-                False,
-                False,
-                False,
-            ),
-            subject.E_COMPLETION_STALLED_FAILED,
-        ),
-        (
-            RAGDiagnosticSnapshot(
-                (RAGDiagnosticEvent(RAGDiagnosticStage.RUN, RAGDiagnosticStatus.OK),),
-                False,
-                False,
-                False,
-                False,
-                False,
-                False,
-            ),
-            subject.E_COMPLETION_STALLED_WORKER_NOT_LIVE,
+            RAGDiagnosticSubmissionState.ACCEPTED,
+            RAGDiagnosticFutureState.TERMINAL,
+            subject.E_COMPLETION_FUTURE_TERMINAL_NO_PUBLICATION,
         ),
     ],
 )
 def test_completion_stall_distinguishes_terminal_and_publication_states(
-    snapshot: RAGDiagnosticSnapshot, phase: str
+    submission_state: RAGDiagnosticSubmissionState,
+    future_state: RAGDiagnosticFutureState,
+    phase: str,
 ) -> None:
+    snapshot = RAGDiagnosticSnapshot(
+        (),
+        future_state is RAGDiagnosticFutureState.RUNNING,
+        future_state is RAGDiagnosticFutureState.TERMINAL,
+        False,
+        False,
+        False,
+        False,
+        submission_state,
+        future_state,
+        False,
+    )
+    assert subject._stalled_completion_phase(snapshot) == phase
+
+
+@pytest.mark.parametrize(
+    ("submission_state", "phase"),
+    [
+        (
+            RAGDiagnosticSubmissionState.REJECTED_DUPLICATE,
+            subject.E_COMPLETION_SUBMISSION_REJECTED_DUPLICATE,
+        ),
+        (
+            RAGDiagnosticSubmissionState.REJECTED_STALE,
+            subject.E_COMPLETION_SUBMISSION_REJECTED_STALE,
+        ),
+        (
+            RAGDiagnosticSubmissionState.REJECTED_CAPACITY_REJECTED,
+            subject.E_COMPLETION_SUBMISSION_REJECTED_CAPACITY_REJECTED,
+        ),
+        (
+            RAGDiagnosticSubmissionState.REJECTED_NOT_STARTED,
+            subject.E_COMPLETION_SUBMISSION_REJECTED_NOT_STARTED,
+        ),
+        (
+            RAGDiagnosticSubmissionState.REJECTED_CLOSED,
+            subject.E_COMPLETION_SUBMISSION_REJECTED_CLOSED,
+        ),
+        (
+            RAGDiagnosticSubmissionState.SUBMIT_FAILED,
+            subject.E_COMPLETION_SUBMIT_FAILED,
+        ),
+    ],
+)
+def test_completion_stall_reports_exact_submission_failure(
+    submission_state: RAGDiagnosticSubmissionState, phase: str
+) -> None:
+    snapshot = RAGDiagnosticSnapshot(
+        (),
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        submission_state,
+        RAGDiagnosticFutureState.ABSENT,
+        False,
+    )
+
     assert subject._stalled_completion_phase(snapshot) == phase
 
 
@@ -605,7 +652,7 @@ def test_completion_diagnostic_snapshot_never_contains_injected_secret() -> None
 
     phase = subject._stalled_completion_phase(snapshot)
 
-    assert phase == subject.E_COMPLETION_STALLED_UNCLASSIFIED
+    assert phase == subject.E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED
     assert "injected-secret" not in repr(snapshot)
     assert "injected-secret" not in phase
 

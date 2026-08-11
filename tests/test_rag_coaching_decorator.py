@@ -190,6 +190,23 @@ class FakeBackgroundManager(BoundedPostgreSQLRAGManager):
         RAGOrchestrationSubmissionStatus.ACCEPTED
     )
     delivered: bool = False
+    submit_error: Exception | None = None
+    diagnostic_not_attempted_calls: int = 0
+    diagnostic_failed_calls: int = 0
+    diagnostic_statuses: list[RAGOrchestrationSubmissionStatus] = field(
+        default_factory=list
+    )
+
+    def diagnostic_submission_not_attempted(self) -> None:
+        self.diagnostic_not_attempted_calls += 1
+
+    def diagnostic_submit_failed(self) -> None:
+        self.diagnostic_failed_calls += 1
+
+    def diagnostic_submission_status(
+        self, status: RAGOrchestrationSubmissionStatus
+    ) -> None:
+        self.diagnostic_statuses.append(status)
 
     def announce_current_revision(
         self,
@@ -206,6 +223,8 @@ class FakeBackgroundManager(BoundedPostgreSQLRAGManager):
         self,
         request: OrchestrationRequest,
     ) -> RAGOrchestrationSubmission:
+        if self.submit_error is not None:
+            raise self.submit_error
         self.requests.append(request)
         return RAGOrchestrationSubmission(
             RAGOrchestrationIdentity.from_request(request),
@@ -546,6 +565,28 @@ def test_rejected_submission_retains_no_context(
     assert decorator.drain_completed(current_seconds=event.end_seconds) == ()
     assert decorator._pending_contexts == {}  # noqa: SLF001
     assert factory.calls == []
+    assert runner.diagnostic_not_attempted_calls == 1
+    assert runner.diagnostic_statuses == [status]
+
+
+def test_submit_failure_preserves_base_outcome_and_records_fixed_state() -> None:
+    decorator, _, runner, factory, event = decorator_dependencies()
+    runner.submit_error = RuntimeError("injected-secret")
+
+    base = decorator.process_safely(
+        event,
+        event.end_seconds,
+        classification_event=classification(event),
+        active_labels=("product_information",),
+    )
+
+    assert base.status is CoachingProcessingStatus.PROCESSED
+    assert runner.diagnostic_not_attempted_calls == 1
+    assert runner.diagnostic_failed_calls == 1
+    assert runner.diagnostic_statuses == []
+    assert decorator._pending_contexts == {}  # noqa: SLF001
+    assert factory.calls == []
+    assert "injected-secret" not in repr(base)
 
 
 def test_constructor_accepts_only_one_coordinator_and_internal_adapter_shares_it() -> (

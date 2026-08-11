@@ -73,6 +73,24 @@ class RAGDiagnosticStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class RAGDiagnosticSubmissionState(str, Enum):
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED_DUPLICATE = "REJECTED_DUPLICATE"
+    REJECTED_STALE = "REJECTED_STALE"
+    REJECTED_CAPACITY_REJECTED = "REJECTED_CAPACITY_REJECTED"
+    REJECTED_NOT_STARTED = "REJECTED_NOT_STARTED"
+    REJECTED_CLOSED = "REJECTED_CLOSED"
+    SUBMIT_FAILED = "SUBMIT_FAILED"
+
+
+class RAGDiagnosticFutureState(str, Enum):
+    ABSENT = "ABSENT"
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    TERMINAL = "TERMINAL"
+
+
 @dataclass(frozen=True, slots=True)
 class RAGDiagnosticEvent:
     stage: RAGDiagnosticStage
@@ -88,6 +106,11 @@ class RAGDiagnosticSnapshot:
     authoritative_completion_published: bool
     running_after_close: bool
     unclassified: bool
+    submission_state: RAGDiagnosticSubmissionState = (
+        RAGDiagnosticSubmissionState.NOT_ATTEMPTED
+    )
+    future_state: RAGDiagnosticFutureState = RAGDiagnosticFutureState.ABSENT
+    rag_worker_entered: bool = False
 
 
 class BoundedRAGDiagnosticObserver:
@@ -102,6 +125,9 @@ class BoundedRAGDiagnosticObserver:
         self._completion_published = False
         self._running_after_close = False
         self._unclassified = False
+        self._submission_state = RAGDiagnosticSubmissionState.NOT_ATTEMPTED
+        self._future_state = RAGDiagnosticFutureState.ABSENT
+        self._rag_worker_entered = False
 
     def record(self, stage: RAGDiagnosticStage, status: RAGDiagnosticStatus) -> None:
         try:
@@ -151,6 +177,36 @@ class BoundedRAGDiagnosticObserver:
         except BaseException:
             self._mark_unclassified()
 
+    def update_submission(self, state: RAGDiagnosticSubmissionState) -> None:
+        if not isinstance(state, RAGDiagnosticSubmissionState):
+            self._mark_unclassified()
+            return
+        try:
+            with self._lock:
+                self._submission_state = state
+        except BaseException:
+            self._mark_unclassified()
+
+    def update_future(self, state: RAGDiagnosticFutureState) -> None:
+        if not isinstance(state, RAGDiagnosticFutureState):
+            self._mark_unclassified()
+            return
+        try:
+            with self._lock:
+                self._future_state = state
+        except BaseException:
+            self._mark_unclassified()
+
+    def mark_rag_worker_entered(self) -> None:
+        try:
+            with self._lock:
+                self._rag_worker_entered = True
+        except BaseException:
+            self._mark_unclassified()
+
+    def fail_closed(self) -> None:
+        self._mark_unclassified()
+
     def snapshot(self) -> RAGDiagnosticSnapshot:
         with self._lock:
             return RAGDiagnosticSnapshot(
@@ -161,6 +217,9 @@ class BoundedRAGDiagnosticObserver:
                 authoritative_completion_published=self._completion_published,
                 running_after_close=self._running_after_close,
                 unclassified=self._unclassified,
+                submission_state=self._submission_state,
+                future_state=self._future_state,
+                rag_worker_entered=self._rag_worker_entered,
             )
 
     def _mark_unclassified(self) -> None:

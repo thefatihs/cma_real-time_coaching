@@ -34,6 +34,8 @@ from app.composition.postgres_rag import (
     RAGDiagnosticSnapshot,
     RAGDiagnosticStage,
     RAGDiagnosticStatus,
+    RAGDiagnosticFutureState,
+    RAGDiagnosticSubmissionState,
 )
 from app.composition.postgres_document_ingestion import (
     PostgreSQLDocumentIngestionRuntime,
@@ -105,10 +107,47 @@ E_COMPLETION_STALLED_GATEWAY_FACTORY_ENTER = (
 E_COMPLETION_STALLED_HTTP_ENTER = "E_COMPLETION_STALLED_HTTP_ENTER"
 E_COMPLETION_STALLED_CALLBACK_ENTER = "E_COMPLETION_STALLED_CALLBACK_ENTER"
 E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED = "E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED"
-E_COMPLETION_STALLED_NO_STAGE = "E_COMPLETION_STALLED_NO_STAGE"
 E_COMPLETION_STALLED_FAILED = "E_COMPLETION_STALLED_FAILED"
 E_COMPLETION_STALLED_WORKER_NOT_LIVE = "E_COMPLETION_STALLED_WORKER_NOT_LIVE"
 E_COMPLETION_STALLED_UNCLASSIFIED = "E_COMPLETION_STALLED_UNCLASSIFIED"
+E_COMPLETION_SUBMISSION_NOT_ATTEMPTED = "E_COMPLETION_SUBMISSION_NOT_ATTEMPTED"
+E_COMPLETION_SUBMISSION_REJECTED_DUPLICATE = (
+    "E_COMPLETION_SUBMISSION_REJECTED_DUPLICATE"
+)
+E_COMPLETION_SUBMISSION_REJECTED_STALE = "E_COMPLETION_SUBMISSION_REJECTED_STALE"
+E_COMPLETION_SUBMISSION_REJECTED_CAPACITY_REJECTED = (
+    "E_COMPLETION_SUBMISSION_REJECTED_CAPACITY_REJECTED"
+)
+E_COMPLETION_SUBMISSION_REJECTED_NOT_STARTED = (
+    "E_COMPLETION_SUBMISSION_REJECTED_NOT_STARTED"
+)
+E_COMPLETION_SUBMISSION_REJECTED_CLOSED = "E_COMPLETION_SUBMISSION_REJECTED_CLOSED"
+E_COMPLETION_SUBMIT_FAILED = "E_COMPLETION_SUBMIT_FAILED"
+E_COMPLETION_FUTURE_QUEUED = "E_COMPLETION_FUTURE_QUEUED"
+E_COMPLETION_FUTURE_RUNNING_NO_STAGE = "E_COMPLETION_FUTURE_RUNNING_NO_STAGE"
+E_COMPLETION_FUTURE_TERMINAL_NO_PUBLICATION = (
+    "E_COMPLETION_FUTURE_TERMINAL_NO_PUBLICATION"
+)
+E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED = "E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED"
+_SUBMISSION_PHASES = {
+    RAGDiagnosticSubmissionState.NOT_ATTEMPTED: (E_COMPLETION_SUBMISSION_NOT_ATTEMPTED),
+    RAGDiagnosticSubmissionState.REJECTED_DUPLICATE: (
+        E_COMPLETION_SUBMISSION_REJECTED_DUPLICATE
+    ),
+    RAGDiagnosticSubmissionState.REJECTED_STALE: (
+        E_COMPLETION_SUBMISSION_REJECTED_STALE
+    ),
+    RAGDiagnosticSubmissionState.REJECTED_CAPACITY_REJECTED: (
+        E_COMPLETION_SUBMISSION_REJECTED_CAPACITY_REJECTED
+    ),
+    RAGDiagnosticSubmissionState.REJECTED_NOT_STARTED: (
+        E_COMPLETION_SUBMISSION_REJECTED_NOT_STARTED
+    ),
+    RAGDiagnosticSubmissionState.REJECTED_CLOSED: (
+        E_COMPLETION_SUBMISSION_REJECTED_CLOSED
+    ),
+    RAGDiagnosticSubmissionState.SUBMIT_FAILED: E_COMPLETION_SUBMIT_FAILED,
+}
 _STALLED_STAGE_PHASES = {
     RAGDiagnosticStage.RUN: E_COMPLETION_STALLED_RUN_ENTER,
     RAGDiagnosticStage.EMBED: E_COMPLETION_STALLED_EMBED_ENTER,
@@ -198,10 +237,14 @@ COMPLETION_FAILURE_PHASES = frozenset(
         E_COMPLETION_STALLED_HTTP_ENTER,
         E_COMPLETION_STALLED_CALLBACK_ENTER,
         E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED,
-        E_COMPLETION_STALLED_NO_STAGE,
         E_COMPLETION_STALLED_FAILED,
         E_COMPLETION_STALLED_WORKER_NOT_LIVE,
         E_COMPLETION_STALLED_UNCLASSIFIED,
+        *_SUBMISSION_PHASES.values(),
+        E_COMPLETION_FUTURE_QUEUED,
+        E_COMPLETION_FUTURE_RUNNING_NO_STAGE,
+        E_COMPLETION_FUTURE_TERMINAL_NO_PUBLICATION,
+        E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED,
     }
 )
 PHASES = (
@@ -255,13 +298,25 @@ class _CompletionPumpError(RuntimeError):
 
 def _stalled_completion_phase(snapshot: RAGDiagnosticSnapshot) -> str:
     if not isinstance(snapshot, RAGDiagnosticSnapshot) or snapshot.unclassified:
-        return E_COMPLETION_STALLED_UNCLASSIFIED
+        return E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED
     if snapshot.authoritative_completion_published:
         return E_COMPLETION_NO_AUTHORITATIVE_OUTCOME
-    if snapshot.future_terminal:
-        if not snapshot.callback_entered:
-            return E_COMPLETION_STALLED_CALLBACK_NOT_ENTERED
-        return E_COMPLETION_STALLED_CALLBACK_ENTER
+    if snapshot.future_state is RAGDiagnosticFutureState.TERMINAL:
+        return E_COMPLETION_FUTURE_TERMINAL_NO_PUBLICATION
+    submission_phase = _SUBMISSION_PHASES.get(snapshot.submission_state)
+    if submission_phase is not None:
+        return submission_phase
+    if snapshot.submission_state is not RAGDiagnosticSubmissionState.ACCEPTED:
+        return E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED
+    if snapshot.future_state is RAGDiagnosticFutureState.QUEUED:
+        return E_COMPLETION_FUTURE_QUEUED
+    if (
+        snapshot.future_state is RAGDiagnosticFutureState.RUNNING
+        and not snapshot.events
+    ):
+        return E_COMPLETION_FUTURE_RUNNING_NO_STAGE
+    if snapshot.future_state is RAGDiagnosticFutureState.ABSENT:
+        return E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED
     active: set[RAGDiagnosticStage] = set()
     last_failed = False
     try:
@@ -285,8 +340,6 @@ def _stalled_completion_phase(snapshot: RAGDiagnosticSnapshot) -> str:
                 return _STALLED_STAGE_PHASES[event.stage]
     if last_failed:
         return E_COMPLETION_STALLED_FAILED
-    if not snapshot.events:
-        return E_COMPLETION_STALLED_NO_STAGE
     if not snapshot.worker_live:
         return E_COMPLETION_STALLED_WORKER_NOT_LIVE
     return E_COMPLETION_STALLED_UNCLASSIFIED
@@ -1344,9 +1397,9 @@ class _ProductionLifecycle:
         try:
             snapshot = manager.diagnostic_snapshot()
         except BaseException:
-            return E_COMPLETION_STALLED_UNCLASSIFIED
+            return E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED
         if snapshot is None:
-            return E_COMPLETION_STALLED_UNCLASSIFIED
+            return E_COMPLETION_DIAGNOSTIC_UNCLASSIFIED
         return _stalled_completion_phase(snapshot)
 
     def _completion_timeout_seconds(self) -> float:

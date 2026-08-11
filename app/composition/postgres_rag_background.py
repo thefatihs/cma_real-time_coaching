@@ -9,9 +9,11 @@ from threading import Event, Lock
 
 from app.composition.postgres_rag import (
     BoundedRAGDiagnosticObserver,
+    RAGDiagnosticFutureState,
     RAGDiagnosticSnapshot,
     RAGDiagnosticStage,
     RAGDiagnosticStatus,
+    RAGDiagnosticSubmissionState,
     observe_rag_stage,
 )
 from app.composition.postgres_rag_runtime import (
@@ -245,22 +247,31 @@ class BoundedPostgreSQLRAGManager:
         identity = RAGOrchestrationIdentity.from_request(request)
         with self._lock:
             if self._closed:
+                self._record_submission(RAGDiagnosticSubmissionState.REJECTED_CLOSED)
                 return _submission(identity, RAGOrchestrationSubmissionStatus.CLOSED)
             executor = self._executor
             if executor is None:
+                self._record_submission(
+                    RAGDiagnosticSubmissionState.REJECTED_NOT_STARTED
+                )
                 return _submission(
                     identity,
                     RAGOrchestrationSubmissionStatus.NOT_STARTED,
                 )
             current = self._current_revisions.get(_scope(identity))
             if current != identity.transcript_revision:
+                self._record_submission(RAGDiagnosticSubmissionState.REJECTED_STALE)
                 return _submission(identity, RAGOrchestrationSubmissionStatus.STALE)
             if identity in self._submitted_identities:
+                self._record_submission(RAGDiagnosticSubmissionState.REJECTED_DUPLICATE)
                 return _submission(
                     identity,
                     RAGOrchestrationSubmissionStatus.DUPLICATE,
                 )
             if self._reservations >= self._capacity:
+                self._record_submission(
+                    RAGDiagnosticSubmissionState.REJECTED_CAPACITY_REJECTED
+                )
                 return _submission(
                     identity,
                     RAGOrchestrationSubmissionStatus.CAPACITY_REJECTED,
@@ -272,8 +283,16 @@ class BoundedPostgreSQLRAGManager:
             except BaseException:
                 self._submitted_identities.remove(identity)
                 self._release_reservation()
+                self._record_submission(RAGDiagnosticSubmissionState.SUBMIT_FAILED)
                 raise
+            if not isinstance(future, Future):
+                self._submitted_identities.remove(identity)
+                self._release_reservation()
+                self._record_submission(RAGDiagnosticSubmissionState.SUBMIT_FAILED)
+                raise RuntimeError("background executor returned an invalid future")
             self._futures[identity] = future
+            self._record_submission(RAGDiagnosticSubmissionState.ACCEPTED)
+            self._record_future_state(future)
         future.add_done_callback(
             lambda completed, selected=identity: self._complete(
                 selected,
@@ -319,6 +338,10 @@ class BoundedPostgreSQLRAGManager:
             future.cancel()
         observer = self._diagnostic_observer
         if observer is not None:
+            if len(futures) == 1:
+                self._record_future_state(futures[0])
+            elif len(futures) > 1:
+                observer.fail_closed()
             observer.update_execution(
                 future_terminal=all(future.done() for future in futures),
                 running_after_close=any(not future.done() for future in futures),
@@ -334,6 +357,7 @@ class BoundedPostgreSQLRAGManager:
         observer = self._diagnostic_observer
         if observer is not None:
             observer.record(RAGDiagnosticStage.CALLBACK, RAGDiagnosticStatus.ENTER)
+            observer.update_future(RAGDiagnosticFutureState.TERMINAL)
             observer.update_execution(future_terminal=True, callback_entered=True)
         if future.cancelled():
             completion: RAGOrchestrationCompletion | None = None
@@ -370,11 +394,51 @@ class BoundedPostgreSQLRAGManager:
             return None
         with self._lock:
             futures = tuple(self._futures.values())
-        if futures:
+        if len(futures) == 1:
+            self._record_future_state(futures[0])
             observer.update_execution(
                 future_terminal=all(future.done() for future in futures)
             )
+        elif len(futures) > 1:
+            observer.fail_closed()
         return observer.snapshot()
+
+    def diagnostic_submission_not_attempted(self) -> None:
+        self._record_submission(RAGDiagnosticSubmissionState.NOT_ATTEMPTED)
+
+    def diagnostic_submit_failed(self) -> None:
+        self._record_submission(RAGDiagnosticSubmissionState.SUBMIT_FAILED)
+
+    def diagnostic_submission_status(
+        self, status: RAGOrchestrationSubmissionStatus
+    ) -> None:
+        states = {
+            RAGOrchestrationSubmissionStatus.ACCEPTED: (
+                RAGDiagnosticSubmissionState.ACCEPTED
+            ),
+            RAGOrchestrationSubmissionStatus.DUPLICATE: (
+                RAGDiagnosticSubmissionState.REJECTED_DUPLICATE
+            ),
+            RAGOrchestrationSubmissionStatus.STALE: (
+                RAGDiagnosticSubmissionState.REJECTED_STALE
+            ),
+            RAGOrchestrationSubmissionStatus.CAPACITY_REJECTED: (
+                RAGDiagnosticSubmissionState.REJECTED_CAPACITY_REJECTED
+            ),
+            RAGOrchestrationSubmissionStatus.NOT_STARTED: (
+                RAGDiagnosticSubmissionState.REJECTED_NOT_STARTED
+            ),
+            RAGOrchestrationSubmissionStatus.CLOSED: (
+                RAGDiagnosticSubmissionState.REJECTED_CLOSED
+            ),
+        }
+        state = states.get(status)
+        if state is None:
+            observer = self._diagnostic_observer
+            if observer is not None:
+                observer.fail_closed()
+            return
+        self._record_submission(state)
 
     def _run_observed(
         self,
@@ -382,6 +446,7 @@ class BoundedPostgreSQLRAGManager:
     ) -> OrchestrationResult | None:
         observer = self._diagnostic_observer
         if observer is not None:
+            observer.mark_rag_worker_entered()
             observer.update_execution(worker_live=True)
         try:
             return observe_rag_stage(
@@ -392,6 +457,23 @@ class BoundedPostgreSQLRAGManager:
         finally:
             if observer is not None:
                 observer.update_execution(worker_live=False)
+
+    def _record_submission(self, state: RAGDiagnosticSubmissionState) -> None:
+        observer = getattr(self, "_diagnostic_observer", None)
+        if observer is not None:
+            observer.update_submission(state)
+
+    def _record_future_state(self, future: Future[OrchestrationResult | None]) -> None:
+        observer = getattr(self, "_diagnostic_observer", None)
+        if observer is None:
+            return
+        if future.done():
+            state = RAGDiagnosticFutureState.TERMINAL
+        elif future.running():
+            state = RAGDiagnosticFutureState.RUNNING
+        else:
+            state = RAGDiagnosticFutureState.QUEUED
+        observer.update_future(state)
 
     def _release_reservation(self) -> None:
         if self._reservations <= 0:

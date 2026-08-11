@@ -1,6 +1,6 @@
 """Deterministic tests for bounded PostgreSQL RAG background execution."""
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 import inspect
 from threading import Event, Lock
@@ -13,8 +13,10 @@ import app.composition as composition_exports
 import app.composition.postgres_rag_background as background_module
 from app.composition.postgres_rag import (
     BoundedRAGDiagnosticObserver,
+    RAGDiagnosticFutureState,
     RAGDiagnosticStage,
     RAGDiagnosticStatus,
+    RAGDiagnosticSubmissionState,
 )
 from app.composition.postgres_rag_background import (
     BoundedPostgreSQLRAGManager,
@@ -576,6 +578,9 @@ def test_observer_records_run_callback_and_authoritative_publication() -> None:
     assert snapshot.future_terminal is True
     assert snapshot.callback_entered is True
     assert snapshot.authoritative_completion_published is True
+    assert snapshot.submission_state is RAGDiagnosticSubmissionState.ACCEPTED
+    assert snapshot.future_state is RAGDiagnosticFutureState.TERMINAL
+    assert snapshot.rag_worker_entered is True
     manager.close()
 
 
@@ -625,6 +630,146 @@ def test_observer_invalid_input_fails_closed_without_raising() -> None:
     assert snapshot.events == ()
     assert snapshot.unclassified is True
     assert "injected-secret" not in repr(snapshot)
+
+
+def test_real_future_remains_queued_until_executor_worker_is_available() -> None:
+    blocker_entered = Event()
+    blocker_release = Event()
+    observer = BoundedRAGDiagnosticObserver()
+    manager, _runner = _manager(observer=observer)
+    manager.start()
+    executor = manager._executor  # noqa: SLF001
+    assert executor is not None
+    blocker = executor.submit(
+        lambda: (blocker_entered.set(), blocker_release.wait(timeout=5))
+    )
+    assert blocker_entered.wait(timeout=5)
+    _announce(manager)
+
+    submission = manager.submit(_request())
+    snapshot = manager.diagnostic_snapshot()
+
+    assert submission.status is RAGOrchestrationSubmissionStatus.ACCEPTED
+    assert snapshot is not None
+    assert snapshot.submission_state is RAGDiagnosticSubmissionState.ACCEPTED
+    assert snapshot.future_state is RAGDiagnosticFutureState.QUEUED
+    assert snapshot.rag_worker_entered is False
+    assert snapshot.events == ()
+    manager.close(wait=False)
+    blocker_release.set()
+    blocker.result(timeout=5)
+
+
+def test_running_future_before_observed_callable_entry_is_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before_run = Event()
+    release = Event()
+    observer = BoundedRAGDiagnosticObserver()
+    manager, _runner = _manager(observer=observer)
+    original = manager._run_observed  # noqa: SLF001
+
+    def delayed_run(request: OrchestrationRequest) -> OrchestrationResult | None:
+        before_run.set()
+        assert release.wait(timeout=5)
+        return original(request)
+
+    monkeypatch.setattr(manager, "_run_observed", delayed_run)
+    manager.start()
+    _announce(manager)
+    manager.submit(_request())
+    assert before_run.wait(timeout=5)
+
+    snapshot = manager.diagnostic_snapshot()
+
+    assert snapshot is not None
+    assert snapshot.future_state is RAGDiagnosticFutureState.RUNNING
+    assert snapshot.rag_worker_entered is False
+    assert snapshot.events == ()
+    release.set()
+    _poll_until(manager, _identity())
+    manager.close()
+
+
+def test_terminal_future_without_callback_publication_is_distinct() -> None:
+    observer = BoundedRAGDiagnosticObserver()
+    manager, _runner = _manager(observer=observer)
+    identity = _identity()
+    future: Future[OrchestrationResult | None] = Future()
+    future.set_result(None)
+    observer.update_submission(RAGDiagnosticSubmissionState.ACCEPTED)
+    manager._futures[identity] = future  # noqa: SLF001
+
+    snapshot = manager.diagnostic_snapshot()
+
+    assert snapshot is not None
+    assert snapshot.future_state is RAGDiagnosticFutureState.TERMINAL
+    assert snapshot.callback_entered is False
+    assert snapshot.authoritative_completion_published is False
+
+
+def test_submit_failure_is_fixed_and_contains_no_exception_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = BoundedRAGDiagnosticObserver()
+    manager, _runner = _manager(observer=observer)
+    manager.start()
+    _announce(manager)
+    executor = manager._executor  # noqa: SLF001
+    assert executor is not None
+    monkeypatch.setattr(
+        executor,
+        "submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected-secret")
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        manager.submit(_request())
+
+    snapshot = observer.snapshot()
+    assert snapshot.submission_state is RAGDiagnosticSubmissionState.SUBMIT_FAILED
+    assert snapshot.future_state is RAGDiagnosticFutureState.ABSENT
+    assert "injected-secret" not in repr(snapshot)
+    manager.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "state"),
+    [
+        (
+            RAGOrchestrationSubmissionStatus.DUPLICATE,
+            RAGDiagnosticSubmissionState.REJECTED_DUPLICATE,
+        ),
+        (
+            RAGOrchestrationSubmissionStatus.STALE,
+            RAGDiagnosticSubmissionState.REJECTED_STALE,
+        ),
+        (
+            RAGOrchestrationSubmissionStatus.CAPACITY_REJECTED,
+            RAGDiagnosticSubmissionState.REJECTED_CAPACITY_REJECTED,
+        ),
+        (
+            RAGOrchestrationSubmissionStatus.NOT_STARTED,
+            RAGDiagnosticSubmissionState.REJECTED_NOT_STARTED,
+        ),
+        (
+            RAGOrchestrationSubmissionStatus.CLOSED,
+            RAGDiagnosticSubmissionState.REJECTED_CLOSED,
+        ),
+    ],
+)
+def test_every_fixed_rejection_status_has_exact_diagnostic_state(
+    status: RAGOrchestrationSubmissionStatus,
+    state: RAGDiagnosticSubmissionState,
+) -> None:
+    observer = BoundedRAGDiagnosticObserver()
+    manager, _runner = _manager(observer=observer)
+
+    manager.diagnostic_submission_status(status)
+
+    assert observer.snapshot().submission_state is state
 
 
 def test_public_exports_and_no_deferred_features_are_exact() -> None:

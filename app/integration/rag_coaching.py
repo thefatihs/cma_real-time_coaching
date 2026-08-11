@@ -186,10 +186,13 @@ class RAGCoachingProcessorDecorator:
             top_k=rag_config.top_k,
             minimum_score=rag_config.minimum_score,
         )
+        self._background_manager.diagnostic_submission_not_attempted()
         try:
             submission = self._background_manager.submit(request)
         except (RuntimeError, ValueError):
+            self._background_manager.diagnostic_submit_failed()
             return base_outcome
+        self._background_manager.diagnostic_submission_status(submission.status)
         if submission.status is RAGOrchestrationSubmissionStatus.ACCEPTED:
             self._pending_contexts[submission.identity] = _PendingContext(
                 event=event,
