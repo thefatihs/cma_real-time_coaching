@@ -1480,14 +1480,23 @@ class _ProductionLifecycle:
         for row in rows:
             if not isinstance(row, dict):
                 raise RuntimeError
+            if not {
+                "ProcessId",
+                "ParentProcessId",
+                "ExecutablePath",
+                "CommandLine",
+                "CreationDate",
+            }.issubset(row):
+                raise RuntimeError
             process_id = row.get("ProcessId")
             parent_id = row.get("ParentProcessId")
             if (
                 type(process_id) is not int
                 or type(parent_id) is not int
-                or process_id <= 0
+                or process_id < 0
                 or parent_id < 0
                 or process_id in seen
+                or (process_id == 0 and parent_id != 0)
             ):
                 raise RuntimeError
             executable_path = row.get("ExecutablePath")
@@ -1500,6 +1509,8 @@ class _ProductionLifecycle:
             if creation_time is not None and not isinstance(creation_time, str):
                 raise RuntimeError
             seen.add(process_id)
+            if process_id == 0:
+                continue
             observations.append(
                 _WindowsProcessObservation(
                     process_id,

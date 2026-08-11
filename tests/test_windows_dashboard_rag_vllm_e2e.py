@@ -1301,6 +1301,140 @@ def _marker_observation(
     )
 
 
+def _windows_process_observations_from_payload(
+    monkeypatch: pytest.MonkeyPatch, payload: object
+) -> tuple[subject._WindowsProcessObservation, ...]:
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "powershell.exe")
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+    return subject._ProductionLifecycle._windows_process_observations()
+
+
+def _wmi_row(
+    process_id: object,
+    parent_process_id: object,
+    *,
+    executable_path: object = None,
+    command_line: object = None,
+    creation_date: object = None,
+) -> dict[str, object]:
+    return {
+        "ProcessId": process_id,
+        "ParentProcessId": parent_process_id,
+        "ExecutablePath": executable_path,
+        "CommandLine": command_line,
+        "CreationDate": creation_date,
+    }
+
+
+def test_windows_process_observations_omit_canonical_pid_zero_and_keep_python_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "callmetric-owner-" + "a" * 32
+    base_executable = getattr(subject.sys, "_base_executable", subject.sys.executable)
+    payload = [
+        _wmi_row(0, 0),
+        _wmi_row(
+            6052,
+            30240,
+            executable_path=subject.sys.executable,
+            command_line=f"python --owner-marker {marker}",
+            creation_date="2026-08-10T12:00:01+00:00",
+        ),
+        _wmi_row(
+            32448,
+            6052,
+            executable_path=base_executable,
+            command_line=f"python --owner-marker {marker}",
+            creation_date="2026-08-10T12:00:02+00:00",
+        ),
+    ]
+
+    observations = _windows_process_observations_from_payload(monkeypatch, payload)
+
+    assert tuple(item.process_id for item in observations) == (6052, 32448)
+
+
+def test_windows_process_observations_canonical_pid_zero_alone_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _windows_process_observations_from_payload(monkeypatch, _wmi_row(0, 0)) == ()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _wmi_row(0, 1),
+        _wmi_row(-1, 0),
+        [_wmi_row(0, 0), _wmi_row(0, 0)],
+        _wmi_row(0, 0, executable_path=1),
+        _wmi_row(0, 0, command_line=[]),
+        _wmi_row(0, 0, creation_date=False),
+        {"ProcessId": 0, "ParentProcessId": 0},
+        _wmi_row("0", 0),
+    ],
+)
+def test_windows_process_observations_reject_malformed_pid_zero_rows(
+    monkeypatch: pytest.MonkeyPatch, payload: object
+) -> None:
+    with pytest.raises(RuntimeError):
+        _windows_process_observations_from_payload(monkeypatch, payload)
+
+
+def test_postgres_startup_only_accepts_pid_zero_and_cleans_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    secret_like_text = "private-command-line-token"
+    payload = [
+        _wmi_row(0, 0),
+        _wmi_row(
+            6052,
+            1,
+            executable_path=subject.sys.executable,
+            command_line=secret_like_text,
+            creation_date="2026-08-10T12:00:01+00:00",
+        ),
+    ]
+    cleanup_count = 0
+
+    class StartupOnlyOperations:
+        def run_phase(self, phase: str) -> None:
+            assert phase == "E_POSTGRES_START"
+            observations = _windows_process_observations_from_payload(
+                monkeypatch, payload
+            )
+            assert tuple(item.process_id for item in observations) == (6052,)
+
+        def cleanup(self) -> None:
+            nonlocal cleanup_count
+            cleanup_count += 1
+
+    run_postgres_startup_only = subject.run_postgres_startup_only
+    monkeypatch.setattr(
+        subject,
+        "run_postgres_startup_only",
+        lambda: run_postgres_startup_only(
+            environment=values,
+            operations_factory=lambda _config: StartupOnlyOperations(),
+        ),
+    )
+
+    assert subject.main(["--postgres-startup-only"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "POSTGRES_STARTUP_OK\n"
+    assert captured.err == ""
+    assert secret_like_text not in captured.out
+    assert secret_like_text not in captured.err
+    assert cleanup_count == 1
+
+
 def test_marker_ownership_finds_reparented_tls_interpreters_without_root(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
