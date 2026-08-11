@@ -615,7 +615,7 @@ class _ProductionLifecycle:
         self._outcome: StableCoachingOutcome | None = None
         self._processor: RAGCoachingProcessorDecorator | None = None
         self._vector_count = 0
-        self._protected_resources: dict[str, frozenset[str]] | None = None
+        self._protected_resources: object | None = None
         self._protected_handoff_entries: frozenset[Path] | None = None
         self._owned_processes: dict[int, int] = {}
         self._owner_marker: str | None = None
@@ -1911,12 +1911,13 @@ class _ProductionLifecycle:
 
     def _require_protected_resources_unchanged(self) -> None:
         from scripts.run_postgres_tls_service import (
+            ProtectedResourceSnapshot,
             require_protected_resources_unchanged,
         )
 
         expected = self._protected_resources
         docker = shutil.which("docker")
-        if expected is None or docker is None:
+        if not isinstance(expected, ProtectedResourceSnapshot) or docker is None:
             raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
         try:
             require_protected_resources_unchanged(docker, expected)

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 import csv
 import io
 import json
@@ -49,6 +50,8 @@ HANDOFF_PATTERN = re.compile(r"^callmetric-postgres-tls-[a-z0-9_]{8}$")
 HANDOFF_FILES = frozenset({"application.dsn", "ca.crt", "connection.json"})
 MAX_HANDOFF_FILE_BYTES = 65_536
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+DOCKER_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+BUILTIN_NETWORK_NAMES = ("bridge", "host", "none")
 CERTIFICATE_CONTAINER_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]+$")
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
@@ -246,19 +249,138 @@ def _docker_preflight() -> str:
     return docker
 
 
-def _resource_snapshot(docker: str) -> dict[str, frozenset[str]]:
-    commands = {
-        "container": [docker, "container", "ls", "-aq"],
-        "network": [docker, "network", "ls", "-q"],
-        "volume": [docker, "volume", "ls", "-q"],
-    }
-    return {
-        kind: frozenset(value for value in _output(command).splitlines() if value)
-        for kind, command in commands.items()
-    }
+@dataclass(frozen=True, slots=True)
+class BuiltinNetworkFingerprint:
+    name: str
+    driver: str
+    scope: str
+    internal: bool
+    attachable: bool
+    ingress: bool
+    ipam_driver: str
 
 
-def snapshot_protected_resources(docker: str) -> dict[str, frozenset[str]]:
+@dataclass(frozen=True, slots=True)
+class ProtectedResourceSnapshot:
+    container_ids: frozenset[str]
+    volume_ids: frozenset[str]
+    user_network_ids: frozenset[str]
+    builtin_networks: tuple[BuiltinNetworkFingerprint, ...]
+
+
+def _identity_set(
+    docker: str, resource: str, *, all_items: bool = False
+) -> frozenset[str]:
+    arguments = [docker, resource, "ls"]
+    if all_items:
+        arguments.append("-a")
+    arguments.append("-q")
+    values = tuple(value for value in _output(arguments).splitlines() if value)
+    if len(set(values)) != len(values) or any(
+        not RESOURCE_ID_PATTERN.fullmatch(value) for value in values
+    ):
+        raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+    return frozenset(values)
+
+
+def _network_inventory(
+    docker: str,
+) -> tuple[frozenset[str], tuple[BuiltinNetworkFingerprint, ...]]:
+    rows: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    for line in _output(
+        [docker, "network", "ls", "--format", "{{json .}}"]
+    ).splitlines():
+        try:
+            row = json.loads(line)
+        except (TypeError, ValueError):
+            raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES) from None
+        if not isinstance(row, dict) or not {"ID", "Name"}.issubset(row):
+            raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+        network_id = row.get("ID")
+        name = row.get("Name")
+        if (
+            not isinstance(network_id, str)
+            or not RESOURCE_ID_PATTERN.fullmatch(network_id)
+            or not isinstance(name, str)
+            or not DOCKER_VALUE_PATTERN.fullmatch(name)
+            or network_id in seen_ids
+            or name in seen_names
+        ):
+            raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+        seen_ids.add(network_id)
+        seen_names.add(name)
+        rows.append((network_id, name))
+    by_name = {name: network_id for network_id, name in rows}
+    if any(name not in by_name for name in BUILTIN_NETWORK_NAMES):
+        raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+    fingerprints: list[BuiltinNetworkFingerprint] = []
+    for expected_name in BUILTIN_NETWORK_NAMES:
+        network_id = by_name[expected_name]
+        try:
+            inspected = json.loads(
+                _output(
+                    [docker, "network", "inspect", "--format", "{{json .}}", network_id]
+                )
+            )
+        except (TypeError, ValueError):
+            raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES) from None
+        if not isinstance(inspected, dict):
+            raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+        name = inspected.get("Name")
+        inspected_id = inspected.get("Id")
+        driver = inspected.get("Driver")
+        scope = inspected.get("Scope")
+        internal = inspected.get("Internal")
+        attachable = inspected.get("Attachable")
+        ingress = inspected.get("Ingress")
+        ipam = inspected.get("IPAM")
+        if (
+            name != expected_name
+            or inspected_id != network_id
+            or not isinstance(driver, str)
+            or not DOCKER_VALUE_PATTERN.fullmatch(driver)
+            or not isinstance(scope, str)
+            or not DOCKER_VALUE_PATTERN.fullmatch(scope)
+            or type(internal) is not bool
+            or type(attachable) is not bool
+            or type(ingress) is not bool
+            or not isinstance(ipam, dict)
+            or not isinstance(ipam.get("Driver"), str)
+            or not DOCKER_VALUE_PATTERN.fullmatch(ipam["Driver"])
+        ):
+            raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
+        fingerprints.append(
+            BuiltinNetworkFingerprint(
+                expected_name,
+                driver,
+                scope,
+                internal,
+                attachable,
+                ingress,
+                ipam["Driver"],
+            )
+        )
+    return (
+        frozenset(
+            network_id for network_id, name in rows if name not in BUILTIN_NETWORK_NAMES
+        ),
+        tuple(fingerprints),
+    )
+
+
+def _resource_snapshot(docker: str) -> ProtectedResourceSnapshot:
+    user_network_ids, builtin_networks = _network_inventory(docker)
+    return ProtectedResourceSnapshot(
+        container_ids=_identity_set(docker, "container", all_items=True),
+        volume_ids=_identity_set(docker, "volume"),
+        user_network_ids=user_network_ids,
+        builtin_networks=builtin_networks,
+    )
+
+
+def snapshot_protected_resources(docker: str) -> ProtectedResourceSnapshot:
     """Return a secret-free read-only inventory for later preservation proof."""
     if not isinstance(docker, str) or not docker:
         raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)
@@ -266,20 +388,43 @@ def snapshot_protected_resources(docker: str) -> dict[str, frozenset[str]]:
 
 
 def require_protected_resources_unchanged(
-    docker: str, expected: Mapping[str, frozenset[str]]
+    docker: str, expected: ProtectedResourceSnapshot
 ) -> None:
     """Require the current Docker inventory to equal one trusted snapshot."""
     if (
         not isinstance(docker, str)
         or not docker
-        or set(expected) != {"container", "network", "volume"}
+        or not isinstance(expected, ProtectedResourceSnapshot)
         or any(
             not isinstance(values, frozenset)
             or any(
                 not isinstance(value, str) or not RESOURCE_ID_PATTERN.fullmatch(value)
                 for value in values
             )
-            for values in expected.values()
+            for values in (
+                expected.container_ids,
+                expected.volume_ids,
+                expected.user_network_ids,
+            )
+        )
+        or not isinstance(expected.builtin_networks, tuple)
+        or any(
+            not isinstance(item, BuiltinNetworkFingerprint)
+            for item in expected.builtin_networks
+        )
+        or tuple(item.name for item in expected.builtin_networks)
+        != BUILTIN_NETWORK_NAMES
+        or any(
+            not isinstance(item.driver, str)
+            or not DOCKER_VALUE_PATTERN.fullmatch(item.driver)
+            or not isinstance(item.scope, str)
+            or not DOCKER_VALUE_PATTERN.fullmatch(item.scope)
+            or type(item.internal) is not bool
+            or type(item.attachable) is not bool
+            or type(item.ingress) is not bool
+            or not isinstance(item.ipam_driver, str)
+            or not DOCKER_VALUE_PATTERN.fullmatch(item.ipam_driver)
+            for item in expected.builtin_networks
         )
     ):
         raise PostgreSQLTLSServiceError(phase=E_PROTECTED_RESOURCES)

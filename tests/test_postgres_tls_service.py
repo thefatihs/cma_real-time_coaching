@@ -7,12 +7,50 @@ import signal
 import subprocess
 import threading
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from scripts import run_postgres_tls_service as subject
 
 CURRENT_COMMIT = "cf3932dcb43911b2a5f5ff139f6ce07c88caf389"
+
+
+def _builtin_fingerprint(
+    name: str,
+    *,
+    driver: str = "bridge",
+    scope: str = "local",
+    internal: bool = False,
+    attachable: bool = False,
+    ingress: bool = False,
+    ipam_driver: str = "default",
+) -> subject.BuiltinNetworkFingerprint:
+    return subject.BuiltinNetworkFingerprint(
+        name,
+        driver,
+        scope,
+        internal,
+        attachable,
+        ingress,
+        ipam_driver,
+    )
+
+
+def _protected_snapshot(
+    *,
+    containers: frozenset[str] = frozenset({"container123"}),
+    volumes: frozenset[str] = frozenset({"volume123"}),
+    user_networks: frozenset[str] = frozenset({"network123"}),
+    builtins: tuple[subject.BuiltinNetworkFingerprint, ...] | None = None,
+) -> subject.ProtectedResourceSnapshot:
+    return subject.ProtectedResourceSnapshot(
+        containers,
+        volumes,
+        user_networks,
+        builtins
+        or tuple(_builtin_fingerprint(name) for name in subject.BUILTIN_NETWORK_NAMES),
+    )
 
 
 @pytest.mark.parametrize("ttl", [300, 600, 7200])
@@ -107,18 +145,7 @@ def test_handoff_is_owner_only_verify_full_and_removable(
 def test_public_protected_resource_snapshot_comparison_is_read_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    snapshots = [
-        {
-            "container": frozenset({"container123"}),
-            "network": frozenset({"network123"}),
-            "volume": frozenset({"volume123"}),
-        },
-        {
-            "container": frozenset({"container123"}),
-            "network": frozenset({"network123"}),
-            "volume": frozenset({"volume123"}),
-        },
-    ]
+    snapshots = [_protected_snapshot(), _protected_snapshot()]
     monkeypatch.setattr(subject, "_resource_snapshot", lambda _docker: snapshots.pop(0))
 
     expected = subject.snapshot_protected_resources("docker")
@@ -130,21 +157,203 @@ def test_public_protected_resource_snapshot_comparison_is_read_only(
 def test_public_protected_resource_comparison_rejects_change_or_invalid_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    expected = {
-        "container": frozenset({"container123"}),
-        "network": frozenset({"network123"}),
-        "volume": frozenset({"volume123"}),
-    }
+    expected = _protected_snapshot()
     monkeypatch.setattr(
         subject,
         "_resource_snapshot",
-        lambda _docker: {**expected, "volume": frozenset()},
+        lambda _docker: _protected_snapshot(volumes=frozenset()),
     )
 
     with pytest.raises(subject.PostgreSQLTLSServiceError):
         subject.require_protected_resources_unchanged("docker", expected)
     with pytest.raises(subject.PostgreSQLTLSServiceError):
-        subject.require_protected_resources_unchanged("docker", {})
+        subject.require_protected_resources_unchanged(
+            "docker", cast(subject.ProtectedResourceSnapshot, {})
+        )
+
+
+def _install_docker_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    state: dict[str, object],
+) -> None:
+    def output(arguments: list[str], **_kwargs: object) -> str:
+        command = tuple(arguments[1:])
+        if command == ("container", "ls", "-a", "-q"):
+            return "\n".join(cast(tuple[str, ...], state["containers"]))
+        if command == ("volume", "ls", "-q"):
+            return "\n".join(cast(tuple[str, ...], state["volumes"]))
+        if command == ("network", "ls", "--format", "{{json .}}"):
+            networks = cast(dict[str, str], state["networks"])
+            return "\n".join(
+                json.dumps({"ID": network_id, "Name": name})
+                for name, network_id in networks.items()
+            )
+        if command[:4] == ("network", "inspect", "--format", "{{json .}}"):
+            network_id = command[4]
+            networks = cast(dict[str, str], state["networks"])
+            name = next(name for name, value in networks.items() if value == network_id)
+            overrides = cast(dict[str, dict[str, object]], state.get("overrides", {}))
+            payload: dict[str, object] = {
+                "Name": name,
+                "Id": network_id,
+                "Driver": {"bridge": "bridge", "host": "host", "none": "null"}.get(
+                    name, "bridge"
+                ),
+                "Scope": "local",
+                "Internal": False,
+                "Attachable": False,
+                "Ingress": False,
+                "IPAM": {"Driver": "default"},
+            }
+            payload.update(overrides.get(name, {}))
+            return json.dumps(payload)
+        raise AssertionError(command)
+
+    monkeypatch.setattr(subject, "_output", output)
+
+
+@pytest.mark.parametrize("name", subject.BUILTIN_NETWORK_NAMES)
+def test_builtin_network_id_rotation_with_same_semantics_is_accepted(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state: dict[str, object] = {
+        "containers": ("container123",),
+        "volumes": ("volume123",),
+        "networks": {
+            "bridge": "bridge-old",
+            "host": "host-old",
+            "none": "none-old",
+            "user-network": "user123",
+        },
+    }
+    _install_docker_inventory(monkeypatch, state)
+    expected = subject.snapshot_protected_resources("docker")
+    cast(dict[str, str], state["networks"])[name] = f"{name}-new"
+
+    subject.require_protected_resources_unchanged("docker", expected)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("Driver", "changed"),
+        ("Scope", "swarm"),
+        ("Internal", True),
+        ("Attachable", True),
+        ("Ingress", True),
+        ("IPAM", {"Driver": "changed"}),
+    ],
+)
+def test_builtin_network_semantic_change_is_rejected(
+    field: str, changed: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state: dict[str, object] = {
+        "containers": (),
+        "volumes": (),
+        "networks": {"bridge": "b1", "host": "h1", "none": "n1"},
+        "overrides": {},
+    }
+    _install_docker_inventory(monkeypatch, state)
+    expected = subject.snapshot_protected_resources("docker")
+    cast(dict[str, dict[str, object]], state["overrides"])["bridge"] = {field: changed}
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.require_protected_resources_unchanged("docker", expected)
+
+
+@pytest.mark.parametrize("changed", ["containers", "volumes", "user_network"])
+def test_raw_protected_resource_identity_change_is_rejected(
+    changed: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state: dict[str, object] = {
+        "containers": ("container1",),
+        "volumes": ("volume1",),
+        "networks": {
+            "bridge": "b1",
+            "host": "h1",
+            "none": "n1",
+            "user-network": "u1",
+        },
+    }
+    _install_docker_inventory(monkeypatch, state)
+    expected = subject.snapshot_protected_resources("docker")
+    if changed == "containers":
+        state["containers"] = ("container2",)
+    elif changed == "volumes":
+        state["volumes"] = ("volume2",)
+    else:
+        cast(dict[str, str], state["networks"])["user-network"] = "u2"
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.require_protected_resources_unchanged("docker", expected)
+
+
+def test_builtin_network_missing_duplicate_or_inconsistent_name_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state: dict[str, object] = {
+        "containers": (),
+        "volumes": (),
+        "networks": {"bridge": "b1", "host": "h1"},
+    }
+    _install_docker_inventory(monkeypatch, state)
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.snapshot_protected_resources("docker")
+
+    state["networks"] = {"bridge": "b1", "host": "h1", "none": "n1"}
+    state["overrides"] = {"bridge": {"Name": "host"}}
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.snapshot_protected_resources("docker")
+
+    state["overrides"] = {"bridge": {"Id": "different-id"}}
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.snapshot_protected_resources("docker")
+
+
+def test_builtin_network_duplicate_name_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = (
+        {"ID": "b1", "Name": "bridge"},
+        {"ID": "b2", "Name": "bridge"},
+        {"ID": "h1", "Name": "host"},
+        {"ID": "n1", "Name": "none"},
+    )
+    monkeypatch.setattr(
+        subject,
+        "_output",
+        lambda _arguments, **_kwargs: "\n".join(json.dumps(row) for row in rows),
+    )
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.snapshot_protected_resources("docker")
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"Driver": 1},
+        {"Scope": None},
+        {"Internal": "false"},
+        {"Attachable": 0},
+        {"Ingress": None},
+        {"IPAM": []},
+        {"IPAM": {"Driver": False}},
+    ],
+)
+def test_builtin_network_malformed_inspect_shape_is_rejected(
+    override: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state: dict[str, object] = {
+        "containers": (),
+        "volumes": (),
+        "networks": {"bridge": "b1", "host": "h1", "none": "n1"},
+        "overrides": {"bridge": override},
+    }
+    _install_docker_inventory(monkeypatch, state)
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.snapshot_protected_resources("docker")
 
 
 def test_exact_project_cleanup_is_idempotent_when_targets_are_already_absent(

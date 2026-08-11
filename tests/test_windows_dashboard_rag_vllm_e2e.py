@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 
+import scripts.run_postgres_tls_service as tls_subject
 import scripts.run_windows_dashboard_rag_vllm_e2e as subject
 from app.coaching.coordinator import (
     CoachingCoordinatorResult,
@@ -1004,6 +1005,97 @@ def test_postgres_startup_only_unknown_cleanup_failure_stays_generic_and_secret_
     assert secret_like_text not in captured.out
     assert secret_like_text not in captured.err
     assert operations.events == ["E_POSTGRES_START", "E_CLEANUP"]
+
+
+def test_postgres_startup_only_accepts_builtin_bridge_id_rotation_and_cleans_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    fingerprints = tuple(
+        tls_subject.BuiltinNetworkFingerprint(
+            name,
+            {"bridge": "bridge", "host": "host", "none": "null"}[name],
+            "local",
+            False,
+            False,
+            False,
+            "default",
+        )
+        for name in tls_subject.BUILTIN_NETWORK_NAMES
+    )
+    expected = tls_subject.ProtectedResourceSnapshot(
+        frozenset({"container-old"}),
+        frozenset({"volume-old"}),
+        frozenset({"user-network-old"}),
+        fingerprints,
+    )
+    current_after_bridge_rotation = tls_subject.ProtectedResourceSnapshot(
+        expected.container_ids,
+        expected.volume_ids,
+        expected.user_network_ids,
+        fingerprints,
+    )
+    cleanup_count = 0
+
+    class StartupOperations(FakeOperations):
+        def cleanup(self) -> None:
+            nonlocal cleanup_count
+            cleanup_count += 1
+            monkeypatch.setattr(
+                tls_subject,
+                "_resource_snapshot",
+                lambda _docker: current_after_bridge_rotation,
+            )
+            tls_subject.require_protected_resources_unchanged("docker", expected)
+
+    assert (
+        subject.run_postgres_startup_only(
+            environment=environment(tmp_path),
+            operations_factory=lambda _config: StartupOperations(),
+        )
+        == subject.POSTGRES_STARTUP_OK
+    )
+    assert cleanup_count == 1
+
+
+def test_user_network_mutation_maps_to_fixed_cleanup_protected_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    lifecycle = subject._ProductionLifecycle(subject.preflight(values), values)
+    lifecycle._protected_resources = tls_subject.ProtectedResourceSnapshot(
+        frozenset(),
+        frozenset(),
+        frozenset(),
+        tuple(
+            tls_subject.BuiltinNetworkFingerprint(
+                name,
+                {"bridge": "bridge", "host": "host", "none": "null"}[name],
+                "local",
+                False,
+                False,
+                False,
+                "default",
+            )
+            for name in tls_subject.BUILTIN_NETWORK_NAMES
+        ),
+    )
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "docker")
+    monkeypatch.setattr(
+        tls_subject,
+        "require_protected_resources_unchanged",
+        lambda _docker, _expected: (_ for _ in ()).throw(
+            tls_subject.PostgreSQLTLSServiceError(
+                phase=tls_subject.E_PROTECTED_RESOURCES
+            )
+        ),
+    )
+    with pytest.raises(
+        subject._CleanupPhaseError,
+        match=f"^{subject.E_CLEANUP_PROTECTED_VERIFY}$",
+    ):
+        lifecycle._require_protected_resources_unchanged()
 
 
 def test_main_postgres_startup_only_prints_only_fixed_result(
