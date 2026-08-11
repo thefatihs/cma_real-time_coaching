@@ -50,6 +50,7 @@ HANDOFF_PATTERN = re.compile(r"^callmetric-postgres-tls-[a-z0-9_]{8}$")
 HANDOFF_FILES = frozenset({"application.dsn", "ca.crt", "connection.json"})
 MAX_HANDOFF_FILE_BYTES = 65_536
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+DOCKER_NETWORK_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 DOCKER_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 BUILTIN_NETWORK_NAMES = ("bridge", "host", "none")
 CERTIFICATE_CONTAINER_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]+$")
@@ -290,7 +291,7 @@ def _network_inventory(
     seen_ids: set[str] = set()
     seen_names: set[str] = set()
     for line in _output(
-        [docker, "network", "ls", "--format", "{{json .}}"]
+        [docker, "network", "ls", "--no-trunc", "--format", "{{json .}}"]
     ).splitlines():
         try:
             row = json.loads(line)
@@ -302,7 +303,7 @@ def _network_inventory(
         name = row.get("Name")
         if (
             not isinstance(network_id, str)
-            or not RESOURCE_ID_PATTERN.fullmatch(network_id)
+            or not DOCKER_NETWORK_ID_PATTERN.fullmatch(network_id)
             or not isinstance(name, str)
             or not DOCKER_VALUE_PATTERN.fullmatch(name)
             or network_id in seen_ids
@@ -404,8 +405,12 @@ def require_protected_resources_unchanged(
             for values in (
                 expected.container_ids,
                 expected.volume_ids,
-                expected.user_network_ids,
             )
+        )
+        or not isinstance(expected.user_network_ids, frozenset)
+        or any(
+            not isinstance(value, str) or not DOCKER_NETWORK_ID_PATTERN.fullmatch(value)
+            for value in expected.user_network_ids
         )
         or not isinstance(expected.builtin_networks, tuple)
         or any(

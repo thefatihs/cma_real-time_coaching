@@ -1026,7 +1026,7 @@ def test_postgres_startup_only_accepts_builtin_bridge_id_rotation_and_cleans_onc
     expected = tls_subject.ProtectedResourceSnapshot(
         frozenset({"container-old"}),
         frozenset({"volume-old"}),
-        frozenset({"user-network-old"}),
+        frozenset({"d" * 64}),
         fingerprints,
     )
     current_after_bridge_rotation = tls_subject.ProtectedResourceSnapshot(

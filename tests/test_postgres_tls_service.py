@@ -41,7 +41,7 @@ def _protected_snapshot(
     *,
     containers: frozenset[str] = frozenset({"container123"}),
     volumes: frozenset[str] = frozenset({"volume123"}),
-    user_networks: frozenset[str] = frozenset({"network123"}),
+    user_networks: frozenset[str] = frozenset({"d" * 64}),
     builtins: tuple[subject.BuiltinNetworkFingerprint, ...] | None = None,
 ) -> subject.ProtectedResourceSnapshot:
     return subject.ProtectedResourceSnapshot(
@@ -51,6 +51,11 @@ def _protected_snapshot(
         builtins
         or tuple(_builtin_fingerprint(name) for name in subject.BUILTIN_NETWORK_NAMES),
     )
+
+
+def _network_id(character: str) -> str:
+    assert len(character) == 1 and character in "0123456789abcdef"
+    return character * 64
 
 
 @pytest.mark.parametrize("ttl", [300, 600, 7200])
@@ -178,11 +183,20 @@ def _install_docker_inventory(
 ) -> None:
     def output(arguments: list[str], **_kwargs: object) -> str:
         command = tuple(arguments[1:])
+        commands = state.get("commands")
+        if isinstance(commands, list):
+            commands.append(command)
         if command == ("container", "ls", "-a", "-q"):
             return "\n".join(cast(tuple[str, ...], state["containers"]))
         if command == ("volume", "ls", "-q"):
             return "\n".join(cast(tuple[str, ...], state["volumes"]))
-        if command == ("network", "ls", "--format", "{{json .}}"):
+        if command == (
+            "network",
+            "ls",
+            "--no-trunc",
+            "--format",
+            "{{json .}}",
+        ):
             networks = cast(dict[str, str], state["networks"])
             return "\n".join(
                 json.dumps({"ID": network_id, "Name": name})
@@ -212,6 +226,62 @@ def _install_docker_inventory(
     monkeypatch.setattr(subject, "_output", output)
 
 
+def test_network_inventory_requests_full_untruncated_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+    state: dict[str, object] = {
+        "containers": (),
+        "volumes": (),
+        "networks": {
+            "bridge": _network_id("a"),
+            "host": _network_id("b"),
+            "none": _network_id("c"),
+        },
+        "commands": commands,
+    }
+    _install_docker_inventory(monkeypatch, state)
+
+    subject.snapshot_protected_resources("docker")
+
+    assert (
+        "network",
+        "ls",
+        "--no-trunc",
+        "--format",
+        "{{json .}}",
+    ) in commands
+
+
+@pytest.mark.parametrize(
+    "invalid_id",
+    [
+        "a" * 12,
+        "g" * 64,
+        "A" * 64,
+        "a" * 63,
+        "a" * 65,
+        "",
+    ],
+)
+def test_network_inventory_rejects_truncated_or_malformed_ids(
+    invalid_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state: dict[str, object] = {
+        "containers": (),
+        "volumes": (),
+        "networks": {
+            "bridge": invalid_id,
+            "host": _network_id("b"),
+            "none": _network_id("c"),
+        },
+    }
+    _install_docker_inventory(monkeypatch, state)
+
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject.snapshot_protected_resources("docker")
+
+
 @pytest.mark.parametrize("name", subject.BUILTIN_NETWORK_NAMES)
 def test_builtin_network_id_rotation_with_same_semantics_is_accepted(
     name: str, monkeypatch: pytest.MonkeyPatch
@@ -220,15 +290,15 @@ def test_builtin_network_id_rotation_with_same_semantics_is_accepted(
         "containers": ("container123",),
         "volumes": ("volume123",),
         "networks": {
-            "bridge": "bridge-old",
-            "host": "host-old",
-            "none": "none-old",
-            "user-network": "user123",
+            "bridge": _network_id("a"),
+            "host": _network_id("b"),
+            "none": _network_id("c"),
+            "user-network": _network_id("d"),
         },
     }
     _install_docker_inventory(monkeypatch, state)
     expected = subject.snapshot_protected_resources("docker")
-    cast(dict[str, str], state["networks"])[name] = f"{name}-new"
+    cast(dict[str, str], state["networks"])[name] = _network_id("e")
 
     subject.require_protected_resources_unchanged("docker", expected)
 
@@ -250,7 +320,11 @@ def test_builtin_network_semantic_change_is_rejected(
     state: dict[str, object] = {
         "containers": (),
         "volumes": (),
-        "networks": {"bridge": "b1", "host": "h1", "none": "n1"},
+        "networks": {
+            "bridge": _network_id("a"),
+            "host": _network_id("b"),
+            "none": _network_id("c"),
+        },
         "overrides": {},
     }
     _install_docker_inventory(monkeypatch, state)
@@ -269,10 +343,10 @@ def test_raw_protected_resource_identity_change_is_rejected(
         "containers": ("container1",),
         "volumes": ("volume1",),
         "networks": {
-            "bridge": "b1",
-            "host": "h1",
-            "none": "n1",
-            "user-network": "u1",
+            "bridge": _network_id("a"),
+            "host": _network_id("b"),
+            "none": _network_id("c"),
+            "user-network": _network_id("d"),
         },
     }
     _install_docker_inventory(monkeypatch, state)
@@ -282,7 +356,7 @@ def test_raw_protected_resource_identity_change_is_rejected(
     elif changed == "volumes":
         state["volumes"] = ("volume2",)
     else:
-        cast(dict[str, str], state["networks"])["user-network"] = "u2"
+        cast(dict[str, str], state["networks"])["user-network"] = _network_id("e")
 
     with pytest.raises(subject.PostgreSQLTLSServiceError):
         subject.require_protected_resources_unchanged("docker", expected)
@@ -294,30 +368,37 @@ def test_builtin_network_missing_duplicate_or_inconsistent_name_is_rejected(
     state: dict[str, object] = {
         "containers": (),
         "volumes": (),
-        "networks": {"bridge": "b1", "host": "h1"},
+        "networks": {"bridge": _network_id("a"), "host": _network_id("b")},
     }
     _install_docker_inventory(monkeypatch, state)
     with pytest.raises(subject.PostgreSQLTLSServiceError):
         subject.snapshot_protected_resources("docker")
 
-    state["networks"] = {"bridge": "b1", "host": "h1", "none": "n1"}
+    state["networks"] = {
+        "bridge": _network_id("a"),
+        "host": _network_id("b"),
+        "none": _network_id("c"),
+    }
     state["overrides"] = {"bridge": {"Name": "host"}}
     with pytest.raises(subject.PostgreSQLTLSServiceError):
         subject.snapshot_protected_resources("docker")
 
-    state["overrides"] = {"bridge": {"Id": "different-id"}}
+    state["overrides"] = {"bridge": {"Id": _network_id("f")}}
     with pytest.raises(subject.PostgreSQLTLSServiceError):
         subject.snapshot_protected_resources("docker")
 
 
-def test_builtin_network_duplicate_name_is_rejected(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("duplicate", ["name", "id"])
+def test_builtin_network_duplicate_name_or_full_id_is_rejected(
+    duplicate: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    second_id = _network_id("b") if duplicate == "name" else _network_id("a")
+    second_name = "bridge" if duplicate == "name" else "host"
     rows = (
-        {"ID": "b1", "Name": "bridge"},
-        {"ID": "b2", "Name": "bridge"},
-        {"ID": "h1", "Name": "host"},
-        {"ID": "n1", "Name": "none"},
+        {"ID": _network_id("a"), "Name": "bridge"},
+        {"ID": second_id, "Name": second_name},
+        {"ID": _network_id("c"), "Name": "user-network"},
+        {"ID": _network_id("d"), "Name": "none"},
     )
     monkeypatch.setattr(
         subject,
@@ -347,7 +428,11 @@ def test_builtin_network_malformed_inspect_shape_is_rejected(
     state: dict[str, object] = {
         "containers": (),
         "volumes": (),
-        "networks": {"bridge": "b1", "host": "h1", "none": "n1"},
+        "networks": {
+            "bridge": _network_id("a"),
+            "host": _network_id("b"),
+            "none": _network_id("c"),
+        },
         "overrides": {"bridge": override},
     }
     _install_docker_inventory(monkeypatch, state)
