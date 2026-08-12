@@ -17,7 +17,7 @@ from queue import Empty, Full, Queue
 import socket
 import sys
 from threading import Lock, Thread, current_thread
-from typing import Callable, Final
+from typing import Callable, Final, MutableMapping, cast
 
 import av
 
@@ -498,6 +498,22 @@ def create_relay_client_session(config: RelayClientConfig) -> RelayClientSession
     return RelayClientSession(sender=sender, capture=RelayCaptureSession(sender))
 
 
+def reset_terminal_relay_client_session(
+    session_state: MutableMapping[str, object],
+) -> bool:
+    session = session_state.get("relay_client_session")
+    if not isinstance(
+        session, RelayClientSession
+    ) or session.sender.diagnostics.status not in {
+        RelayClientStatus.FAILED,
+        RelayClientStatus.ENDED,
+    }:
+        return False
+    session.close()
+    session_state.pop("relay_client_session", None)
+    return True
+
+
 def render() -> None:
     import streamlit as st
 
@@ -526,9 +542,13 @@ def render() -> None:
             )
             session = create_relay_client_session(config)
             st.session_state.relay_client_session = session
-            session.sender.start()
+            if not session.sender.start():
+                raise RuntimeError(RelayReason.TERMINAL_STATE.value)
             st.rerun()
         except Exception:
+            retained = st.session_state.pop("relay_client_session", None)
+            if isinstance(retained, RelayClientSession):
+                retained.close()
             st.error("Relay oturumu güvenli biçimde başlatılamadı.")
     if not isinstance(session, RelayClientSession):
         st.info("Bağlantı bilgilerini girip Connect / Start seçin.")
@@ -541,6 +561,13 @@ def render() -> None:
     st.metric("Kuyruk", diagnostics.queue_depth)
     if diagnostics.failure_reason is not None:
         st.error(f"Relay başarısız: {diagnostics.failure_reason.value}")
+    if diagnostics.status in {RelayClientStatus.FAILED, RelayClientStatus.ENDED}:
+        if st.button("Reset / Reconnect"):
+            reset_terminal_relay_client_session(
+                cast(MutableMapping[str, object], st.session_state)
+            )
+            st.rerun()
+        return
     if diagnostics.status is RelayClientStatus.STREAMING:
         microphone_webrtc_streamer(
             session=session.capture,  # type: ignore[arg-type]

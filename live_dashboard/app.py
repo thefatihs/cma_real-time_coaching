@@ -1479,14 +1479,13 @@ def _render_ssh_microphone_relay_details(
         disabled=True,
         key="ssh_microphone_relay_stream",
     )
-    st.text_input(
-        "Ephemeral relay token",
-        value=context.token,
-        type="password",
-        disabled=True,
-        key="ssh_microphone_relay_token",
+    st.caption(
+        "Ephemeral relay token — aşağıdaki ayrı bloktan kopyalayın. Yalnızca "
+        "bu geliştirme çağrısı için "
+        "bellekte tutulur; komuta veya URL'ye eklenmez."
     )
-    st.caption("Token yalnızca bu geliştirme çağrısı için bellekte tutulur.")
+    st.code(context.token, language=None)
+    st.caption("SSH tunnel command — token içermez.")
     st.code(_SSH_TUNNEL_COMMAND, language="bash")
     st.caption(
         "Windows istemcisi: uv run streamlit run "

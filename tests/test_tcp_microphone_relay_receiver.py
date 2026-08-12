@@ -21,6 +21,7 @@ from app.audio_ingress.local_microphone import (
     create_local_mic_test_capability,
 )
 from app.audio_ingress.tcp_microphone_relay import (
+    RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS,
     RELAY_IO_TIMEOUT_SECONDS,
     RELAY_LOOPBACK_HOST,
     LocalhostMicrophoneRelayReceiver,
@@ -36,7 +37,9 @@ from scripts.run_local_microphone_relay_client import (
     BoundedRelaySender,
     RelayCaptureSession,
     RelayClientConfig,
+    RelayClientSession,
     RelayClientStatus,
+    reset_terminal_relay_client_session,
 )
 from live_dashboard.demo_data import tenant_demos
 from live_dashboard.runtime_wiring import (
@@ -402,6 +405,50 @@ class TimeoutSocket:
         self.closed += 1
 
 
+class ListenerTimeoutSocket:
+    def __init__(self) -> None:
+        self.timeout: float | None = None
+        self.closed = 0
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+
+    def bind(self, address: tuple[str, int]) -> None:
+        assert address == (RELAY_LOOPBACK_HOST, 0)
+
+    def listen(self, backlog: int) -> None:
+        assert backlog == 1
+
+    def getsockname(self) -> tuple[str, int]:
+        return RELAY_LOOPBACK_HOST, 18_765
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_initial_client_wait_timeout_is_separate_from_connected_io_timeout() -> None:
+    resource, session, _receiver = session_and_receiver()
+    listener = ListenerTimeoutSocket()
+    receiver = LocalhostMicrophoneRelayReceiver(
+        session=session,
+        resource=resource,
+        expected_token=TOKEN,
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        stream_id="relay-stream",
+        resume_capability_factory=lambda: capability(resource),
+        enabled=True,
+        io_timeout_seconds=1.0,
+        socket_factory=lambda *_args: listener,  # type: ignore[arg-type]
+    )
+
+    assert receiver.start() == (RELAY_LOOPBACK_HOST, 18_765)
+    assert listener.timeout == RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS
+    assert listener.timeout is not None
+    assert listener.timeout > RELAY_IO_TIMEOUT_SECONDS
+    receiver.close()
+
+
 def test_timeout_fails_closed_and_closes_connected_socket_once() -> None:
     _resource, session, receiver = session_and_receiver()
     client = TimeoutSocket()
@@ -754,6 +801,42 @@ def test_remote_error_and_tunnel_disconnect_are_fixed_failures() -> None:
         wait_for_client_status(sender, RelayClientStatus.FAILED)
         assert sender.diagnostics.failure_reason is expected
         sender.close()
+
+
+def test_terminal_client_session_can_reset_and_retry_without_restart() -> None:
+    failed_sender = BoundedRelaySender(client_config())
+    failed_sender.fail(RelayReason.CONNECTION_CLOSED)
+    failed_session = RelayClientSession(
+        sender=failed_sender,
+        capture=RelayCaptureSession(failed_sender),
+    )
+    session_state: dict[str, object] = {
+        "relay_client_session": failed_session,
+    }
+
+    assert reset_terminal_relay_client_session(session_state)
+    assert "relay_client_session" not in session_state
+
+    retry_connection = AckSocket()
+    retry_sender = BoundedRelaySender(
+        client_config(),
+        socket_factory=lambda *_args: retry_connection,  # type: ignore[arg-type]
+    )
+    retry_session = RelayClientSession(
+        sender=retry_sender,
+        capture=RelayCaptureSession(retry_sender),
+    )
+    session_state["relay_client_session"] = retry_session
+
+    assert retry_sender.start()
+    retry_connection.wait_for_records(1)
+    wait_for_client_status(retry_sender, RelayClientStatus.STREAMING)
+    assert not reset_terminal_relay_client_session(session_state)
+    assert retry_sender.end()
+    retry_connection.wait_for_records(2)
+    wait_for_client_status(retry_sender, RelayClientStatus.ENDED)
+    assert reset_terminal_relay_client_session(session_state)
+    assert "relay_client_session" not in session_state
 
 
 def test_webrtc_capture_callback_only_normalizes_and_enqueues() -> None:

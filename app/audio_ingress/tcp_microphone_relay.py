@@ -42,6 +42,7 @@ RELAY_CHANNEL_COUNT: Final = 1
 RELAY_LOOPBACK_HOST: Final = "127.0.0.1"
 RELAY_BACKLOG: Final = 1
 RELAY_IO_TIMEOUT_SECONDS: Final = 5.0
+RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS: Final = 300.0
 RELAY_RECV_BYTES: Final = 4_096
 
 
@@ -602,6 +603,9 @@ class LocalhostMicrophoneRelayReceiver:
         bind_host: str = RELAY_LOOPBACK_HOST,
         port: int = 0,
         io_timeout_seconds: float = RELAY_IO_TIMEOUT_SECONDS,
+        initial_client_wait_timeout_seconds: float = (
+            RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS
+        ),
         socket_factory: Callable[..., socket.socket] = socket.socket,
     ) -> None:
         if bind_host != RELAY_LOOPBACK_HOST:
@@ -612,6 +616,13 @@ class LocalhostMicrophoneRelayReceiver:
             not isfinite(io_timeout_seconds)
             or io_timeout_seconds <= 0
             or io_timeout_seconds > RELAY_IO_TIMEOUT_SECONDS
+        ):
+            raise ValueError(RelayReason.IO_TIMEOUT.value)
+        if (
+            not isfinite(initial_client_wait_timeout_seconds)
+            or initial_client_wait_timeout_seconds <= 0
+            or initial_client_wait_timeout_seconds
+            > RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS
         ):
             raise ValueError(RelayReason.IO_TIMEOUT.value)
         if (
@@ -626,6 +637,7 @@ class LocalhostMicrophoneRelayReceiver:
         self._bind_host = bind_host
         self._port = port
         self._io_timeout_seconds = io_timeout_seconds
+        self._initial_client_wait_timeout_seconds = initial_client_wait_timeout_seconds
         self._socket_factory = socket_factory
         self._protocol = BoundedMicrophoneRelayProtocol(
             expected_token=expected_token,
@@ -676,7 +688,7 @@ class LocalhostMicrophoneRelayReceiver:
             return address
         listener = self._socket_factory(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            listener.settimeout(self._io_timeout_seconds)
+            listener.settimeout(self._initial_client_wait_timeout_seconds)
             listener.bind((self._bind_host, self._port))
             listener.listen(RELAY_BACKLOG)
         except Exception:

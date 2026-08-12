@@ -1955,7 +1955,7 @@ def test_ssh_relay_receiver_is_retained_once_and_session_cleanup_owns_it(
     assert first.closed == 1
 
 
-def test_ssh_relay_details_mask_token_and_render_no_secret_in_command(
+def test_ssh_relay_details_make_token_copyable_without_putting_it_in_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recorder = _RecordingStreamlit()
@@ -1972,13 +1972,13 @@ def test_ssh_relay_details_mask_token_and_render_no_secret_in_command(
         receiver=None,
     )
 
-    token_inputs = [
-        item for item in recorder.text_inputs if item[0] == "Ephemeral relay token"
-    ]
-    assert token_inputs[0][2]["type"] == "password"
-    assert context.token not in "\n".join(recorder.codes)
-    assert "127.0.0.1:18765" in recorder.codes[0]
-    assert "<gpu-ssh-alias>" in recorder.codes[0]
+    assert not any(item[0] == "Ephemeral relay token" for item in recorder.text_inputs)
+    assert recorder.codes[0] == context.token
+    assert context.token not in recorder.codes[1]
+    assert "127.0.0.1:18765" in recorder.codes[1]
+    assert "<gpu-ssh-alias>" in recorder.codes[1]
+    assert any("Ephemeral relay token" in caption for caption in recorder.captions)
+    assert any("SSH tunnel command" in caption for caption in recorder.captions)
 
 
 def test_local_microphone_model_preparation_failure_is_visible_and_revokes_once(

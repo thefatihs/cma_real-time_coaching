@@ -374,3 +374,16 @@ This log uses local chronological numbering and records only Fatih-owned work.
 - Tests: focused calibration and threshold-profile tests 20 passed. Ruff,
   formatting, and focused Pyright passed.
 - Next planned step: confirm the trusted checksum on the Linux model host.
+
+## Development SSH microphone relay workflow
+
+- Separated the bounded five-minute first-client wait from unchanged
+  five-second connected I/O timeouts, and added safe terminal client reset and
+  reconnect handling without changing localhost, scope, or token validation.
+- Made the memory-only ephemeral token directly copyable without adding it to
+  commands, URLs, logs, or persistent storage.
+- Changed files: Fatih-owned relay receiver/client/dashboard files, focused
+  synthetic tests, and this progress file.
+- Tests: focused relay/dashboard tests 85 passed. Ruff, formatting, and focused
+  Pyright passed.
+- Next planned step: manually verify the SSH tunnel workflow end to end.
