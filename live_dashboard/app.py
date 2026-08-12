@@ -1449,6 +1449,12 @@ def _render_ssh_microphone_relay_details(
             RelaySessionState.FAILED: "Relay oturumu başarısız",
         }[receiver.state]
     st.info(status)
+    if (
+        receiver is not None
+        and receiver.state is RelaySessionState.FAILED
+        and receiver.last_failure_reason is not None
+    ):
+        st.error(f"Relay hata nedeni: {receiver.last_failure_reason.value}")
     _metric_rows(
         (
             StatusCardViewModel("Relay adresi", RELAY_LOOPBACK_HOST),

@@ -262,6 +262,7 @@ def test_wrong_token_and_scope_fail_without_secret_leakage() -> None:
         _resource, _session, receiver = session_and_receiver()
         response = receiver.process_bytes(record)[0]
         assert response_reason(response) == (RelayMessageType.ERROR, expected)
+        assert receiver.last_failure_reason is expected
         assert TOKEN not in repr(receiver)
         assert TOKEN not in response.decode("latin1")
 
@@ -463,6 +464,7 @@ def test_timeout_fails_closed_and_closes_connected_socket_once() -> None:
         RelayReason.IO_TIMEOUT,
     )
     assert receiver.state is RelaySessionState.FAILED
+    assert receiver.last_failure_reason is RelayReason.IO_TIMEOUT
     assert session.diagnostics.status is LocalMicrophoneStatus.FAILED
 
 
@@ -513,6 +515,7 @@ def test_disconnect_before_end_releases_resources() -> None:
     receiver.serve_connected_socket(server)
 
     assert receiver.state is RelaySessionState.FAILED
+    assert receiver.last_failure_reason is RelayReason.CONNECTION_CLOSED
     assert not receiver.client_active
     assert session.diagnostics.status is LocalMicrophoneStatus.DISCONNECTED
 

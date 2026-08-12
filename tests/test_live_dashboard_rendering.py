@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+
+from app.audio_ingress.tcp_microphone_relay import RelayReason
 from streamlit.testing.v1 import AppTest
 
 from app.audio_ingress.local_microphone import (
@@ -1979,6 +1981,34 @@ def test_ssh_relay_details_make_token_copyable_without_putting_it_in_command(
     assert "<gpu-ssh-alias>" in recorder.codes[1]
     assert any("Ephemeral relay token" in caption for caption in recorder.captions)
     assert any("SSH tunnel command" in caption for caption in recorder.captions)
+
+
+def test_ssh_relay_details_render_only_sanitized_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-relay")
+    token = "synthetic-relay-token-00000001"
+    context = app._SSHMicrophoneRelayContext(
+        stream_id="relay-stream",
+        token=token,
+    )
+
+    class FailedReceiver:
+        state = app.RelaySessionState.FAILED
+        last_failure_reason = RelayReason.IO_TIMEOUT
+        worker_active = False
+
+    app._render_ssh_microphone_relay_details(
+        local=state,
+        context=context,
+        receiver=cast(Any, FailedReceiver()),
+    )
+
+    assert recorder.errors == ["Relay hata nedeni: io_timeout"]
+    assert token not in "\n".join(recorder.errors)
+    assert token not in recorder.codes[1]
 
 
 def test_local_microphone_model_preparation_failure_is_visible_and_revokes_once(

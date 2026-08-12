@@ -391,5 +391,8 @@ This log uses local chronological numbering and records only Fatih-owned work.
   unchanged five-second connected I/O timeout after the first audio chunk.
 - Follow-up tests: focused relay tests 31 passed. Ruff, formatting, and focused
   Pyright passed.
+- Diagnostic follow-up retains and displays only the receiver's final sanitized
+  `RelayReason` for FAILED development relay sessions. Focused relay/dashboard
+  tests: 33 passed; Ruff, formatting, and focused Pyright passed.
 - Next planned step: manually verify browser permission and first audio over
   the SSH tunnel workflow end to end.

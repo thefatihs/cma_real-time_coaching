@@ -653,10 +653,15 @@ class LocalhostMicrophoneRelayReceiver:
         self._client_active = False
         self._closed = False
         self._session_released = False
+        self._last_failure_reason: RelayReason | None = None
 
     @property
     def state(self) -> RelaySessionState:
         return self._protocol.state
+
+    @property
+    def last_failure_reason(self) -> RelayReason | None:
+        return self._last_failure_reason
 
     @property
     def listening_address(self) -> tuple[str, int] | None:
@@ -892,6 +897,7 @@ class LocalhostMicrophoneRelayReceiver:
     def _fail(self, reason: RelayReason) -> None:
         if self.state is RelaySessionState.ENDED:
             return
+        self._last_failure_reason = reason
         self._protocol.fail(reason)
         self._release_session(
             (
