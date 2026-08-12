@@ -493,6 +493,130 @@ class FirstAudioSocket:
         return None
 
 
+class TimeoutThenClientListener:
+    def __init__(self, client: FirstAudioSocket) -> None:
+        self.client = client
+        self.accept_count = 0
+        self.closed = False
+
+    def settimeout(self, timeout: float) -> None:
+        assert timeout == RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS
+
+    def bind(self, address: tuple[str, int]) -> None:
+        assert address == (RELAY_LOOPBACK_HOST, 0)
+
+    def listen(self, backlog: int) -> None:
+        assert backlog == 1
+
+    def getsockname(self) -> tuple[str, int]:
+        return RELAY_LOOPBACK_HOST, 18_765
+
+    def accept(self) -> tuple[FirstAudioSocket, tuple[str, int]]:
+        self.accept_count += 1
+        if self.accept_count == 1:
+            raise TimeoutError
+        return self.client, (RELAY_LOOPBACK_HOST, 50_000)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class CloseInterruptibleListener:
+    def __init__(self) -> None:
+        self.accept_entered = Event()
+        self.closed = Event()
+
+    def settimeout(self, timeout: float) -> None:
+        assert timeout == RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS
+
+    def bind(self, address: tuple[str, int]) -> None:
+        assert address == (RELAY_LOOPBACK_HOST, 0)
+
+    def listen(self, backlog: int) -> None:
+        assert backlog == 1
+
+    def getsockname(self) -> tuple[str, int]:
+        return RELAY_LOOPBACK_HOST, 18_765
+
+    def accept(self) -> tuple[FirstAudioSocket, tuple[str, int]]:
+        self.accept_entered.set()
+        assert self.closed.wait(timeout=1.0)
+        raise OSError
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+def test_initial_accept_timeout_keeps_waiting_for_later_valid_client() -> None:
+    resource = object()
+    session = LocalMicrophoneIngressSession(
+        capability=capability(resource),
+        resource=resource,
+        provider_stream_id="relay-stream",
+    )
+    session.set_asr_readiness(
+        LocalMicrophoneASRReadiness.WARMING_UP,
+        resource=resource,
+    )
+    session.set_asr_readiness(
+        LocalMicrophoneASRReadiness.READY_TO_CAPTURE,
+        resource=resource,
+    )
+    client = FirstAudioSocket()
+    listener = TimeoutThenClientListener(client)
+    receiver = LocalhostMicrophoneRelayReceiver(
+        session=session,
+        resource=resource,
+        expected_token=TOKEN,
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        stream_id="relay-stream",
+        resume_capability_factory=lambda: capability(resource),
+        enabled=True,
+        socket_factory=lambda *_args: listener,  # type: ignore[arg-type]
+    )
+
+    receiver.start_background()
+    for _attempt in range(1_000):
+        if not receiver.worker_active:
+            break
+        Event().wait(0.001)
+
+    assert listener.accept_count == 2
+    assert receiver.state is RelaySessionState.ENDED
+    assert receiver.last_failure_reason is None
+    assert session.diagnostics.received_chunk_count == 1
+
+
+def test_close_interrupts_initial_accept_wait_without_worker_leak() -> None:
+    resource = object()
+    session = LocalMicrophoneIngressSession(
+        capability=capability(resource),
+        resource=resource,
+        provider_stream_id="relay-stream",
+    )
+    listener = CloseInterruptibleListener()
+    receiver = LocalhostMicrophoneRelayReceiver(
+        session=session,
+        resource=resource,
+        expected_token=TOKEN,
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        stream_id="relay-stream",
+        resume_capability_factory=lambda: capability(resource),
+        enabled=True,
+        socket_factory=lambda *_args: listener,  # type: ignore[arg-type]
+    )
+
+    receiver.start_background()
+    assert listener.accept_entered.wait(timeout=1.0)
+    receiver.close()
+
+    assert not receiver.worker_active
+    assert receiver.state is RelaySessionState.AWAIT_START
+    assert receiver.last_failure_reason is None
+
+
 def test_first_audio_grace_is_separate_then_restores_normal_io_timeout() -> None:
     _resource, _session, receiver = session_and_receiver()
     client = FirstAudioSocket()

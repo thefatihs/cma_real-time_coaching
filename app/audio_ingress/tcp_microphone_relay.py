@@ -709,14 +709,17 @@ class LocalhostMicrophoneRelayReceiver:
         listener = self._listener
         if listener is None:
             raise RuntimeError(RelayReason.RECEIVER_DISABLED.value)
-        try:
-            client, _address = listener.accept()
-        except TimeoutError:
-            self._fail(RelayReason.IO_TIMEOUT)
-            return
-        except OSError:
-            if not self._closed:
-                self._fail(RelayReason.CONNECTION_CLOSED)
+        while not self._closed and self.state is RelaySessionState.AWAIT_START:
+            try:
+                client, _address = listener.accept()
+                break
+            except TimeoutError:
+                continue
+            except OSError:
+                if not self._closed:
+                    self._fail(RelayReason.CONNECTION_CLOSED)
+                return
+        else:
             return
         try:
             self.serve_connected_socket(client)
