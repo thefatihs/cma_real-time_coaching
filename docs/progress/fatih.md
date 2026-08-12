@@ -397,5 +397,13 @@ This log uses local chronological numbering and records only Fatih-owned work.
 - Listener lifecycle follow-up keeps bounded initial accept operations waiting
   across timeouts until a client arrives or explicit close interrupts the
   worker; connected timeout behavior is unchanged.
+- Client rerun follow-up uses a stable imported session-handle identity so one
+  live sender/capture session remains recognized and rendered across Streamlit
+  script re-execution without duplicate connections.
+- Added fixed, Turkish-labeled, 20-transition progress histories for both relay
+  dashboards, driven only by concrete socket, protocol, browser callback,
+  queue, ASR, classification and coaching evidence.
+- Observability tests: focused relay/dashboard suites 93 passed; Ruff,
+  formatting, and focused Pyright passed.
 - Next planned step: manually verify browser permission and first audio over
   the SSH tunnel workflow end to end.

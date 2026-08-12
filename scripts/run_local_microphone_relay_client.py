@@ -35,10 +35,14 @@ from app.audio_ingress.tcp_microphone_relay import (  # noqa: E402
     RELAY_IO_TIMEOUT_SECONDS,
     RELAY_LOOPBACK_HOST,
     MicrophoneRelayRecordParser,
+    RelayClientProgressStage,
     RelayEndReason,
+    RelayClientSessionHandle,
     RelayMessageType,
     RelayReason,
     RelayResponseMetadata,
+    RelayProgressHistory,
+    RelayProgressStage,
     encode_relay_record,
 )
 from live_dashboard.local_microphone import microphone_webrtc_streamer  # noqa: E402
@@ -50,6 +54,32 @@ CLIENT_START_COMMAND: Final = (
     "uv run streamlit run scripts/run_local_microphone_relay_client.py "
     "--server.address 127.0.0.1 --server.port 8503"
 )
+_CLIENT_PROGRESS_LABELS: Final = {
+    RelayClientProgressStage.CONFIGURATION_VALIDATED: "Yapılandırma doğrulandı",
+    RelayClientProgressStage.TCP_CONNECTING: "TCP bağlantısı kuruluyor",
+    RelayClientProgressStage.TCP_CONNECTED: "TCP bağlantısı kuruldu",
+    RelayClientProgressStage.START_SENT: "START gönderildi",
+    RelayClientProgressStage.START_ACKNOWLEDGED: "START GPU tarafından onaylandı",
+    RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED: "Mikrofon bileşeni açıldı",
+    RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED: (
+        "İlk tarayıcı mikrofon karesi alındı"
+    ),
+    RelayClientProgressStage.FIRST_PCM_CHUNK_ENQUEUED: "İlk PCM parçası kuyruğa alındı",
+    RelayClientProgressStage.FIRST_AUDIO_CHUNK_SENT: "İlk ses parçası gönderildi",
+    RelayClientProgressStage.FIRST_AUDIO_CHUNK_ACKNOWLEDGED: (
+        "İlk ses parçası GPU tarafından onaylandı"
+    ),
+    RelayClientProgressStage.STREAMING: "Ses aktarımı etkin",
+    RelayClientProgressStage.PAUSED: "Ses aktarımı duraklatıldı",
+    RelayClientProgressStage.RESUMED: "Ses aktarımı sürdürüldü",
+    RelayClientProgressStage.ENDED: "Relay oturumu tamamlandı",
+    RelayClientProgressStage.FAILED: "Relay oturumu başarısız",
+}
+_CLIENT_WAITING_STAGES: Final = {
+    RelayClientProgressStage.TCP_CONNECTING,
+    RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED,
+    RelayClientProgressStage.STREAMING,
+}
 
 
 class RelayClientStatus(str, Enum):
@@ -141,6 +171,14 @@ class BoundedRelaySender:
         self._acknowledged_chunks = 0
         self._failure_reason: RelayReason | None = None
         self._closed = False
+        self._progress = RelayProgressHistory()
+
+    @property
+    def progress_stages(self) -> tuple[RelayProgressStage, ...]:
+        return self._progress.stages
+
+    def record_progress(self, stage: RelayClientProgressStage) -> None:
+        self._progress.record(stage)
 
     @property
     def diagnostics(self) -> RelayClientDiagnostics:
@@ -164,6 +202,7 @@ class BoundedRelaySender:
             if self._worker is not None or self._closed:
                 return False
             self._status = RelayClientStatus.CONNECTING
+            self.record_progress(RelayClientProgressStage.TCP_CONNECTING)
             worker = Thread(
                 target=self._run,
                 name="local-microphone-relay-sender",
@@ -264,6 +303,7 @@ class BoundedRelaySender:
         try:
             connection.settimeout(RELAY_IO_TIMEOUT_SECONDS)
             connection.connect((self._config.host, self._config.port))
+            self.record_progress(RelayClientProgressStage.TCP_CONNECTED)
             with self._lock:
                 if self._closed:
                     return
@@ -282,7 +322,11 @@ class BoundedRelaySender:
                     "sample_rate_hz": 16_000,
                     "channel_count": 1,
                 },
+                sent_callback=lambda: self.record_progress(
+                    RelayClientProgressStage.START_SENT
+                ),
             )
+            self.record_progress(RelayClientProgressStage.START_ACKNOWLEDGED)
             with self._lock:
                 self._status = RelayClientStatus.STREAMING
             while True:
@@ -300,6 +344,7 @@ class BoundedRelaySender:
                 if outbound.message_type is RelayMessageType.END:
                     with self._lock:
                         self._status = RelayClientStatus.ENDED
+                    self.record_progress(RelayClientProgressStage.ENDED)
                     return
         except _RelayClientError as error:
             self._fail(error.reason)
@@ -335,16 +380,31 @@ class BoundedRelaySender:
             outbound.message_type,
             metadata,
             outbound.payload,
+            sent_callback=(
+                lambda: (
+                    self.record_progress(
+                        RelayClientProgressStage.FIRST_AUDIO_CHUNK_SENT
+                    )
+                    if outbound.message_type is RelayMessageType.AUDIO
+                    else None
+                )
+            ),
         )
         with self._lock:
             if outbound.message_type is RelayMessageType.AUDIO:
                 self._sent_chunks += 1
                 self._acknowledged_chunks += 1
+                self.record_progress(
+                    RelayClientProgressStage.FIRST_AUDIO_CHUNK_ACKNOWLEDGED
+                )
+                self.record_progress(RelayClientProgressStage.STREAMING)
             elif outbound.message_type is RelayMessageType.PAUSE:
                 self._status = RelayClientStatus.PAUSED
+                self.record_progress(RelayClientProgressStage.PAUSED)
             elif outbound.message_type is RelayMessageType.RESUME:
                 self._generation = outbound.generation
                 self._status = RelayClientStatus.STREAMING
+                self.record_progress(RelayClientProgressStage.RESUMED)
 
     @staticmethod
     def _exchange(
@@ -352,12 +412,15 @@ class BoundedRelaySender:
         message_type: RelayMessageType,
         metadata: dict[str, object],
         payload: bytes = b"",
+        sent_callback: Callable[[], None] | None = None,
     ) -> None:
         raw_sequence = metadata["sequence_number"]
         if type(raw_sequence) is not int:
             raise _RelayClientError(RelayReason.INVALID_METADATA)
         sequence = raw_sequence
         connection.sendall(encode_relay_record(message_type, metadata, payload))
+        if sent_callback is not None:
+            sent_callback()
         parser = MicrophoneRelayRecordParser()
         received = 0
         while received <= MAX_RELAY_RECORD_BYTES:
@@ -397,6 +460,7 @@ class BoundedRelaySender:
             if self._status in {RelayClientStatus.ENDED, RelayClientStatus.FAILED}:
                 return
             self._status = RelayClientStatus.FAILED
+            self.record_progress(RelayClientProgressStage.FAILED)
             self._failure_reason = reason
             self._closed = True
             connection = self._socket if close_connection else None
@@ -431,6 +495,9 @@ class RelayCaptureSession:
         capture_generation: int | None = None,
     ) -> av.AudioFrame:
         with self._lock:
+            self._sender.record_progress(
+                RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED
+            )
             if self._sender.diagnostics.status is not RelayClientStatus.STREAMING:
                 return frame
             if (
@@ -455,10 +522,15 @@ class RelayCaptureSession:
                 return True
             payload = bytes(self._buffer)
             self._buffer.clear()
-            return self._sender.enqueue_audio(
+            accepted = self._sender.enqueue_audio(
                 payload,
                 captured_at_utc=datetime.now(UTC),
             )
+            if accepted:
+                self._sender.record_progress(
+                    RelayClientProgressStage.FIRST_PCM_CHUNK_ENQUEUED
+                )
+            return accepted
 
     def _append(self, pcm_s16le: bytes) -> None:
         offset = 0
@@ -475,10 +547,13 @@ class RelayCaptureSession:
                     captured_at_utc=datetime.now(UTC),
                 ):
                     raise RuntimeError(RelayReason.BUFFER_LIMIT.value)
+                self._sender.record_progress(
+                    RelayClientProgressStage.FIRST_PCM_CHUNK_ENQUEUED
+                )
 
 
 @dataclass(slots=True)
-class RelayClientSession:
+class RelayClientSession(RelayClientSessionHandle):
     sender: BoundedRelaySender
     capture: RelayCaptureSession
 
@@ -497,16 +572,21 @@ class RelayClientSession:
 
 def create_relay_client_session(config: RelayClientConfig) -> RelayClientSession:
     sender = BoundedRelaySender(config)
+    sender.record_progress(RelayClientProgressStage.CONFIGURATION_VALIDATED)
     return RelayClientSession(sender=sender, capture=RelayCaptureSession(sender))
+
+
+def retained_relay_client_session(value: object) -> RelayClientSession | None:
+    if not isinstance(value, RelayClientSessionHandle):
+        return None
+    return cast(RelayClientSession, value)
 
 
 def reset_terminal_relay_client_session(
     session_state: MutableMapping[str, object],
 ) -> bool:
-    session = session_state.get("relay_client_session")
-    if not isinstance(
-        session, RelayClientSession
-    ) or session.sender.diagnostics.status not in {
+    session = retained_relay_client_session(session_state.get("relay_client_session"))
+    if session is None or session.sender.diagnostics.status not in {
         RelayClientStatus.FAILED,
         RelayClientStatus.ENDED,
     }:
@@ -518,6 +598,15 @@ def reset_terminal_relay_client_session(
 
 def relay_capture_should_be_mounted(status: RelayClientStatus) -> bool:
     return status in {RelayClientStatus.CONNECTING, RelayClientStatus.STREAMING}
+
+
+def _render_relay_progress(st: object, sender: BoundedRelaySender) -> None:
+    stages = sender.progress_stages
+    for index, stage in enumerate(stages):
+        assert isinstance(stage, RelayClientProgressStage)
+        current = index == len(stages) - 1
+        prefix = "…" if current and stage in _CLIENT_WAITING_STAGES else "✓"
+        getattr(st, "caption")(f"{prefix} {_CLIENT_PROGRESS_LABELS[stage]}")
 
 
 def render() -> None:
@@ -536,7 +625,9 @@ def render() -> None:
     call_id = st.text_input("call_id")
     stream_id = st.text_input("stream_id")
     token = st.text_input("Ephemeral token", type="password")
-    session = st.session_state.get("relay_client_session")
+    session = retained_relay_client_session(
+        st.session_state.get("relay_client_session")
+    )
     if st.button("Connect / Start", disabled=session is not None):
         try:
             config = RelayClientConfig(
@@ -552,11 +643,13 @@ def render() -> None:
                 raise RuntimeError(RelayReason.TERMINAL_STATE.value)
             st.rerun()
         except Exception:
-            retained = st.session_state.pop("relay_client_session", None)
-            if isinstance(retained, RelayClientSession):
+            retained = retained_relay_client_session(
+                st.session_state.pop("relay_client_session", None)
+            )
+            if retained is not None:
                 retained.close()
             st.error("Relay oturumu güvenli biçimde başlatılamadı.")
-    if not isinstance(session, RelayClientSession):
+    if session is None:
         st.info("Bağlantı bilgilerini girip Connect / Start seçin.")
         return
     diagnostics = session.sender.diagnostics
@@ -580,6 +673,10 @@ def render() -> None:
             key="ssh-microphone-relay-capture",
             desired_playing_state=True,
         )
+        session.sender.record_progress(
+            RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED
+        )
+    _render_relay_progress(st, session.sender)
     pause, resume, end = st.columns(3)
     if pause.button(
         "Pause",

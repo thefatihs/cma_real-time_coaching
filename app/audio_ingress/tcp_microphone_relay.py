@@ -45,6 +45,68 @@ RELAY_IO_TIMEOUT_SECONDS: Final = 5.0
 RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS: Final = 300.0
 RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS: Final = 30.0
 RELAY_RECV_BYTES: Final = 4_096
+MAX_RELAY_PROGRESS_TRANSITIONS: Final = 20
+
+
+class RelayClientProgressStage(str, Enum):
+    CONFIGURATION_VALIDATED = "configuration_validated"
+    TCP_CONNECTING = "tcp_connecting"
+    TCP_CONNECTED = "tcp_connected"
+    START_SENT = "start_sent"
+    START_ACKNOWLEDGED = "start_acknowledged"
+    MICROPHONE_COMPONENT_MOUNTED = "microphone_component_mounted"
+    FIRST_BROWSER_AUDIO_FRAME_RECEIVED = "first_browser_audio_frame_received"
+    FIRST_PCM_CHUNK_ENQUEUED = "first_pcm_chunk_enqueued"
+    FIRST_AUDIO_CHUNK_SENT = "first_audio_chunk_sent"
+    FIRST_AUDIO_CHUNK_ACKNOWLEDGED = "first_audio_chunk_acknowledged"
+    STREAMING = "streaming"
+    PAUSED = "paused"
+    RESUMED = "resumed"
+    ENDED = "ended"
+    FAILED = "failed"
+
+
+class RelayReceiverProgressStage(str, Enum):
+    RELAY_SESSION_CREATED = "relay_session_created"
+    LISTENER_READY = "listener_ready"
+    WAITING_FOR_CLIENT = "waiting_for_client"
+    CLIENT_CONNECTED = "client_connected"
+    START_RECEIVED = "start_received"
+    START_VALIDATED = "start_validated"
+    WAITING_FOR_FIRST_AUDIO = "waiting_for_first_audio"
+    FIRST_AUDIO_RECEIVED = "first_audio_received"
+    AUDIO_STREAMING = "audio_streaming"
+    FIRST_ASR_RESULT = "first_asr_result"
+    FIRST_CLASSIFICATION_RESULT = "first_classification_result"
+    FIRST_COACHING_DECISION = "first_coaching_decision"
+    ENDED = "ended"
+    FAILED = "failed"
+
+
+RelayProgressStage: TypeAlias = RelayClientProgressStage | RelayReceiverProgressStage
+
+
+class RelayProgressHistory:
+    """Thread-safe bounded history containing fixed sanitized stages only."""
+
+    def __init__(self) -> None:
+        self._stages: list[RelayProgressStage] = []
+        self._lock = Lock()
+
+    @property
+    def stages(self) -> tuple[RelayProgressStage, ...]:
+        with self._lock:
+            return tuple(self._stages)
+
+    def record(self, stage: RelayProgressStage) -> None:
+        with self._lock:
+            if any(
+                type(existing) is type(stage) and existing.value == stage.value
+                for existing in self._stages
+            ):
+                return
+            self._stages.append(stage)
+            del self._stages[:-MAX_RELAY_PROGRESS_TRANSITIONS]
 
 
 class RelayMessageType(IntEnum):
@@ -126,6 +188,10 @@ class MicrophoneRelayProtocolError(ValueError):
     def __init__(self, reason: RelayReason) -> None:
         self.reason = reason
         super().__init__(reason.value)
+
+
+class RelayClientSessionHandle:
+    """Stable marker for a live relay client retained across Streamlit reruns."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -654,6 +720,8 @@ class LocalhostMicrophoneRelayReceiver:
         self._closed = False
         self._session_released = False
         self._last_failure_reason: RelayReason | None = None
+        self._progress = RelayProgressHistory()
+        self._progress.record(RelayReceiverProgressStage.RELAY_SESSION_CREATED)
 
     @property
     def state(self) -> RelaySessionState:
@@ -662,6 +730,13 @@ class LocalhostMicrophoneRelayReceiver:
     @property
     def last_failure_reason(self) -> RelayReason | None:
         return self._last_failure_reason
+
+    @property
+    def progress_stages(self) -> tuple[RelayProgressStage, ...]:
+        return self._progress.stages
+
+    def record_progress(self, stage: RelayReceiverProgressStage) -> None:
+        self._progress.record(stage)
 
     @property
     def listening_address(self) -> tuple[str, int] | None:
@@ -701,6 +776,7 @@ class LocalhostMicrophoneRelayReceiver:
             listener.close()
             raise RuntimeError(RelayReason.INVALID_BIND.value) from None
         self._listener = listener
+        self.record_progress(RelayReceiverProgressStage.LISTENER_READY)
         address = self.listening_address
         assert address is not None
         return address
@@ -710,8 +786,10 @@ class LocalhostMicrophoneRelayReceiver:
         if listener is None:
             raise RuntimeError(RelayReason.RECEIVER_DISABLED.value)
         while not self._closed and self.state is RelaySessionState.AWAIT_START:
+            self.record_progress(RelayReceiverProgressStage.WAITING_FOR_CLIENT)
             try:
                 client, _address = listener.accept()
+                self.record_progress(RelayReceiverProgressStage.CLIENT_CONNECTED)
                 break
             except TimeoutError:
                 continue
@@ -773,6 +851,9 @@ class LocalhostMicrophoneRelayReceiver:
                     client.sendall(response)
                 received_audio = self._session.diagnostics.received_chunk_count > 0
                 if self.state is RelaySessionState.STREAMING and not received_audio:
+                    self.record_progress(
+                        RelayReceiverProgressStage.WAITING_FOR_FIRST_AUDIO
+                    )
                     if not waiting_for_first_audio:
                         client.settimeout(RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS)
                         waiting_for_first_audio = True
@@ -818,11 +899,20 @@ class LocalhostMicrophoneRelayReceiver:
                 continue
             record = acceptance.record
             assert record is not None
+            if record.message_type is RelayMessageType.START:
+                self.record_progress(RelayReceiverProgressStage.START_RECEIVED)
             reason = self._admit(record, arrived_at_utc=now)
             if reason is not None:
                 self._fail(reason)
                 responses.append(self._error_record(sequence, reason))
                 break
+            if record.message_type is RelayMessageType.START:
+                self.record_progress(RelayReceiverProgressStage.START_VALIDATED)
+            elif record.message_type is RelayMessageType.AUDIO:
+                self.record_progress(RelayReceiverProgressStage.FIRST_AUDIO_RECEIVED)
+                self.record_progress(RelayReceiverProgressStage.AUDIO_STREAMING)
+            elif record.message_type is RelayMessageType.END:
+                self.record_progress(RelayReceiverProgressStage.ENDED)
             responses.append(self._ack_record(sequence, acceptance.reason))
         return tuple(responses)
 
@@ -901,6 +991,7 @@ class LocalhostMicrophoneRelayReceiver:
         if self.state is RelaySessionState.ENDED:
             return
         self._last_failure_reason = reason
+        self.record_progress(RelayReceiverProgressStage.FAILED)
         self._protocol.fail(reason)
         self._release_session(
             (

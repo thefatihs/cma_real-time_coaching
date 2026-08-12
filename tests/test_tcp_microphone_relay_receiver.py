@@ -5,10 +5,12 @@ from datetime import UTC, datetime, timedelta
 from collections import deque
 from threading import Condition, Event, Thread, get_ident
 import socket
+import sys
 
 import av
 import numpy as np
 import pytest
+from scripts import run_local_microphone_relay_client as relay_client_app
 
 from app.audio_ingress.local_microphone import (
     LOCAL_MIC_CHUNK_BYTES,
@@ -21,14 +23,18 @@ from app.audio_ingress.local_microphone import (
     create_local_mic_test_capability,
 )
 from app.audio_ingress.tcp_microphone_relay import (
+    MAX_RELAY_PROGRESS_TRANSITIONS,
     RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS,
     RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS,
     RELAY_IO_TIMEOUT_SECONDS,
     RELAY_LOOPBACK_HOST,
     LocalhostMicrophoneRelayReceiver,
     MicrophoneRelayRecordParser,
+    RelayClientProgressStage,
     RelayMessageType,
+    RelayProgressHistory,
     RelayReason,
+    RelayReceiverProgressStage,
     RelayResponseMetadata,
     RelaySessionState,
     encode_relay_record,
@@ -41,6 +47,7 @@ from scripts.run_local_microphone_relay_client import (
     RelayClientSession,
     RelayClientStatus,
     relay_capture_should_be_mounted,
+    retained_relay_client_session,
     reset_terminal_relay_client_session,
 )
 from live_dashboard.demo_data import tenant_demos
@@ -213,12 +220,22 @@ def test_start_audio_uses_existing_audio_chunk_event_without_renormalizing() -> 
         RelayMessageType.ACK,
         RelayReason.STARTED,
     )
+    assert (
+        RelayReceiverProgressStage.FIRST_AUDIO_RECEIVED not in receiver.progress_stages
+    )
     assert response_reason(
         receiver.process_bytes(
             audio_record(1, payload=payload),
             arrived_at_utc=NOW + timedelta(milliseconds=50),
         )[0]
     ) == (RelayMessageType.ACK, RelayReason.AUDIO_ACCEPTED)
+    assert receiver.progress_stages == (
+        RelayReceiverProgressStage.RELAY_SESSION_CREATED,
+        RelayReceiverProgressStage.START_RECEIVED,
+        RelayReceiverProgressStage.START_VALIDATED,
+        RelayReceiverProgressStage.FIRST_AUDIO_RECEIVED,
+        RelayReceiverProgressStage.AUDIO_STREAMING,
+    )
 
     chunks = iter(session.iter_audio_chunks(cancellation=Event()))
     chunk = next(chunks)
@@ -920,6 +937,30 @@ def test_local_sender_encodes_start_audio_pause_resume_and_drained_end() -> None
     sender.close()
     sender.close()
     assert connection.closed == 1
+    assert sender.progress_stages == (
+        RelayClientProgressStage.TCP_CONNECTING,
+        RelayClientProgressStage.TCP_CONNECTED,
+        RelayClientProgressStage.START_SENT,
+        RelayClientProgressStage.START_ACKNOWLEDGED,
+        RelayClientProgressStage.FIRST_AUDIO_CHUNK_SENT,
+        RelayClientProgressStage.FIRST_AUDIO_CHUNK_ACKNOWLEDGED,
+        RelayClientProgressStage.STREAMING,
+        RelayClientProgressStage.PAUSED,
+        RelayClientProgressStage.RESUMED,
+        RelayClientProgressStage.ENDED,
+    )
+
+
+def test_progress_history_is_deduplicated_bounded_and_fixed() -> None:
+    history = RelayProgressHistory()
+    stages = tuple(RelayClientProgressStage) + tuple(RelayReceiverProgressStage)
+    history.record(RelayClientProgressStage.TCP_CONNECTING)
+    history.record(RelayClientProgressStage.TCP_CONNECTING)
+    for stage in stages:
+        history.record(stage)
+
+    assert len(history.stages) == MAX_RELAY_PROGRESS_TRANSITIONS
+    assert history.stages == stages[-MAX_RELAY_PROGRESS_TRANSITIONS:]
 
 
 def test_local_sender_queue_overload_fails_closed_without_dropping() -> None:
@@ -1007,6 +1048,106 @@ def test_terminal_client_session_can_reset_and_retry_without_restart() -> None:
     assert "relay_client_session" not in session_state
 
 
+def test_streamlit_rerun_recognizes_session_and_renders_without_second_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = AckSocket(block_type=RelayMessageType.START)
+    sender = BoundedRelaySender(
+        client_config(),
+        socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
+    )
+    retained = RelayClientSession(
+        sender=sender,
+        capture=RelayCaptureSession(sender),
+    )
+    assert sender.start()
+    connection.wait_for_records(1)
+    assert sender.diagnostics.status is RelayClientStatus.CONNECTING
+    sender.record_progress(RelayClientProgressStage.CONFIGURATION_VALIDATED)
+
+    class RerunRelayClientSession(relay_client_app.RelayClientSessionHandle):
+        pass
+
+    assert not isinstance(retained, RerunRelayClientSession)
+    monkeypatch.setattr(
+        relay_client_app,
+        "RelayClientSession",
+        RerunRelayClientSession,
+    )
+    assert retained_relay_client_session(retained) is retained
+
+    class Column:
+        def button(self, _label: str, **_kwargs: object) -> bool:
+            return False
+
+    class FakeStreamlit:
+        def __init__(self) -> None:
+            self.session_state = {"relay_client_session": retained}
+            self.metrics: list[tuple[str, str]] = []
+            self.infos: list[str] = []
+            self.captions: list[str] = []
+            self.connect_disabled: bool | None = None
+
+        def set_page_config(self, **_kwargs: object) -> None:
+            return None
+
+        def get_option(self, _name: str) -> str:
+            return RELAY_LOOPBACK_HOST
+
+        def title(self, _value: str) -> None:
+            return None
+
+        def caption(self, value: str) -> None:
+            self.captions.append(value)
+
+        def text_input(self, _label: str, **_kwargs: object) -> str:
+            return ""
+
+        def number_input(self, _label: str, *_args: int) -> int:
+            return 18_765
+
+        def button(self, label: str, **kwargs: object) -> bool:
+            if label == "Connect / Start":
+                self.connect_disabled = bool(kwargs["disabled"])
+            return False
+
+        def info(self, value: str) -> None:
+            self.infos.append(value)
+
+        def metric(self, label: str, value: object) -> None:
+            self.metrics.append((label, str(value)))
+
+        def error(self, _value: str) -> None:
+            return None
+
+        def columns(self, count: int) -> list[Column]:
+            return [Column() for _index in range(count)]
+
+    fake_streamlit = FakeStreamlit()
+    mounted: list[object] = []
+    monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        relay_client_app,
+        "microphone_webrtc_streamer",
+        lambda *, session, **_kwargs: mounted.append(session),
+    )
+
+    relay_client_app.render()
+
+    assert fake_streamlit.connect_disabled is True
+    assert not fake_streamlit.infos
+    assert ("Durum", RelayClientStatus.CONNECTING.value) in fake_streamlit.metrics
+    assert mounted == [retained.capture]
+    assert (
+        RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED
+        in retained.sender.progress_stages
+    )
+    assert any("Yapılandırma doğrulandı" in value for value in fake_streamlit.captions)
+    assert len(connection.records) == 1
+    connection.release()
+    sender.close()
+
+
 def test_webrtc_capture_callback_only_normalizes_and_enqueues() -> None:
     connection = AckSocket(block_type=RelayMessageType.AUDIO)
     sender = BoundedRelaySender(
@@ -1054,7 +1195,15 @@ def test_connecting_mounts_capture_but_drops_frames_until_streaming() -> None:
     assert relay_capture_should_be_mounted(RelayClientStatus.CONNECTING)
     assert relay_capture_should_be_mounted(RelayClientStatus.STREAMING)
     assert not relay_capture_should_be_mounted(RelayClientStatus.PAUSED)
+    assert (
+        RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED
+        not in sender.progress_stages
+    )
     assert capture.accept_frame(frame) is frame
+    assert (
+        RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED
+        in sender.progress_stages
+    )
     assert len(connection.records) == 1
 
     connection.release()

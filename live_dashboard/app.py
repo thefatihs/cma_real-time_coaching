@@ -35,6 +35,7 @@ from app.audio_ingress.local_microphone import (  # noqa: E402
 from app.audio_ingress.tcp_microphone_relay import (  # noqa: E402
     RELAY_LOOPBACK_HOST,
     LocalhostMicrophoneRelayReceiver,
+    RelayReceiverProgressStage,
     RelaySessionState,
 )
 from app.classification.runtime import RuntimeSetFitClassifier  # noqa: E402
@@ -279,6 +280,29 @@ _EXECUTION_MODE_TEXT = {
     DashboardExecutionMode.FAST_ANALYSIS: "Hızlı analiz",
     DashboardExecutionMode.REALTIME_SIMULATION: "Gerçek zaman simülasyonu",
     DashboardExecutionMode.LOCAL_MIC_TEST: "Tek konuşmacılı mikrofon testi",
+}
+_RECEIVER_PROGRESS_LABELS = {
+    RelayReceiverProgressStage.RELAY_SESSION_CREATED: "Relay oturumu oluşturuldu",
+    RelayReceiverProgressStage.LISTENER_READY: "Yerel dinleyici hazır",
+    RelayReceiverProgressStage.WAITING_FOR_CLIENT: "Relay istemcisi bekleniyor",
+    RelayReceiverProgressStage.CLIENT_CONNECTED: "Relay istemcisi bağlandı",
+    RelayReceiverProgressStage.START_RECEIVED: "START alındı",
+    RelayReceiverProgressStage.START_VALIDATED: "START doğrulandı",
+    RelayReceiverProgressStage.WAITING_FOR_FIRST_AUDIO: "İlk ses bekleniyor",
+    RelayReceiverProgressStage.FIRST_AUDIO_RECEIVED: "İlk ses GPU'ya ulaştı",
+    RelayReceiverProgressStage.AUDIO_STREAMING: "Ses akışı alınıyor",
+    RelayReceiverProgressStage.FIRST_ASR_RESULT: "İlk ASR sonucu üretildi",
+    RelayReceiverProgressStage.FIRST_CLASSIFICATION_RESULT: (
+        "İlk sınıflandırma sonucu üretildi"
+    ),
+    RelayReceiverProgressStage.FIRST_COACHING_DECISION: ("İlk koçluk kararı üretildi"),
+    RelayReceiverProgressStage.ENDED: "Relay oturumu tamamlandı",
+    RelayReceiverProgressStage.FAILED: "Relay oturumu başarısız",
+}
+_RECEIVER_WAITING_STAGES = {
+    RelayReceiverProgressStage.WAITING_FOR_CLIENT,
+    RelayReceiverProgressStage.WAITING_FOR_FIRST_AUDIO,
+    RelayReceiverProgressStage.AUDIO_STREAMING,
 }
 
 
@@ -1438,6 +1462,7 @@ def _render_ssh_microphone_relay_details(
     local: LocalExecutionState,
     context: _SSHMicrophoneRelayContext,
     receiver: LocalhostMicrophoneRelayReceiver | None,
+    session: LocalMicrophoneIngressSession | None = None,
 ) -> None:
     status = "Konuşma modeli hazırlanıyor"
     if receiver is not None:
@@ -1449,6 +1474,23 @@ def _render_ssh_microphone_relay_details(
             RelaySessionState.FAILED: "Relay oturumu başarısız",
         }[receiver.state]
     st.info(status)
+    if receiver is not None and session is not None:
+        diagnostics = session.diagnostics
+        if diagnostics.asr_non_empty_result_count + diagnostics.asr_empty_result_count:
+            receiver.record_progress(RelayReceiverProgressStage.FIRST_ASR_RESULT)
+        if local.runtime.consumed_classification_event_ids:
+            receiver.record_progress(
+                RelayReceiverProgressStage.FIRST_CLASSIFICATION_RESULT
+            )
+        if local.runtime.suggestion_decisions:
+            receiver.record_progress(RelayReceiverProgressStage.FIRST_COACHING_DECISION)
+    if receiver is not None:
+        stages = receiver.progress_stages
+        for index, stage in enumerate(stages):
+            assert isinstance(stage, RelayReceiverProgressStage)
+            current = index == len(stages) - 1
+            prefix = "…" if current and stage in _RECEIVER_WAITING_STAGES else "✓"
+            st.caption(f"{prefix} {_RECEIVER_PROGRESS_LABELS[stage]}")
     if (
         receiver is not None
         and receiver.state is RelaySessionState.FAILED
@@ -1612,6 +1654,7 @@ def _render_local_microphone_controls(
                 local=local,
                 context=relay_context,
                 receiver=relay_receiver,
+                session=session,
             )
         finish_pending = st.session_state.get(
             _LOCAL_MIC_FINISH_PENDING_SESSION_KEY,

@@ -12,7 +12,11 @@ from typing import Any, cast
 
 import pytest
 
-from app.audio_ingress.tcp_microphone_relay import RelayReason
+from app.audio_ingress.tcp_microphone_relay import (
+    RelayProgressHistory,
+    RelayReason,
+    RelayReceiverProgressStage,
+)
 from streamlit.testing.v1 import AppTest
 
 from app.audio_ingress.local_microphone import (
@@ -1999,6 +2003,10 @@ def test_ssh_relay_details_render_only_sanitized_failure_reason(
         state = app.RelaySessionState.FAILED
         last_failure_reason = RelayReason.IO_TIMEOUT
         worker_active = False
+        progress_stages = (
+            RelayReceiverProgressStage.RELAY_SESSION_CREATED,
+            RelayReceiverProgressStage.FAILED,
+        )
 
     app._render_ssh_microphone_relay_details(
         local=state,
@@ -2008,7 +2016,62 @@ def test_ssh_relay_details_render_only_sanitized_failure_reason(
 
     assert recorder.errors == ["Relay hata nedeni: io_timeout"]
     assert token not in "\n".join(recorder.errors)
+    assert token not in "\n".join(recorder.captions)
     assert token not in recorder.codes[1]
+
+
+def test_ssh_relay_pipeline_progress_uses_real_counters_and_deduplicates_reruns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _RecordingStreamlit()
+    app = _load_dashboard_app(monkeypatch, recorder)
+    state = create_local_execution(tenant_demos()["tenant_alpha"], "call-relay")
+    state.runtime.consumed_classification_event_ids.add("synthetic-event")
+    state.runtime.suggestion_decisions.append(cast(Any, object()))
+    context = app._SSHMicrophoneRelayContext(
+        stream_id="relay-stream",
+        token="synthetic-relay-token-00000001",
+    )
+    history = RelayProgressHistory()
+    history.record(RelayReceiverProgressStage.RELAY_SESSION_CREATED)
+
+    class Receiver:
+        state = app.RelaySessionState.STREAMING
+        last_failure_reason = None
+        worker_active = True
+
+        @property
+        def progress_stages(self) -> tuple[object, ...]:
+            return history.stages
+
+        def record_progress(self, stage: RelayReceiverProgressStage) -> None:
+            history.record(stage)
+
+    diagnostics = SimpleNamespace(
+        asr_non_empty_result_count=1,
+        asr_empty_result_count=0,
+    )
+    session = SimpleNamespace(diagnostics=diagnostics)
+    receiver = Receiver()
+
+    for _rerun in range(2):
+        app._render_ssh_microphone_relay_details(
+            local=state,
+            context=context,
+            receiver=cast(Any, receiver),
+            session=cast(Any, session),
+        )
+
+    assert history.stages == (
+        RelayReceiverProgressStage.RELAY_SESSION_CREATED,
+        RelayReceiverProgressStage.FIRST_ASR_RESULT,
+        RelayReceiverProgressStage.FIRST_CLASSIFICATION_RESULT,
+        RelayReceiverProgressStage.FIRST_COACHING_DECISION,
+    )
+    rendered = "\n".join(recorder.captions)
+    assert "İlk ASR sonucu üretildi" in rendered
+    assert "synthetic-event" not in rendered
+    assert context.token not in rendered
 
 
 def test_local_microphone_model_preparation_failure_is_visible_and_revokes_once(
