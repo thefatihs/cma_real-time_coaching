@@ -1,7 +1,7 @@
 {
   "tenant_id": "tenant_alpha",
   "knowledge_base_id": "kb_smoke",
-  "category": "urun_bilgisi",
+  "category": "product_information",
   "chunks": [
     {
       "document_id": "sentetik_urun_iade_politikasi_v1",
@@ -10,7 +10,7 @@
       "metadata": [
         [
           "category",
-          "urun_bilgisi"
+          "product_information"
         ],
         [
           "data_class",

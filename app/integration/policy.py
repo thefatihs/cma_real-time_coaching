@@ -4,6 +4,7 @@ from math import isfinite
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from app.events.labels import CANONICAL_LABELS
 from app.events.models import CoachingAction, SuggestionPriority
 
 
@@ -27,6 +28,10 @@ class RAGCoachingIntegrationPolicy(BaseModel):
             raise ValueError("rag_llm_enabled_labels cannot contain blank labels")
         if len(cleaned) != len(set(cleaned)):
             raise ValueError("rag_llm_enabled_labels must be unique")
+        if any(value not in CANONICAL_LABELS for value in cleaned):
+            raise ValueError("rag_llm_enabled_labels must be canonical")
+        if all(value == "no_action" for value in cleaned):
+            raise ValueError("rag_llm_enabled_labels must contain a business label")
         return cleaned
 
     @field_validator("title")

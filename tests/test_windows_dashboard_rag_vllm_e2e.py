@@ -59,11 +59,11 @@ def environment(tmp_path: Path) -> dict[str, str]:
     policy.write_text(
         json.dumps(
             {
-                "rag_llm_enabled_labels": ["urun_bilgisi"],
+                "rag_llm_enabled_labels": ["product_information"],
                 "title": "Synthetic guidance",
                 "action": "RAG_ACTION",
                 "priority": "HIGH",
-                "label_id": "urun_bilgisi",
+                "label_id": "product_information",
                 "expires_after_seconds": 60.0,
             }
         ),
@@ -758,6 +758,23 @@ def test_unsafe_configuration_fails_closed(
     prepare_preflight(monkeypatch, tmp_path)
     values = environment(tmp_path)
     values[key] = value
+    with pytest.raises(subject.DashboardRAGVLLME2EError, match="^E_PREFLIGHT$"):
+        subject.preflight(values)
+
+
+@pytest.mark.parametrize("labels", [["urun_bilgisi"], ["no_action"]])
+def test_non_triggering_policy_labels_fail_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    labels: list[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    policy_path = Path(values[subject.POLICY_ENV])
+    policy_payload = json.loads(policy_path.read_text(encoding="utf-8"))
+    policy_payload["rag_llm_enabled_labels"] = labels
+    policy_path.write_text(json.dumps(policy_payload), encoding="utf-8")
+
     with pytest.raises(subject.DashboardRAGVLLME2EError, match="^E_PREFLIGHT$"):
         subject.preflight(values)
 

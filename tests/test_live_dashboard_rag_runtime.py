@@ -43,7 +43,7 @@ _PROVIDER = {
     "local_files_only": True,
 }
 _POLICY = {
-    "rag_llm_enabled_labels": ["risk"],
+    "rag_llm_enabled_labels": ["churn_risk"],
     "title": "Synthetic guidance",
     "action": "RAG_ACTION",
     "priority": "MEDIUM",

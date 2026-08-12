@@ -2,7 +2,7 @@
 
 This phase-4 artifact is a later, operator-invoked proof for the existing
 dashboard RAG contracts. It uses only the fixed `tenant_alpha` / `kb_smoke` /
-`urun_bilgisi` synthetic scenario. It does not start the dashboard, Docker,
+`product_information` synthetic scenario. It does not start the dashboard, Docker,
 AWS vLLM controller, model server, certificates, or SSH tunnel.
 
 ## Safety boundary
@@ -121,7 +121,7 @@ The exact served model was `callmetric-qwen25-7b-awq`, backed by the official
 `Qwen/Qwen2.5-7B-Instruct-AWQ`. The embedding model was
 `sentence-transformers/all-MiniLM-L6-v2`, running on CPU with 384 normalized
 dimensions and verified local-files-only/offline loading. The proof used only
-`tenant_alpha` / `kb_smoke` / `urun_bilgisi`; it used no customer data or
+`tenant_alpha` / `kb_smoke` / `product_information`; it used no customer data or
 production endpoint and did not publicly expose AWS vLLM.
 
 Final cleanup verification found the SSH tunnel closed; zero vLLM port,

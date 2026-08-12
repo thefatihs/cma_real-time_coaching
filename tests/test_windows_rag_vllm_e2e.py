@@ -169,8 +169,8 @@ def test_exact_synthetic_artifact_identity_and_existing_schemas() -> None:
     assert artifacts.provider.model_id == "sentence-transformers/all-MiniLM-L6-v2"
     assert artifacts.provider.vector_dimension == 384
     assert artifacts.provider.local_files_only is True
-    assert artifacts.policy.rag_llm_enabled_labels == ("urun_bilgisi",)
-    assert artifacts.policy.label_id == "urun_bilgisi"
+    assert artifacts.policy.rag_llm_enabled_labels == ("product_information",)
+    assert artifacts.policy.label_id == "product_information"
     assert artifacts.document.chunks[0].document_id == subject.DOCUMENT_ID
     assert artifacts.document.chunks[0].chunk_id == subject.CHUNK_ID
     assert dict(artifacts.document.chunks[0].metadata)["data_class"] == "synthetic"

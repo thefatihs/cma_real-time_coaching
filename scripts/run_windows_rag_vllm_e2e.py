@@ -53,7 +53,7 @@ from app.vector_store.models import VectorBatchWriteResult
 
 TENANT_ID = "tenant_alpha"
 KNOWLEDGE_BASE_ID = "kb_smoke"
-CATEGORY = "urun_bilgisi"
+CATEGORY = "product_information"
 DOCUMENT_ID = "sentetik_urun_iade_politikasi_v1"
 CHUNK_ID = "sentetik_urun_iade_001"
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"

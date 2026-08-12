@@ -3,6 +3,10 @@ import math
 import pytest
 from pydantic import ValidationError
 
+from app.coaching.llm_decision_gate import (
+    LLMCoachingDecision,
+    LLMCoachingDecisionGate,
+)
 from app.events.models import CoachingAction, SuggestionPriority
 from app.integration import (
     CoachingSuggestionFactory,
@@ -66,12 +70,12 @@ def test_all_fields_are_required(field_name: str) -> None:
 
 def test_text_and_label_order_are_normalized_deterministically() -> None:
     subject = policy(
-        rag_llm_enabled_labels=(" second ", "first "),
+        rag_llm_enabled_labels=(" complaint ", "product_information "),
         title="  Synthetic guidance  ",
         label_id="  product_information  ",
     )
 
-    assert subject.rag_llm_enabled_labels == ("second", "first")
+    assert subject.rag_llm_enabled_labels == ("complaint", "product_information")
     assert subject.title == "Synthetic guidance"
     assert subject.label_id == "product_information"
 
@@ -83,6 +87,9 @@ def test_text_and_label_order_are_normalized_deterministically() -> None:
         (("product_information", " "), "blank labels"),
         (("complaint", "complaint"), "unique"),
         (("complaint", " complaint "), "unique"),
+        (("urun_bilgisi",), "canonical"),
+        (("unknown",), "canonical"),
+        (("no_action",), "business label"),
     ],
 )
 def test_invalid_label_collections_are_rejected(
@@ -91,6 +98,23 @@ def test_invalid_label_collections_are_rejected(
 ) -> None:
     with pytest.raises(ValidationError, match=message):
         policy(rag_llm_enabled_labels=labels)
+
+
+def test_enabled_business_label_matches_decision_gate_contract() -> None:
+    subject = policy(rag_llm_enabled_labels=("product_information",))
+
+    result = LLMCoachingDecisionGate().decide(
+        tenant_id="tenant_alpha",
+        call_id="call_001",
+        revision=1,
+        current_labels=subject.rag_llm_enabled_labels,
+        newly_detected_labels=subject.rag_llm_enabled_labels,
+        rag_llm_enabled_labels=subject.rag_llm_enabled_labels,
+        rag_enabled=True,
+        llm_enabled=True,
+    )
+
+    assert result.decision is LLMCoachingDecision.REQUEST_RAG_LLM
 
 
 def test_blank_title_is_rejected() -> None:
