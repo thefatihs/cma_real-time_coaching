@@ -21,6 +21,7 @@ from app.audio_ingress.local_microphone import (
     create_local_mic_test_capability,
 )
 from app.audio_ingress.tcp_microphone_relay import (
+    RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS,
     RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS,
     RELAY_IO_TIMEOUT_SECONDS,
     RELAY_LOOPBACK_HOST,
@@ -39,6 +40,7 @@ from scripts.run_local_microphone_relay_client import (
     RelayClientConfig,
     RelayClientSession,
     RelayClientStatus,
+    relay_capture_should_be_mounted,
     reset_terminal_relay_client_session,
 )
 from live_dashboard.demo_data import tenant_demos
@@ -464,6 +466,45 @@ def test_timeout_fails_closed_and_closes_connected_socket_once() -> None:
     assert session.diagnostics.status is LocalMicrophoneStatus.FAILED
 
 
+class FirstAudioSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+        self.received = deque(
+            (
+                start_record(),
+                audio_record(1),
+                control_record(RelayMessageType.END, 2),
+            )
+        )
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+
+    def recv(self, size: int) -> bytes:
+        assert size <= 4_096
+        return self.received.popleft()
+
+    def sendall(self, data: bytes) -> None:
+        assert response_reason(data)[0] is RelayMessageType.ACK
+
+    def close(self) -> None:
+        return None
+
+
+def test_first_audio_grace_is_separate_then_restores_normal_io_timeout() -> None:
+    _resource, _session, receiver = session_and_receiver()
+    client = FirstAudioSocket()
+
+    receiver.serve_connected_socket(client)  # type: ignore[arg-type]
+
+    assert RELAY_IO_TIMEOUT_SECONDS == 5.0
+    assert client.timeouts == [
+        RELAY_IO_TIMEOUT_SECONDS,
+        RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS,
+        RELAY_IO_TIMEOUT_SECONDS,
+    ]
+
+
 def test_disconnect_before_end_releases_resources() -> None:
     _resource, session, receiver = session_and_receiver()
     server, client = socket.socketpair()
@@ -863,6 +904,37 @@ def test_webrtc_capture_callback_only_normalizes_and_enqueues() -> None:
     assert callback_thread not in connection.send_threads
     assert getattr(connection.records[1], "message_type") is RelayMessageType.AUDIO
     connection.release()
+    sender.close()
+
+
+def test_connecting_mounts_capture_but_drops_frames_until_streaming() -> None:
+    connection = AckSocket(block_type=RelayMessageType.START)
+    sender = BoundedRelaySender(
+        client_config(),
+        socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
+    )
+    capture = RelayCaptureSession(sender)
+    frame = av.AudioFrame.from_ndarray(
+        np.zeros((1, 32_000), dtype=np.int16),
+        format="s16",
+        layout="mono",
+    )
+    frame.sample_rate = 16_000
+
+    assert sender.start()
+    connection.wait_for_records(1)
+    assert sender.diagnostics.status is RelayClientStatus.CONNECTING
+    assert relay_capture_should_be_mounted(RelayClientStatus.CONNECTING)
+    assert relay_capture_should_be_mounted(RelayClientStatus.STREAMING)
+    assert not relay_capture_should_be_mounted(RelayClientStatus.PAUSED)
+    assert capture.accept_frame(frame) is frame
+    assert len(connection.records) == 1
+
+    connection.release()
+    wait_for_client_status(sender, RelayClientStatus.STREAMING)
+    assert capture.accept_frame(frame) is frame
+    connection.wait_for_records(2)
+    assert getattr(connection.records[1], "message_type") is RelayMessageType.AUDIO
     sender.close()
 
 

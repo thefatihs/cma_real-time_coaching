@@ -431,6 +431,8 @@ class RelayCaptureSession:
         capture_generation: int | None = None,
     ) -> av.AudioFrame:
         with self._lock:
+            if self._sender.diagnostics.status is not RelayClientStatus.STREAMING:
+                return frame
             if (
                 capture_generation is not None
                 and capture_generation != self._sender.diagnostics.generation
@@ -514,6 +516,10 @@ def reset_terminal_relay_client_session(
     return True
 
 
+def relay_capture_should_be_mounted(status: RelayClientStatus) -> bool:
+    return status in {RelayClientStatus.CONNECTING, RelayClientStatus.STREAMING}
+
+
 def render() -> None:
     import streamlit as st
 
@@ -568,7 +574,7 @@ def render() -> None:
             )
             st.rerun()
         return
-    if diagnostics.status is RelayClientStatus.STREAMING:
+    if relay_capture_should_be_mounted(diagnostics.status):
         microphone_webrtc_streamer(
             session=session.capture,  # type: ignore[arg-type]
             key="ssh-microphone-relay-capture",

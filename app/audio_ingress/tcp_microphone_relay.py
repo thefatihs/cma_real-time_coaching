@@ -43,6 +43,7 @@ RELAY_LOOPBACK_HOST: Final = "127.0.0.1"
 RELAY_BACKLOG: Final = 1
 RELAY_IO_TIMEOUT_SECONDS: Final = 5.0
 RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS: Final = 300.0
+RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS: Final = 30.0
 RELAY_RECV_BYTES: Final = 4_096
 
 
@@ -746,6 +747,7 @@ class LocalhostMicrophoneRelayReceiver:
             self._client = client
         try:
             client.settimeout(self._io_timeout_seconds)
+            waiting_for_first_audio = False
             while self.state not in {
                 RelaySessionState.ENDED,
                 RelaySessionState.FAILED,
@@ -761,6 +763,14 @@ class LocalhostMicrophoneRelayReceiver:
                     return
                 for response in self.process_bytes(data):
                     client.sendall(response)
+                received_audio = self._session.diagnostics.received_chunk_count > 0
+                if self.state is RelaySessionState.STREAMING and not received_audio:
+                    if not waiting_for_first_audio:
+                        client.settimeout(RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS)
+                        waiting_for_first_audio = True
+                elif waiting_for_first_audio:
+                    client.settimeout(self._io_timeout_seconds)
+                    waiting_for_first_audio = False
         except OSError:
             self._fail(RelayReason.CONNECTION_CLOSED)
         finally:

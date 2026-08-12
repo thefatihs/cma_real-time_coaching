@@ -386,4 +386,10 @@ This log uses local chronological numbering and records only Fatih-owned work.
   synthetic tests, and this progress file.
 - Tests: focused relay/dashboard tests 85 passed. Ruff, formatting, and focused
   Pyright passed.
-- Next planned step: manually verify the SSH tunnel workflow end to end.
+- Follow-up mounted capture during CONNECTING, dropped pre-STREAMING frames,
+  and added a separate bounded 30-second first-audio grace that restores the
+  unchanged five-second connected I/O timeout after the first audio chunk.
+- Follow-up tests: focused relay tests 31 passed. Ruff, formatting, and focused
+  Pyright passed.
+- Next planned step: manually verify browser permission and first audio over
+  the SSH tunnel workflow end to end.
