@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from io import BytesIO
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 import signal
 import subprocess
@@ -28,6 +29,18 @@ from app.composition.postgres_rag import (
     RAGDiagnosticSubmissionState,
 )
 from app.coaching.coordinator import _cooldown_available
+from app.ingestion.document_background import (
+    DocumentSubmissionResult,
+    DocumentSubmissionStatus,
+)
+from app.ingestion.registry_models import (
+    DocumentIngestionJob,
+    DocumentIngestionPhase,
+    DocumentIngestionState,
+    DocumentReadiness,
+    DocumentRegistryEntry,
+    DocumentRegistryRecord,
+)
 
 HEAD = "4" * 40
 BASELINE = "3" * 40
@@ -184,6 +197,7 @@ def test_every_phase_failure_cleans_once_and_stays_fixed(
     expected = {
         "E_COMPLETION_PUMP": subject.E_COMPLETION_UNCLASSIFIED,
         "E_POSTGRES_START": subject.E_POSTGRES_UNCLASSIFIED,
+        "E_DUPLICATE": subject.E_DUPLICATE_UNCLASSIFIED,
     }.get(phase, phase)
     assert caught.value.phase == expected
     assert str(caught.value) == expected
@@ -1407,6 +1421,259 @@ def test_e2e_fixture_submits_exactly_one_orchestration_identity() -> None:
         0
     ]
     assert orchestration.count("processor.process_safely(") == 1
+
+
+def _ready_document_entry(
+    name: str, *, source_key: str | None = None
+) -> DocumentRegistryEntry:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    document = DocumentRegistryRecord(
+        tenant_id="tenant-synthetic",
+        knowledge_base_id="kb-synthetic",
+        document_id=f"document-{name}",
+        original_filename=f"{name}.txt",
+        media_type="text/plain",
+        byte_size=10,
+        storage_object_key=source_key,
+        created_at_utc=now,
+        ready_at_utc=now,
+    )
+    job = DocumentIngestionJob(
+        tenant_id=document.tenant_id,
+        knowledge_base_id=document.knowledge_base_id,
+        document_id=document.document_id,
+        job_id=f"job-{name}",
+        state=DocumentIngestionState.SUCCEEDED,
+        phase=DocumentIngestionPhase.FINALIZE,
+        processed_chunks=1,
+        total_chunks=1,
+        attempt_count=1,
+        created_at_utc=now,
+        started_at_utc=now,
+        updated_at_utc=now,
+        finished_at_utc=now,
+    )
+    return DocumentRegistryEntry(
+        document=document, job=job, readiness=DocumentReadiness.READY
+    )
+
+
+class _DuplicateRegistry:
+    def __init__(
+        self,
+        before: tuple[DocumentRegistryEntry, ...],
+        after: tuple[DocumentRegistryEntry, ...],
+    ) -> None:
+        self.before = before
+        self.after = after
+        self.list_calls = 0
+
+    def list_documents(self, **_kwargs: object) -> tuple[DocumentRegistryEntry, ...]:
+        self.list_calls += 1
+        return self.before if self.list_calls == 1 else self.after
+
+    def get_entry(
+        self, *, document_id: str, **_kwargs: object
+    ) -> DocumentRegistryEntry | None:
+        return next(
+            (item for item in self.after if item.document.document_id == document_id),
+            None,
+        )
+
+
+class _DuplicateManager:
+    def __init__(self, result: DocumentSubmissionResult | None = None) -> None:
+        self.result = result or DocumentSubmissionResult(
+            DocumentSubmissionStatus.ACCEPTED
+        )
+        self.calls = 0
+
+    def submit(self, **_kwargs: object) -> DocumentSubmissionResult:
+        self.calls += 1
+        return self.result
+
+
+class _FailingDuplicateManager(_DuplicateManager):
+    def submit(self, **_kwargs: object) -> DocumentSubmissionResult:
+        raise RuntimeError("secret-like-submit-value")
+
+
+def _duplicate_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    after: tuple[DocumentRegistryEntry, ...] | None = None,
+    manager: _DuplicateManager | None = None,
+    vector_count: int = 1,
+) -> tuple[subject._ProductionLifecycle, _DuplicateRegistry, _DuplicateManager]:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    target = _ready_document_entry("target")
+    other = _ready_document_entry("other")
+    registry = _DuplicateRegistry((target, other), after or (target, other))
+    actual_manager = manager or _DuplicateManager()
+    lifecycle._document_runtime = cast(
+        subject.PostgreSQLDocumentIngestionRuntime,
+        SimpleNamespace(
+            tenant_id=target.document.tenant_id,
+            knowledge_base_id=target.document.knowledge_base_id,
+            registry=registry,
+            manager=actual_manager,
+        ),
+    )
+    lifecycle._target_entry = target
+    lifecycle._other_entry = other
+    lifecycle._vector_count = 1
+    monkeypatch.setattr(lifecycle, "_target_vector_count", lambda: vector_count)
+    return lifecycle, registry, actual_manager
+
+
+def test_duplicate_replay_is_synchronous_and_does_not_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, registry, manager = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.setattr(subject.time, "sleep", lambda _seconds: pytest.fail("polled"))
+
+    lifecycle._duplicate()
+
+    assert registry.list_calls == 2
+    assert manager.calls == 1
+
+
+def test_duplicate_missing_runtime_and_submit_failure_have_fixed_phases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    with pytest.raises(
+        subject._DuplicatePhaseError, match=f"^{subject.E_DUPLICATE_RUNTIME}$"
+    ):
+        lifecycle._duplicate()
+    (tmp_path / "submit").mkdir()
+    lifecycle, _, _ = _duplicate_lifecycle(
+        monkeypatch, tmp_path / "submit", manager=_FailingDuplicateManager()
+    )
+    with pytest.raises(
+        subject._DuplicatePhaseError, match=f"^{subject.E_DUPLICATE_SUBMIT}$"
+    ):
+        lifecycle._duplicate()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        subject.E_DUPLICATE_DOCUMENT_IDENTITY,
+        subject.E_DUPLICATE_JOB_IDENTITY,
+        subject.E_DUPLICATE_READINESS,
+        subject.E_DUPLICATE_REGISTRY_CARDINALITY,
+        subject.E_DUPLICATE_VECTOR_CARDINALITY,
+        subject.E_DUPLICATE_OTHER_DOCUMENT,
+        subject.E_DUPLICATE_SOURCE_KEY,
+    ],
+)
+def test_duplicate_invariants_have_exact_fixed_phases(
+    phase: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = _ready_document_entry("target")
+    other = _ready_document_entry("other")
+    after: tuple[DocumentRegistryEntry, ...] = (target, other)
+    vector_count = 1
+    if phase == subject.E_DUPLICATE_DOCUMENT_IDENTITY:
+        after = (
+            target.model_copy(
+                update={
+                    "document": target.document.model_copy(update={"byte_size": 11})
+                }
+            ),
+            other,
+        )
+    elif phase == subject.E_DUPLICATE_JOB_IDENTITY:
+        after = (
+            target.model_copy(
+                update={"job": target.job.model_copy(update={"attempt_count": 2})}
+            ),
+            other,
+        )
+    elif phase == subject.E_DUPLICATE_READINESS:
+        after = (
+            target.model_copy(update={"readiness": DocumentReadiness.PENDING}),
+            other,
+        )
+    elif phase == subject.E_DUPLICATE_REGISTRY_CARDINALITY:
+        after = (target,)
+    elif phase == subject.E_DUPLICATE_VECTOR_CARDINALITY:
+        vector_count = 2
+    elif phase == subject.E_DUPLICATE_OTHER_DOCUMENT:
+        after = (
+            target,
+            other.model_copy(
+                update={"document": other.document.model_copy(update={"byte_size": 11})}
+            ),
+        )
+    elif phase == subject.E_DUPLICATE_SOURCE_KEY:
+        after = (
+            target.model_copy(
+                update={
+                    "document": target.document.model_copy(
+                        update={"storage_object_key": "objects/server-key"}
+                    )
+                }
+            ),
+            other,
+        )
+    lifecycle, _, _ = _duplicate_lifecycle(
+        monkeypatch, tmp_path, after=after, vector_count=vector_count
+    )
+
+    with pytest.raises(subject._DuplicatePhaseError, match=f"^{phase}$"):
+        lifecycle._duplicate()
+
+
+def test_duplicate_rejection_and_query_failure_are_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rejected = _DuplicateManager(
+        DocumentSubmissionResult(DocumentSubmissionStatus.BUSY)
+    )
+    lifecycle, registry, _ = _duplicate_lifecycle(
+        monkeypatch, tmp_path, manager=rejected
+    )
+    with pytest.raises(
+        subject._DuplicatePhaseError, match=f"^{subject.E_DUPLICATE_STATUS}$"
+    ):
+        lifecycle._duplicate()
+    registry.list_documents = lambda **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("secret-like-value")
+    )
+    with pytest.raises(
+        subject._DuplicatePhaseError,
+        match=f"^{subject.E_DUPLICATE_UNCLASSIFIED}$",
+    ):
+        lifecycle._duplicate()
+    captured = capsys.readouterr()
+    assert "secret-like-value" not in captured.out + captured.err
+
+
+def test_duplicate_subphase_remains_primary_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+
+    class Operations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            if phase == "E_DUPLICATE":
+                raise subject._DuplicatePhaseError(subject.E_DUPLICATE_STATUS)
+
+    operations = Operations(cleanup_failure=True)
+    with pytest.raises(
+        subject.DashboardRAGVLLME2EError,
+        match=f"^{subject.E_DUPLICATE_STATUS}$",
+    ):
+        subject.run(
+            preflight_only=False,
+            environment=environment(tmp_path),
+            operations_factory=lambda _config: operations,
+        )
 
 
 class FakeServiceProcess:

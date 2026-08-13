@@ -276,8 +276,12 @@ def _store(
 
 
 class _Deterministic384Backend:
+    def __init__(self) -> None:
+        self.encoded_text_count = 0
+
     def encode(self, texts: list[str], *, normalize_embeddings: bool) -> object:
         assert normalize_embeddings is True
+        self.encoded_text_count += len(texts)
         return [[1.0] + [0.0] * 383 for _ in texts]
 
 
@@ -895,6 +899,8 @@ def test_background_document_manager_real_pgvector_lifecycle(
     postgres_settings = _document_runtime_settings(settings)
     primary_provider = _document_provider("document-manager-primary")
     isolated_provider = _document_provider("document-manager-isolated")
+    primary_backend = _Deterministic384Backend()
+    isolated_backend = _Deterministic384Backend()
 
     def connect(**kwargs: object) -> Connection[Any]:
         return _production_connect(settings, **kwargs)
@@ -904,14 +910,14 @@ def test_background_document_manager_real_pgvector_lifecycle(
         knowledge_base_settings=primary_provider,
         ingestion_settings=PostgreSQLDocumentIngestionSettings(),
         psycopg_connect=connect,
-        embedding_backend_factory=lambda config: _Deterministic384Backend(),
+        embedding_backend_factory=lambda config: primary_backend,
     )
     isolated = compose_postgres_document_ingestion(
         postgres_settings=postgres_settings,
         knowledge_base_settings=isolated_provider,
         ingestion_settings=PostgreSQLDocumentIngestionSettings(),
         psycopg_connect=connect,
-        embedding_backend_factory=lambda config: _Deterministic384Backend(),
+        embedding_backend_factory=lambda config: isolated_backend,
     )
 
     def await_ready(runtime: Any) -> Any:
@@ -945,17 +951,18 @@ def test_background_document_manager_real_pgvector_lifecycle(
             == isolated.postgres_rag.profile
         )
 
+        source_bytes = b"Synthetic primary document for real PostgreSQL."
         primary_submission = primary.manager.submit(
             submission_token="primary-document-submission",
-            content=b"Synthetic primary document for real PostgreSQL.",
+            content=source_bytes,
             original_filename="primary.txt",
             declared_media_type="text/plain",
         )
         isolated_submission = isolated.manager.submit(
             submission_token="isolated-document-submission",
-            content=b"Synthetic isolated document for real PostgreSQL.",
-            original_filename="isolated.md",
-            declared_media_type="text/markdown",
+            content=source_bytes,
+            original_filename="isolated.txt",
+            declared_media_type="text/plain",
         )
         assert primary_submission.status is DocumentSubmissionStatus.ACCEPTED
         assert isolated_submission.status is DocumentSubmissionStatus.ACCEPTED
@@ -965,6 +972,67 @@ def test_background_document_manager_real_pgvector_lifecycle(
         assert isolated_entry.document.storage_object_key is None
         assert primary_entry.job.total_chunks == 1
         assert isolated_entry.job.total_chunks == 1
+
+        def scoped_counts(runtime: Any) -> tuple[int, int, int]:
+            connection = psycopg.connect(
+                host=settings.host,
+                port=settings.port,
+                dbname=settings.database,
+                user=settings.user,
+                password=settings.password,
+                connect_timeout=settings.connect_timeout,
+            )
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT "
+                        "(SELECT count(*) FROM callmetric_vector.documents "
+                        "WHERE tenant_id = %s AND knowledge_base_id = %s), "
+                        "(SELECT count(*) FROM callmetric_vector.document_ingestion_jobs "
+                        "WHERE tenant_id = %s AND knowledge_base_id = %s), "
+                        "(SELECT count(*) FROM callmetric_vector.vector_records "
+                        "WHERE tenant_id = %s AND knowledge_base_id = %s)",
+                        (
+                            runtime.tenant_id,
+                            runtime.knowledge_base_id,
+                            runtime.tenant_id,
+                            runtime.knowledge_base_id,
+                            runtime.tenant_id,
+                            runtime.knowledge_base_id,
+                        ),
+                    )
+                    row = cursor.fetchone()
+            finally:
+                connection.close()
+            assert row is not None
+            return cast(tuple[int, int, int], row)
+
+        before_entries = primary.registry.list_documents(
+            tenant_id=primary.tenant_id,
+            knowledge_base_id=primary.knowledge_base_id,
+        )
+        before_counts = scoped_counts(primary)
+        before_embedding_count = primary_backend.encoded_text_count
+        replay = primary.manager.submit(
+            submission_token="primary-document-replay",
+            content=source_bytes,
+            original_filename="renamed-primary.txt",
+            declared_media_type="text/plain",
+        )
+        after_entries = primary.registry.list_documents(
+            tenant_id=primary.tenant_id,
+            knowledge_base_id=primary.knowledge_base_id,
+        )
+        assert replay.status is DocumentSubmissionStatus.ACCEPTED
+        assert after_entries == before_entries == (primary_entry,)
+        assert (
+            after_entries[0].document.document_id == primary_entry.document.document_id
+        )
+        assert after_entries[0].job.job_id == primary_entry.job.job_id
+        assert scoped_counts(primary) == before_counts == (1, 1, 1)
+        assert primary_backend.encoded_text_count == before_embedding_count
+        assert isolated_backend.encoded_text_count == 1
+        assert isolated_entry.document.document_id != primary_entry.document.document_id
 
         retrieved = primary.postgres_rag.retriever.retrieve(
             tenant_id=primary.tenant_id,

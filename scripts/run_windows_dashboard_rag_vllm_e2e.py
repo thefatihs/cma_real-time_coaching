@@ -90,6 +90,32 @@ CLEANUP_FAILURE_PHASES = frozenset(
         E_CLEANUP_UNVERIFIABLE,
     }
 )
+E_DUPLICATE_RUNTIME = "E_DUPLICATE_RUNTIME"
+E_DUPLICATE_SUBMIT = "E_DUPLICATE_SUBMIT"
+E_DUPLICATE_STATUS = "E_DUPLICATE_STATUS"
+E_DUPLICATE_DOCUMENT_IDENTITY = "E_DUPLICATE_DOCUMENT_IDENTITY"
+E_DUPLICATE_JOB_IDENTITY = "E_DUPLICATE_JOB_IDENTITY"
+E_DUPLICATE_READINESS = "E_DUPLICATE_READINESS"
+E_DUPLICATE_REGISTRY_CARDINALITY = "E_DUPLICATE_REGISTRY_CARDINALITY"
+E_DUPLICATE_VECTOR_CARDINALITY = "E_DUPLICATE_VECTOR_CARDINALITY"
+E_DUPLICATE_OTHER_DOCUMENT = "E_DUPLICATE_OTHER_DOCUMENT"
+E_DUPLICATE_SOURCE_KEY = "E_DUPLICATE_SOURCE_KEY"
+E_DUPLICATE_UNCLASSIFIED = "E_DUPLICATE_UNCLASSIFIED"
+DUPLICATE_FAILURE_PHASES = frozenset(
+    {
+        E_DUPLICATE_RUNTIME,
+        E_DUPLICATE_SUBMIT,
+        E_DUPLICATE_STATUS,
+        E_DUPLICATE_DOCUMENT_IDENTITY,
+        E_DUPLICATE_JOB_IDENTITY,
+        E_DUPLICATE_READINESS,
+        E_DUPLICATE_REGISTRY_CARDINALITY,
+        E_DUPLICATE_VECTOR_CARDINALITY,
+        E_DUPLICATE_OTHER_DOCUMENT,
+        E_DUPLICATE_SOURCE_KEY,
+        E_DUPLICATE_UNCLASSIFIED,
+    }
+)
 E_COMPLETION_PROCESSOR_MISSING = "E_COMPLETION_PROCESSOR_MISSING"
 E_COMPLETION_NO_AUTHORITATIVE_OUTCOME = "E_COMPLETION_NO_AUTHORITATIVE_OUTCOME"
 E_COMPLETION_CARDINALITY = "E_COMPLETION_CARDINALITY"
@@ -279,6 +305,7 @@ class DashboardRAGVLLME2EError(RuntimeError):
             or phase in POSTGRES_CHILD_FAILURE_PHASES
             or phase in POSTGRES_STARTUP_FAILURE_PHASES
             or phase in CLEANUP_FAILURE_PHASES
+            or phase in DUPLICATE_FAILURE_PHASES
             else "E_PREFLIGHT"
         )
         super().__init__(self.phase)
@@ -291,6 +318,12 @@ class _CleanupPhaseError(RuntimeError):
 
 
 class _CompletionPumpError(RuntimeError):
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__(phase)
+
+
+class _DuplicatePhaseError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase
         super().__init__(phase)
@@ -665,6 +698,14 @@ def run(
                         else E_COMPLETION_UNCLASSIFIED
                     )
                     raise DashboardRAGVLLME2EError(completion_phase) from None
+                if phase == "E_DUPLICATE":
+                    duplicate_phase = (
+                        error.phase
+                        if isinstance(error, _DuplicatePhaseError)
+                        and error.phase in DUPLICATE_FAILURE_PHASES
+                        else E_DUPLICATE_UNCLASSIFIED
+                    )
+                    raise DashboardRAGVLLME2EError(duplicate_phase) from None
                 raise DashboardRAGVLLME2EError(phase) from None
     except BaseException as error:
         functional_primary_error = error
@@ -1451,29 +1492,77 @@ class _ProductionLifecycle:
 
     def _duplicate(self) -> None:
         from app.ingestion.document_background import DocumentSubmissionStatus
+        from app.ingestion.registry_models import DocumentReadiness
 
         runtime = self._document_runtime
-        if runtime is None:
-            raise RuntimeError
-        result = runtime.manager.submit(
-            submission_token="duplicate",
-            content=b"Synthetic bounded product return guidance.",
-            original_filename="synthetic-guide.txt",
-            declared_media_type="text/plain",
-        )
+        target_before = self._target_entry
+        other_before = self._other_entry
+        if (
+            runtime is None
+            or target_before is None
+            or other_before is None
+            or self._vector_count <= 0
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RUNTIME)
+        try:
+            before_entries = runtime.registry.list_documents(
+                tenant_id=runtime.tenant_id,
+                knowledge_base_id=runtime.knowledge_base_id,
+            )
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_UNCLASSIFIED) from None
+        if len(before_entries) != 2:
+            raise _DuplicatePhaseError(E_DUPLICATE_REGISTRY_CARDINALITY)
+        try:
+            result = runtime.manager.submit(
+                submission_token="duplicate",
+                content=b"Synthetic bounded product return guidance.",
+                original_filename="synthetic-guide.txt",
+                declared_media_type="text/plain",
+            )
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_SUBMIT) from None
         if result.status is not DocumentSubmissionStatus.ACCEPTED:
-            raise RuntimeError
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            if self._target_vector_count() == self._vector_count:
-                runtime_entries = runtime.registry.list_documents(
-                    tenant_id=runtime.tenant_id,
-                    knowledge_base_id=runtime.knowledge_base_id,
-                )
-                if len(runtime_entries) == 2:
-                    return
-            time.sleep(POLL_INTERVAL_SECONDS)
-        raise RuntimeError
+            raise _DuplicatePhaseError(E_DUPLICATE_STATUS)
+        try:
+            after_entries = runtime.registry.list_documents(
+                tenant_id=runtime.tenant_id,
+                knowledge_base_id=runtime.knowledge_base_id,
+            )
+            target_after = runtime.registry.get_entry(
+                tenant_id=target_before.document.tenant_id,
+                knowledge_base_id=target_before.document.knowledge_base_id,
+                document_id=target_before.document.document_id,
+            )
+            other_after = runtime.registry.get_entry(
+                tenant_id=other_before.document.tenant_id,
+                knowledge_base_id=other_before.document.knowledge_base_id,
+                document_id=other_before.document.document_id,
+            )
+            vector_count_after = self._target_vector_count()
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_UNCLASSIFIED) from None
+        if len(after_entries) != 2 or len(after_entries) != len(before_entries):
+            raise _DuplicatePhaseError(E_DUPLICATE_REGISTRY_CARDINALITY)
+        if target_after is None or other_after is None:
+            raise _DuplicatePhaseError(E_DUPLICATE_DOCUMENT_IDENTITY)
+        if (
+            target_before.document.storage_object_key is not None
+            or target_after.document.storage_object_key is not None
+            or other_before.document.storage_object_key is not None
+            or other_after.document.storage_object_key is not None
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_SOURCE_KEY)
+        if target_after.document != target_before.document:
+            raise _DuplicatePhaseError(E_DUPLICATE_DOCUMENT_IDENTITY)
+        if target_after.job != target_before.job:
+            raise _DuplicatePhaseError(E_DUPLICATE_JOB_IDENTITY)
+        if target_after.readiness is not DocumentReadiness.READY:
+            raise _DuplicatePhaseError(E_DUPLICATE_READINESS)
+        if other_after != other_before:
+            raise _DuplicatePhaseError(E_DUPLICATE_OTHER_DOCUMENT)
+        if vector_count_after != self._vector_count:
+            raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_CARDINALITY)
 
     def _target_vector_count(self) -> int:
         from psycopg import connect
