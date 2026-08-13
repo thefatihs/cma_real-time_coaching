@@ -1475,8 +1475,9 @@ class _DuplicateRegistry:
     def get_entry(
         self, *, document_id: str, **_kwargs: object
     ) -> DocumentRegistryEntry | None:
+        entries = self.before if self.list_calls == 1 else self.after
         return next(
-            (item for item in self.after if item.document.document_id == document_id),
+            (item for item in entries if item.document.document_id == document_id),
             None,
         )
 
@@ -1523,7 +1524,8 @@ def _duplicate_lifecycle(
     lifecycle._target_entry = target
     lifecycle._other_entry = other
     lifecycle._vector_count = 1
-    monkeypatch.setattr(lifecycle, "_target_vector_count", lambda: vector_count)
+    vector_counts = iter((1, vector_count))
+    monkeypatch.setattr(lifecycle, "_target_vector_count", lambda: next(vector_counts))
     return lifecycle, registry, actual_manager
 
 
@@ -1537,6 +1539,327 @@ def test_duplicate_replay_is_synchronous_and_does_not_poll(
 
     assert registry.list_calls == 2
     assert manager.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "phase"),
+    [
+        ("before_list", subject.E_DUPLICATE_BEFORE_LIST),
+        ("after_list", subject.E_DUPLICATE_AFTER_LIST),
+        ("target_lookup", subject.E_DUPLICATE_TARGET_LOOKUP),
+        ("other_lookup", subject.E_DUPLICATE_OTHER_LOOKUP),
+        ("vector_query", subject.E_DUPLICATE_VECTOR_QUERY),
+    ],
+)
+def test_duplicate_reviewed_helper_failures_have_exact_phases(
+    operation: str,
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lifecycle, registry, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    original_list = registry.list_documents
+    original_get = registry.get_entry
+    if operation in {"before_list", "after_list"}:
+        calls = 0
+
+        def list_documents(**kwargs: object) -> tuple[DocumentRegistryEntry, ...]:
+            nonlocal calls
+            calls += 1
+            if calls == (1 if operation == "before_list" else 2):
+                raise RuntimeError("private-secret")
+            return original_list(**kwargs)
+
+        registry.list_documents = list_documents
+    elif operation in {"target_lookup", "other_lookup"}:
+        calls = 0
+
+        def get_entry(**kwargs: object) -> DocumentRegistryEntry | None:
+            nonlocal calls
+            calls += 1
+            if calls == (1 if operation == "target_lookup" else 2):
+                raise RuntimeError("private-secret")
+            document_id = kwargs.get("document_id")
+            assert isinstance(document_id, str)
+            return original_get(document_id=document_id)
+
+        registry.get_entry = get_entry
+    else:
+        monkeypatch.setattr(
+            lifecycle,
+            "_target_vector_count",
+            lambda: (_ for _ in ()).throw(RuntimeError("private-secret")),
+        )
+
+    with pytest.raises(subject._DuplicatePhaseError, match=f"^{phase}$"):
+        lifecycle._duplicate()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "before_list",
+        "after_list",
+        "target_lookup",
+        "other_lookup",
+        "submit",
+        "vector_count",
+    ],
+)
+def test_duplicate_malformed_helper_shapes_have_fixed_phase(
+    operation: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, registry, manager = _duplicate_lifecycle(monkeypatch, tmp_path)
+    original_list = registry.list_documents
+    original_get = registry.get_entry
+    if operation in {"before_list", "after_list"}:
+        calls = 0
+
+        def malformed_list(**kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == (1 if operation == "before_list" else 2):
+                return list(original_list(**kwargs))
+            return original_list(**kwargs)
+
+        monkeypatch.setattr(registry, "list_documents", malformed_list)
+    elif operation in {"target_lookup", "other_lookup"}:
+        calls = 0
+
+        def malformed_get(**kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == (1 if operation == "target_lookup" else 2):
+                return object()
+            document_id = kwargs.get("document_id")
+            assert isinstance(document_id, str)
+            return original_get(document_id=document_id)
+
+        monkeypatch.setattr(registry, "get_entry", malformed_get)
+    elif operation == "submit":
+        monkeypatch.setattr(manager, "submit", lambda **_kwargs: object())
+    else:
+        counts = iter((1, -1))
+        monkeypatch.setattr(lifecycle, "_target_vector_count", lambda: next(counts))
+
+    with pytest.raises(
+        subject._DuplicatePhaseError, match=f"^{subject.E_DUPLICATE_RESULT_SHAPE}$"
+    ):
+        lifecycle._duplicate()
+
+
+@pytest.mark.parametrize("snapshot", ["before", "after"])
+def test_duplicate_rejects_non_entry_tuple_members(
+    snapshot: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, registry, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    malformed = cast(tuple[DocumentRegistryEntry, ...], (object(), registry.before[1]))
+    if snapshot == "before":
+        registry.before = malformed
+    else:
+        registry.after = malformed
+    with pytest.raises(
+        subject._DuplicatePhaseError, match=f"^{subject.E_DUPLICATE_RESULT_SHAPE}$"
+    ):
+        lifecycle._duplicate()
+
+
+def test_duplicate_rejects_malformed_submission_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    malformed = DocumentSubmissionResult(cast(DocumentSubmissionStatus, "accepted"))
+    lifecycle, _, _ = _duplicate_lifecycle(
+        monkeypatch, tmp_path, manager=_DuplicateManager(malformed)
+    )
+    with pytest.raises(
+        subject._DuplicatePhaseError, match=f"^{subject.E_DUPLICATE_RESULT_SHAPE}$"
+    ):
+        lifecycle._duplicate()
+
+
+def test_duplicate_uses_fresh_before_snapshots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    assert lifecycle._target_entry is not None
+    assert lifecycle._other_entry is not None
+    lifecycle._target_entry = lifecycle._target_entry.model_copy(
+        update={
+            "document": lifecycle._target_entry.document.model_copy(
+                update={"byte_size": 999}
+            )
+        }
+    )
+    lifecycle._other_entry = lifecycle._other_entry.model_copy(
+        update={
+            "job": lifecycle._other_entry.job.model_copy(update={"attempt_count": 2})
+        }
+    )
+
+    lifecycle._duplicate()
+
+
+class _VectorCountCursor:
+    def __init__(
+        self,
+        row: object,
+        *,
+        execute_failure: bool = False,
+        fetch_failure: bool = False,
+    ) -> None:
+        self.row = row
+        self.execute_failure = execute_failure
+        self.fetch_failure = fetch_failure
+        self.executed = 0
+
+    def __enter__(self) -> _VectorCountCursor:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, *_args: object) -> None:
+        self.executed += 1
+        if self.execute_failure:
+            raise RuntimeError("private-secret")
+
+    def fetchone(self) -> object:
+        if self.fetch_failure:
+            raise RuntimeError("private-secret")
+        return self.row
+
+
+class _VectorCountConnection:
+    def __init__(
+        self,
+        row: object,
+        *,
+        execute_failure: bool = False,
+        cursor_failure: bool = False,
+        fetch_failure: bool = False,
+        close_failure: bool = False,
+    ) -> None:
+        self.cursor_instance = _VectorCountCursor(
+            row, execute_failure=execute_failure, fetch_failure=fetch_failure
+        )
+        self.cursor_failure = cursor_failure
+        self.close_failure = close_failure
+        self.closed = 0
+
+    def cursor(self) -> _VectorCountCursor:
+        if self.cursor_failure:
+            raise RuntimeError("private-secret")
+        return self.cursor_instance
+
+    def close(self) -> None:
+        self.closed += 1
+        if self.close_failure:
+            raise RuntimeError("private-secret")
+
+
+def test_target_vector_count_runs_production_shaped_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import psycopg
+
+    lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.delattr(lifecycle, "_target_vector_count")
+    connection = _VectorCountConnection((3,))
+    monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
+    monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: connection)
+
+    assert lifecycle._target_vector_count() == 3
+    assert connection.cursor_instance.executed == 1
+    assert connection.closed == 1
+
+
+@pytest.mark.parametrize("row", [None, (), (1, 2), (True,), (-1,), ("1",)])
+def test_target_vector_count_rejects_malformed_production_rows(
+    row: object, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import psycopg
+
+    lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.delattr(lifecycle, "_target_vector_count")
+    connection = _VectorCountConnection(row)
+    monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
+    monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: connection)
+    with pytest.raises(subject._DuplicateResultShapeError):
+        lifecycle._target_vector_count()
+    assert connection.closed == 1
+
+
+@pytest.mark.parametrize(
+    "boundary", ["dsn", "connect", "cursor", "execute", "fetchone", "close"]
+)
+def test_duplicate_real_vector_query_boundaries_have_exact_phase(
+    boundary: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import psycopg
+
+    lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.delattr(lifecycle, "_target_vector_count")
+    if boundary == "dsn":
+        monkeypatch.setattr(
+            lifecycle,
+            "_application_dsn",
+            lambda: (_ for _ in ()).throw(RuntimeError("private-secret")),
+        )
+    else:
+        monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
+    connection = _VectorCountConnection(
+        (1,),
+        cursor_failure=boundary == "cursor",
+        execute_failure=boundary == "execute",
+        fetch_failure=boundary == "fetchone",
+        close_failure=boundary == "close",
+    )
+    if boundary == "connect":
+        monkeypatch.setattr(
+            psycopg,
+            "connect",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("private-secret")
+            ),
+        )
+    else:
+        monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: connection)
+
+    with pytest.raises(
+        subject._DuplicatePhaseError,
+        match=f"^{subject.E_DUPLICATE_VECTOR_QUERY}$",
+    ):
+        lifecycle._duplicate()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_duplicate_real_vector_row_shape_has_exact_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import psycopg
+
+    lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.delattr(lifecycle, "_target_vector_count")
+    monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
+    monkeypatch.setattr(
+        psycopg,
+        "connect",
+        lambda *_args, **_kwargs: _VectorCountConnection(("malformed",)),
+    )
+    with pytest.raises(
+        subject._DuplicatePhaseError,
+        match=f"^{subject.E_DUPLICATE_RESULT_SHAPE}$",
+    ):
+        lifecycle._duplicate()
 
 
 def test_duplicate_missing_runtime_and_submit_failure_have_fixed_phases(
@@ -1647,7 +1970,7 @@ def test_duplicate_rejection_and_query_failure_are_secret_safe(
     )
     with pytest.raises(
         subject._DuplicatePhaseError,
-        match=f"^{subject.E_DUPLICATE_UNCLASSIFIED}$",
+        match=f"^{subject.E_DUPLICATE_BEFORE_LIST}$",
     ):
         lifecycle._duplicate()
     captured = capsys.readouterr()

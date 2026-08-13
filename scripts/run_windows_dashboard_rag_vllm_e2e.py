@@ -94,8 +94,14 @@ CLEANUP_FAILURE_PHASES = frozenset(
     }
 )
 E_DUPLICATE_RUNTIME = "E_DUPLICATE_RUNTIME"
+E_DUPLICATE_BEFORE_LIST = "E_DUPLICATE_BEFORE_LIST"
 E_DUPLICATE_SUBMIT = "E_DUPLICATE_SUBMIT"
 E_DUPLICATE_STATUS = "E_DUPLICATE_STATUS"
+E_DUPLICATE_AFTER_LIST = "E_DUPLICATE_AFTER_LIST"
+E_DUPLICATE_TARGET_LOOKUP = "E_DUPLICATE_TARGET_LOOKUP"
+E_DUPLICATE_OTHER_LOOKUP = "E_DUPLICATE_OTHER_LOOKUP"
+E_DUPLICATE_VECTOR_QUERY = "E_DUPLICATE_VECTOR_QUERY"
+E_DUPLICATE_RESULT_SHAPE = "E_DUPLICATE_RESULT_SHAPE"
 E_DUPLICATE_DOCUMENT_IDENTITY = "E_DUPLICATE_DOCUMENT_IDENTITY"
 E_DUPLICATE_JOB_IDENTITY = "E_DUPLICATE_JOB_IDENTITY"
 E_DUPLICATE_READINESS = "E_DUPLICATE_READINESS"
@@ -107,8 +113,14 @@ E_DUPLICATE_UNCLASSIFIED = "E_DUPLICATE_UNCLASSIFIED"
 DUPLICATE_FAILURE_PHASES = frozenset(
     {
         E_DUPLICATE_RUNTIME,
+        E_DUPLICATE_BEFORE_LIST,
         E_DUPLICATE_SUBMIT,
         E_DUPLICATE_STATUS,
+        E_DUPLICATE_AFTER_LIST,
+        E_DUPLICATE_TARGET_LOOKUP,
+        E_DUPLICATE_OTHER_LOOKUP,
+        E_DUPLICATE_VECTOR_QUERY,
+        E_DUPLICATE_RESULT_SHAPE,
         E_DUPLICATE_DOCUMENT_IDENTITY,
         E_DUPLICATE_JOB_IDENTITY,
         E_DUPLICATE_READINESS,
@@ -330,6 +342,10 @@ class _DuplicatePhaseError(RuntimeError):
     def __init__(self, phase: str) -> None:
         self.phase = phase
         super().__init__(phase)
+
+
+class _DuplicateResultShapeError(RuntimeError):
+    pass
 
 
 def _stalled_completion_phase(snapshot: RAGDiagnosticSnapshot) -> str:
@@ -1497,7 +1513,10 @@ class _ProductionLifecycle:
             raise RuntimeError
 
     def _duplicate(self) -> None:
-        from app.ingestion.document_background import DocumentSubmissionStatus
+        from app.ingestion.document_background import (
+            DocumentSubmissionResult,
+            DocumentSubmissionStatus,
+        )
         from app.ingestion.registry_models import DocumentReadiness
 
         runtime = self._document_runtime
@@ -1516,9 +1535,47 @@ class _ProductionLifecycle:
                 knowledge_base_id=runtime.knowledge_base_id,
             )
         except Exception:
-            raise _DuplicatePhaseError(E_DUPLICATE_UNCLASSIFIED) from None
+            raise _DuplicatePhaseError(E_DUPLICATE_BEFORE_LIST) from None
+        if type(before_entries) is not tuple or any(
+            not isinstance(entry, DocumentRegistryEntry) for entry in before_entries
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
         if len(before_entries) != 2:
             raise _DuplicatePhaseError(E_DUPLICATE_REGISTRY_CARDINALITY)
+        try:
+            fresh_target_before = runtime.registry.get_entry(
+                tenant_id=target_before.document.tenant_id,
+                knowledge_base_id=target_before.document.knowledge_base_id,
+                document_id=target_before.document.document_id,
+            )
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_TARGET_LOOKUP) from None
+        if fresh_target_before is not None and not isinstance(
+            fresh_target_before, DocumentRegistryEntry
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
+        try:
+            fresh_other_before = runtime.registry.get_entry(
+                tenant_id=other_before.document.tenant_id,
+                knowledge_base_id=other_before.document.knowledge_base_id,
+                document_id=other_before.document.document_id,
+            )
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_OTHER_LOOKUP) from None
+        if fresh_other_before is not None and not isinstance(
+            fresh_other_before, DocumentRegistryEntry
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
+        if fresh_target_before is None or fresh_other_before is None:
+            raise _DuplicatePhaseError(E_DUPLICATE_DOCUMENT_IDENTITY)
+        try:
+            vector_count_before = self._target_vector_count()
+        except _DuplicateResultShapeError:
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE) from None
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_QUERY) from None
+        if type(vector_count_before) is not int or vector_count_before < 0:
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
         try:
             result = runtime.manager.submit(
                 submission_token="duplicate",
@@ -1528,6 +1585,10 @@ class _ProductionLifecycle:
             )
         except Exception:
             raise _DuplicatePhaseError(E_DUPLICATE_SUBMIT) from None
+        if not isinstance(result, DocumentSubmissionResult) or not isinstance(
+            result.status, DocumentSubmissionStatus
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
         if result.status is not DocumentSubmissionStatus.ACCEPTED:
             raise _DuplicatePhaseError(E_DUPLICATE_STATUS)
         try:
@@ -1535,39 +1596,64 @@ class _ProductionLifecycle:
                 tenant_id=runtime.tenant_id,
                 knowledge_base_id=runtime.knowledge_base_id,
             )
-            target_after = runtime.registry.get_entry(
-                tenant_id=target_before.document.tenant_id,
-                knowledge_base_id=target_before.document.knowledge_base_id,
-                document_id=target_before.document.document_id,
-            )
-            other_after = runtime.registry.get_entry(
-                tenant_id=other_before.document.tenant_id,
-                knowledge_base_id=other_before.document.knowledge_base_id,
-                document_id=other_before.document.document_id,
-            )
-            vector_count_after = self._target_vector_count()
         except Exception:
-            raise _DuplicatePhaseError(E_DUPLICATE_UNCLASSIFIED) from None
+            raise _DuplicatePhaseError(E_DUPLICATE_AFTER_LIST) from None
+        if type(after_entries) is not tuple or any(
+            not isinstance(entry, DocumentRegistryEntry) for entry in after_entries
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
+        try:
+            target_after = runtime.registry.get_entry(
+                tenant_id=fresh_target_before.document.tenant_id,
+                knowledge_base_id=fresh_target_before.document.knowledge_base_id,
+                document_id=fresh_target_before.document.document_id,
+            )
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_TARGET_LOOKUP) from None
+        if target_after is not None and not isinstance(
+            target_after, DocumentRegistryEntry
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
+        try:
+            other_after = runtime.registry.get_entry(
+                tenant_id=fresh_other_before.document.tenant_id,
+                knowledge_base_id=fresh_other_before.document.knowledge_base_id,
+                document_id=fresh_other_before.document.document_id,
+            )
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_OTHER_LOOKUP) from None
+        if other_after is not None and not isinstance(
+            other_after, DocumentRegistryEntry
+        ):
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
+        try:
+            vector_count_after = self._target_vector_count()
+        except _DuplicateResultShapeError:
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE) from None
+        except Exception:
+            raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_QUERY) from None
+        if type(vector_count_after) is not int or vector_count_after < 0:
+            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
         if len(after_entries) != 2 or len(after_entries) != len(before_entries):
             raise _DuplicatePhaseError(E_DUPLICATE_REGISTRY_CARDINALITY)
         if target_after is None or other_after is None:
             raise _DuplicatePhaseError(E_DUPLICATE_DOCUMENT_IDENTITY)
         if (
-            target_before.document.storage_object_key is not None
+            fresh_target_before.document.storage_object_key is not None
             or target_after.document.storage_object_key is not None
-            or other_before.document.storage_object_key is not None
+            or fresh_other_before.document.storage_object_key is not None
             or other_after.document.storage_object_key is not None
         ):
             raise _DuplicatePhaseError(E_DUPLICATE_SOURCE_KEY)
-        if target_after.document != target_before.document:
+        if target_after.document != fresh_target_before.document:
             raise _DuplicatePhaseError(E_DUPLICATE_DOCUMENT_IDENTITY)
-        if target_after.job != target_before.job:
+        if target_after.job != fresh_target_before.job:
             raise _DuplicatePhaseError(E_DUPLICATE_JOB_IDENTITY)
         if target_after.readiness is not DocumentReadiness.READY:
             raise _DuplicatePhaseError(E_DUPLICATE_READINESS)
-        if other_after != other_before:
+        if other_after != fresh_other_before:
             raise _DuplicatePhaseError(E_DUPLICATE_OTHER_DOCUMENT)
-        if vector_count_after != self._vector_count:
+        if vector_count_after != vector_count_before:
             raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_CARDINALITY)
 
     def _target_vector_count(self) -> int:
@@ -1590,8 +1676,13 @@ class _ProductionLifecycle:
                     ),
                 )
                 row = cursor.fetchone()
-                if row is None or type(row[0]) is not int:
-                    raise RuntimeError
+                if (
+                    type(row) is not tuple
+                    or len(row) != 1
+                    or type(row[0]) is not int
+                    or row[0] < 0
+                ):
+                    raise _DuplicateResultShapeError
                 return row[0]
         finally:
             connection.close()
