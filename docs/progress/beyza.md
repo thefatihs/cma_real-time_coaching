@@ -725,3 +725,28 @@ Tarih: 3 Agustos 2026
 
 - Sonraki planli adim: PR54 kaniti tamamlandi; production rollout veya kapsam
   genisletmesi ayri, ownership-onayli bir calisma olarak ele alinacak.
+
+## Windows Document Dashboard RAG/vLLM E2E Verification
+
+Tarih: 13 Agustos 2026
+
+- Gercek Windows document-dashboard RAG/vLLM E2E calismasi tam zinciri
+  tamamlayarak tam olarak `E2E_OK` yazdirdi.
+- TLS PostgreSQL/pgvector, `READY` document ingestion, gercek pinned MiniLM
+  embedding, scoped retrieval, validated tunnel uzerinden Ubuntu HTTPS vLLM,
+  coaching result gate, safe citation projection, duplicate replay, exact
+  deletion ve scope isolation dogrulandi.
+- `600` saniyelik PostgreSQL service lease'in gec duplicate verification
+  baglantisindan once yetersiz kaldigi tespit edildi. Full E2E preflight artik
+  exact canonical `7200` degerini gerektirir; `--postgres-startup-only`
+  bagimsiz `300`-`7200` araligini korur.
+- `7200`, desteklenen full-E2E operator lease'idir; her model, embedding ve SQL
+  islemini kapsayan formal bir total-runtime garantisi degildir.
+- Focused preflight/startup/cleanup testleri 72 passed; full controller 342
+  passed; standalone TLS controller 107 passed; Windows-compatible suite 2969
+  passed, 20 skipped. Ruff, format, focused Pyright, lock, conflict-marker ve
+  diff kontrolleri passed.
+- Cleanup sonrasi E2E/TLS process ve generated TLS container kalintisi yoktu;
+  PostgreSQL handoff bos ve Git worktree clean olarak dogrulandi.
+- Final commit baseline:
+  `1ac880f09af70ae5d97817b14236b859ea07f7b6`.

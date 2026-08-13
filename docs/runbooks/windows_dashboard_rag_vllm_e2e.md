@@ -18,7 +18,7 @@ Set these placeholders through a private Windows process environment:
 CALLMETRIC_DASHBOARD_RAG_E2E_EXPECTED_BRANCH=<REVIEWED_BRANCH>
 CALLMETRIC_DASHBOARD_RAG_E2E_EXPECTED_HEAD=<REVIEWED_40_HEX_HEAD>
 CALLMETRIC_DASHBOARD_RAG_E2E_EXPECTED_BASELINE=<REVIEWED_40_HEX_BASELINE>
-CALLMETRIC_DASHBOARD_RAG_E2E_POSTGRES_TTL_SECONDS=<300..7200>
+CALLMETRIC_DASHBOARD_RAG_E2E_POSTGRES_TTL_SECONDS=7200
 CALLMETRIC_POSTGRES_TLS_SERVICE_HANDOFF_ROOT=<OWNER_ONLY_ROOT>
 CALLMETRIC_DASHBOARD_RAG_PROVIDER_SETTINGS_PATH=<ABSOLUTE_PROVIDER_JSON>
 CALLMETRIC_DASHBOARD_RAG_INTEGRATION_POLICY_PATH=<ABSOLUTE_POLICY_JSON>
@@ -51,6 +51,10 @@ Execution order:
 6. Run `uv run python -m scripts.run_windows_dashboard_rag_vllm_e2e`.
 7. Require only `E2E_OK`.
 
+The full dashboard RAG/vLLM E2E accepts only the canonical PostgreSQL service
+lease value `7200`. The independent `--postgres-startup-only` diagnostic keeps
+the standalone `300` through `7200` range.
+
 Full mode starts one randomized loopback TLS PostgreSQL service. That service
 proves migrations 0001-0003 and repeat idempotency before its owner-only
 handoff. The controller verifies ledger/readiness, provisions the exact cosine
@@ -60,6 +64,23 @@ and runs one HTTPS orchestration. The existing gate must ground the admitted
 suggestion. Completion pumping and exact-scope projection must yield exactly one
 safe dashboard source containing only display filename and `TXT`. Duplicate
 ingestion may not expand vectors; deletion preserves the other document/profile.
+
+## Verified real E2E result
+
+The reviewed real run emitted exactly `E2E_OK`. It verified TLS
+PostgreSQL/pgvector startup, document ingestion reaching `READY`, real pinned
+MiniLM embedding and scoped pgvector retrieval, and Ubuntu HTTPS vLLM through
+the validated tunnel. The coaching result gate and safe citation projection,
+duplicate replay without vector expansion, exact deletion, scope isolation and
+controller-owned cleanup all completed.
+
+Post-run verification found no E2E or TLS process residue, no generated TLS
+container residue, an empty PostgreSQL handoff and a clean Git worktree. An
+observed run with a `600`-second PostgreSQL lease expired before the late
+duplicate verification connection. The supported full-E2E operator lease is
+therefore exactly `7200`. This is not a formal total-runtime guarantee because
+the controller does not yet impose one complete deadline across every model,
+embedding and SQL operation.
 
 Failures print only a fixed `E_*` phase. On every path the controller closes
 background resources, deletes only reachable synthetic documents and terminates
