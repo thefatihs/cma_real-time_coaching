@@ -198,6 +198,7 @@ def test_every_phase_failure_cleans_once_and_stays_fixed(
         "E_COMPLETION_PUMP": subject.E_COMPLETION_UNCLASSIFIED,
         "E_POSTGRES_START": subject.E_POSTGRES_UNCLASSIFIED,
         "E_DUPLICATE": subject.E_DUPLICATE_UNCLASSIFIED,
+        "E_DOCUMENT_READY": subject.E_DOCUMENT_READY_UNCLASSIFIED,
     }.get(phase, phase)
     assert caught.value.phase == expected
     assert str(caught.value) == expected
@@ -1431,7 +1432,10 @@ def _ready_document_entry(
         tenant_id="tenant-synthetic",
         knowledge_base_id="kb-synthetic",
         document_id=f"document-{name}",
-        original_filename=f"{name}.txt",
+        original_filename={
+            "target": "synthetic-guide.txt",
+            "other": "synthetic-other.txt",
+        }.get(name, f"{name}.txt"),
         media_type="text/plain",
         byte_size=10,
         storage_object_key=source_key,
@@ -1456,6 +1460,392 @@ def _ready_document_entry(
     return DocumentRegistryEntry(
         document=document, job=job, readiness=DocumentReadiness.READY
     )
+
+
+def _document_entry_with_state(
+    name: str, state: DocumentIngestionState
+) -> DocumentRegistryEntry:
+    ready = _ready_document_entry(name)
+    if state is DocumentIngestionState.SUCCEEDED:
+        return ready
+    readiness = {
+        DocumentIngestionState.QUEUED: DocumentReadiness.PENDING,
+        DocumentIngestionState.PROCESSING: DocumentReadiness.PENDING,
+        DocumentIngestionState.FAILED: DocumentReadiness.FAILED,
+        DocumentIngestionState.CANCELLED: DocumentReadiness.CANCELLED,
+    }[state]
+    started = (
+        None if state is DocumentIngestionState.QUEUED else ready.job.started_at_utc
+    )
+    finished = (
+        ready.job.finished_at_utc
+        if state in {DocumentIngestionState.FAILED, DocumentIngestionState.CANCELLED}
+        else None
+    )
+    job = ready.job.model_copy(
+        update={
+            "state": state,
+            "phase": DocumentIngestionPhase.EXTRACTION,
+            "processed_chunks": 0,
+            "total_chunks": 0,
+            "started_at_utc": started,
+            "finished_at_utc": finished,
+        }
+    )
+    document = ready.document.model_copy(update={"ready_at_utc": None})
+    return DocumentRegistryEntry(document=document, job=job, readiness=readiness)
+
+
+class _DocumentReadyRegistry:
+    def __init__(self, results: tuple[object, ...]) -> None:
+        self.results = list(results)
+        self.calls = 0
+
+    def list_documents(self, **_kwargs: object) -> object:
+        self.calls += 1
+        if not self.results:
+            raise AssertionError("unexpected registry call")
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def _document_ready_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *results: object,
+) -> tuple[subject._ProductionLifecycle, _DocumentReadyRegistry]:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    registry = _DocumentReadyRegistry(results)
+    lifecycle._document_runtime = cast(
+        subject.PostgreSQLDocumentIngestionRuntime,
+        SimpleNamespace(
+            tenant_id="tenant-synthetic",
+            knowledge_base_id="kb-synthetic",
+            registry=registry,
+        ),
+    )
+    return lifecycle, registry
+
+
+def test_document_ready_immediate_success_uses_real_models_without_sleep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = _ready_document_entry("target")
+    other = _ready_document_entry("other")
+    lifecycle, registry = _document_ready_lifecycle(
+        monkeypatch, tmp_path, (other, target)
+    )
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    monkeypatch.setattr(subject.time, "sleep", lambda _seconds: pytest.fail("slept"))
+
+    lifecycle._document_ready()
+
+    assert lifecycle._target_entry == target
+    assert lifecycle._other_entry == other
+    assert registry.calls == 1
+
+
+def test_document_ready_mixed_pending_then_success_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = _ready_document_entry("target")
+    other = _ready_document_entry("other")
+    pending = _document_entry_with_state("other", DocumentIngestionState.PROCESSING)
+    lifecycle, registry = _document_ready_lifecycle(
+        monkeypatch, tmp_path, (target, pending), (target, other)
+    )
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0, 0.1)).__next__)
+    sleeps: list[float] = []
+    monkeypatch.setattr(subject.time, "sleep", sleeps.append)
+
+    lifecycle._document_ready()
+
+    assert registry.calls == 2
+    assert sleeps == [subject.POLL_INTERVAL_SECONDS]
+
+
+@pytest.mark.parametrize(
+    ("fixture", "state", "phase"),
+    [
+        (
+            "target",
+            DocumentIngestionState.FAILED,
+            subject.E_DOCUMENT_READY_TARGET_FAILED,
+        ),
+        ("other", DocumentIngestionState.FAILED, subject.E_DOCUMENT_READY_OTHER_FAILED),
+        (
+            "target",
+            DocumentIngestionState.CANCELLED,
+            subject.E_DOCUMENT_READY_TARGET_CANCELLED,
+        ),
+        (
+            "other",
+            DocumentIngestionState.CANCELLED,
+            subject.E_DOCUMENT_READY_OTHER_CANCELLED,
+        ),
+    ],
+)
+def test_document_ready_terminal_state_fails_without_sleep(
+    fixture: str,
+    state: DocumentIngestionState,
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = _document_entry_with_state(
+        "target", state if fixture == "target" else DocumentIngestionState.PROCESSING
+    )
+    other = _document_entry_with_state(
+        "other", state if fixture == "other" else DocumentIngestionState.PROCESSING
+    )
+    lifecycle, _ = _document_ready_lifecycle(monkeypatch, tmp_path, (target, other))
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    monkeypatch.setattr(subject.time, "sleep", lambda _seconds: pytest.fail("slept"))
+
+    with pytest.raises(subject._DocumentReadyPhaseError, match=f"^{phase}$"):
+        lifecycle._document_ready()
+
+
+@pytest.mark.parametrize(
+    ("entries", "phase"),
+    [
+        (
+            (_ready_document_entry("unknown"), _ready_document_entry("other")),
+            subject.E_DOCUMENT_READY_TARGET_MISSING,
+        ),
+        (
+            (_ready_document_entry("target"), _ready_document_entry("unknown")),
+            subject.E_DOCUMENT_READY_OTHER_MISSING,
+        ),
+        (
+            (
+                _ready_document_entry("target"),
+                _ready_document_entry("other"),
+                _ready_document_entry("unknown"),
+            ),
+            subject.E_DOCUMENT_READY_CARDINALITY,
+        ),
+        (
+            (_ready_document_entry("target"), _ready_document_entry("target")),
+            subject.E_DOCUMENT_READY_RESULT_SHAPE,
+        ),
+    ],
+)
+def test_document_ready_fixture_shape_has_exact_phase(
+    entries: tuple[DocumentRegistryEntry, ...],
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    lifecycle, _ = _document_ready_lifecycle(monkeypatch, tmp_path, entries)
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    with pytest.raises(subject._DocumentReadyPhaseError, match=f"^{phase}$"):
+        lifecycle._document_ready()
+
+
+@pytest.mark.parametrize("result", [[], (object(), object())])
+def test_document_ready_rejects_malformed_registry_shape(
+    result: object, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, _ = _document_ready_lifecycle(monkeypatch, tmp_path, result)
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    with pytest.raises(
+        subject._DocumentReadyPhaseError,
+        match=f"^{subject.E_DOCUMENT_READY_RESULT_SHAPE}$",
+    ):
+        lifecycle._document_ready()
+
+
+@pytest.mark.parametrize(
+    ("fixture", "phase"),
+    [
+        ("target", subject.E_DOCUMENT_READY_TARGET_JOB),
+        ("other", subject.E_DOCUMENT_READY_OTHER_JOB),
+    ],
+)
+def test_document_ready_rejects_inconsistent_job_readiness(
+    fixture: str, phase: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = _ready_document_entry("target")
+    other = _ready_document_entry("other")
+    if fixture == "target":
+        target = target.model_copy(update={"readiness": DocumentReadiness.PENDING})
+    else:
+        other = other.model_copy(
+            update={"job": other.job.model_copy(update={"document_id": "other-job"})}
+        )
+    lifecycle, _ = _document_ready_lifecycle(monkeypatch, tmp_path, (target, other))
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    with pytest.raises(subject._DocumentReadyPhaseError, match=f"^{phase}$"):
+        lifecycle._document_ready()
+
+
+def test_document_ready_rejects_non_null_source_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = _ready_document_entry("target", source_key="server-owned-key")
+    lifecycle, _ = _document_ready_lifecycle(
+        monkeypatch, tmp_path, (target, _ready_document_entry("other"))
+    )
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    with pytest.raises(
+        subject._DocumentReadyPhaseError,
+        match=f"^{subject.E_DOCUMENT_READY_SOURCE_KEY}$",
+    ):
+        lifecycle._document_ready()
+
+
+def test_document_ready_runtime_absence_has_exact_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle = _completion_lifecycle(monkeypatch, tmp_path)
+    with pytest.raises(
+        subject._DocumentReadyPhaseError,
+        match=f"^{subject.E_DOCUMENT_READY_RUNTIME}$",
+    ):
+        lifecycle._document_ready()
+
+
+def test_document_ready_registry_failure_is_secret_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lifecycle, _ = _document_ready_lifecycle(
+        monkeypatch, tmp_path, RuntimeError("private-secret")
+    )
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    with pytest.raises(
+        subject._DocumentReadyPhaseError,
+        match=f"^{subject.E_DOCUMENT_READY_LIST}$",
+    ):
+        lifecycle._document_ready()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("failure_at", [1, 2])
+def test_document_ready_clock_failures_have_exact_phase(
+    failure_at: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, _ = _document_ready_lifecycle(
+        monkeypatch,
+        tmp_path,
+        (
+            _document_entry_with_state("target", DocumentIngestionState.PROCESSING),
+            _document_entry_with_state("other", DocumentIngestionState.PROCESSING),
+        ),
+    )
+    calls = 0
+
+    def monotonic() -> float:
+        nonlocal calls
+        calls += 1
+        if calls == failure_at:
+            raise RuntimeError("private-secret")
+        return 0.0
+
+    monkeypatch.setattr(subject.time, "monotonic", monotonic)
+    with pytest.raises(
+        subject._DocumentReadyPhaseError,
+        match=f"^{subject.E_DOCUMENT_READY_CLOCK}$",
+    ):
+        lifecycle._document_ready()
+
+
+def test_document_ready_sleep_failure_has_exact_phase(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pending = (
+        _document_entry_with_state("target", DocumentIngestionState.PROCESSING),
+        _document_entry_with_state("other", DocumentIngestionState.PROCESSING),
+    )
+    lifecycle, _ = _document_ready_lifecycle(monkeypatch, tmp_path, pending)
+    monkeypatch.setattr(subject.time, "monotonic", iter((0.0, 0.0)).__next__)
+    monkeypatch.setattr(
+        subject.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(RuntimeError("private-secret")),
+    )
+    with pytest.raises(
+        subject._DocumentReadyPhaseError,
+        match=f"^{subject.E_DOCUMENT_READY_SLEEP}$",
+    ):
+        lifecycle._document_ready()
+
+
+def test_document_ready_exact_deadline_times_out_without_registry_or_sleep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, registry = _document_ready_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        subject.time,
+        "monotonic",
+        iter((10.0, 10.0 + subject.DOCUMENT_POLL_TIMEOUT_SECONDS)).__next__,
+    )
+    monkeypatch.setattr(subject.time, "sleep", lambda _seconds: pytest.fail("slept"))
+    with pytest.raises(
+        subject._DocumentReadyPhaseError,
+        match=f"^{subject.E_DOCUMENT_READY_TIMEOUT}$",
+    ):
+        lifecycle._document_ready()
+    assert registry.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (
+            subject._DocumentReadyPhaseError(subject.E_DOCUMENT_READY_TARGET_FAILED),
+            subject.E_DOCUMENT_READY_TARGET_FAILED,
+        ),
+        (RuntimeError("private-secret"), subject.E_DOCUMENT_READY_UNCLASSIFIED),
+    ],
+)
+def test_document_ready_public_phase_and_cleanup_precedence_are_secret_safe(
+    raised: BaseException,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    cleanup_count = 0
+
+    class Operations(FakeOperations):
+        def run_phase(self, phase: str) -> None:
+            if phase == "E_DOCUMENT_READY":
+                raise raised
+
+        def cleanup(self) -> None:
+            nonlocal cleanup_count
+            cleanup_count += 1
+            raise RuntimeError("cleanup-private-secret")
+
+    with pytest.raises(subject.DashboardRAGVLLME2EError) as caught:
+        subject.run(
+            preflight_only=False,
+            environment=values,
+            operations_factory=lambda _config: Operations(),
+        )
+    assert caught.value.phase == expected
+    monkeypatch.setattr(
+        subject,
+        "run",
+        lambda *, preflight_only: (_ for _ in ()).throw(caught.value),
+    )
+
+    assert subject.main([]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == f"{expected}\n"
+    assert captured.err == ""
+    assert "private-secret" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert cleanup_count == 1
 
 
 class _DuplicateRegistry:

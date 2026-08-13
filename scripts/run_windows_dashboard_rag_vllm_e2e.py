@@ -131,6 +131,44 @@ DUPLICATE_FAILURE_PHASES = frozenset(
         E_DUPLICATE_UNCLASSIFIED,
     }
 )
+E_DOCUMENT_READY_RUNTIME = "E_DOCUMENT_READY_RUNTIME"
+E_DOCUMENT_READY_CLOCK = "E_DOCUMENT_READY_CLOCK"
+E_DOCUMENT_READY_LIST = "E_DOCUMENT_READY_LIST"
+E_DOCUMENT_READY_RESULT_SHAPE = "E_DOCUMENT_READY_RESULT_SHAPE"
+E_DOCUMENT_READY_CARDINALITY = "E_DOCUMENT_READY_CARDINALITY"
+E_DOCUMENT_READY_TARGET_MISSING = "E_DOCUMENT_READY_TARGET_MISSING"
+E_DOCUMENT_READY_OTHER_MISSING = "E_DOCUMENT_READY_OTHER_MISSING"
+E_DOCUMENT_READY_TARGET_FAILED = "E_DOCUMENT_READY_TARGET_FAILED"
+E_DOCUMENT_READY_OTHER_FAILED = "E_DOCUMENT_READY_OTHER_FAILED"
+E_DOCUMENT_READY_TARGET_CANCELLED = "E_DOCUMENT_READY_TARGET_CANCELLED"
+E_DOCUMENT_READY_OTHER_CANCELLED = "E_DOCUMENT_READY_OTHER_CANCELLED"
+E_DOCUMENT_READY_TARGET_JOB = "E_DOCUMENT_READY_TARGET_JOB"
+E_DOCUMENT_READY_OTHER_JOB = "E_DOCUMENT_READY_OTHER_JOB"
+E_DOCUMENT_READY_SOURCE_KEY = "E_DOCUMENT_READY_SOURCE_KEY"
+E_DOCUMENT_READY_SLEEP = "E_DOCUMENT_READY_SLEEP"
+E_DOCUMENT_READY_TIMEOUT = "E_DOCUMENT_READY_TIMEOUT"
+E_DOCUMENT_READY_UNCLASSIFIED = "E_DOCUMENT_READY_UNCLASSIFIED"
+DOCUMENT_READY_FAILURE_PHASES = frozenset(
+    {
+        E_DOCUMENT_READY_RUNTIME,
+        E_DOCUMENT_READY_CLOCK,
+        E_DOCUMENT_READY_LIST,
+        E_DOCUMENT_READY_RESULT_SHAPE,
+        E_DOCUMENT_READY_CARDINALITY,
+        E_DOCUMENT_READY_TARGET_MISSING,
+        E_DOCUMENT_READY_OTHER_MISSING,
+        E_DOCUMENT_READY_TARGET_FAILED,
+        E_DOCUMENT_READY_OTHER_FAILED,
+        E_DOCUMENT_READY_TARGET_CANCELLED,
+        E_DOCUMENT_READY_OTHER_CANCELLED,
+        E_DOCUMENT_READY_TARGET_JOB,
+        E_DOCUMENT_READY_OTHER_JOB,
+        E_DOCUMENT_READY_SOURCE_KEY,
+        E_DOCUMENT_READY_SLEEP,
+        E_DOCUMENT_READY_TIMEOUT,
+        E_DOCUMENT_READY_UNCLASSIFIED,
+    }
+)
 E_COMPLETION_PROCESSOR_MISSING = "E_COMPLETION_PROCESSOR_MISSING"
 E_COMPLETION_NO_AUTHORITATIVE_OUTCOME = "E_COMPLETION_NO_AUTHORITATIVE_OUTCOME"
 E_COMPLETION_CARDINALITY = "E_COMPLETION_CARDINALITY"
@@ -321,6 +359,7 @@ class DashboardRAGVLLME2EError(RuntimeError):
             or phase in POSTGRES_STARTUP_FAILURE_PHASES
             or phase in CLEANUP_FAILURE_PHASES
             or phase in DUPLICATE_FAILURE_PHASES
+            or phase in DOCUMENT_READY_FAILURE_PHASES
             else "E_PREFLIGHT"
         )
         super().__init__(self.phase)
@@ -346,6 +385,12 @@ class _DuplicatePhaseError(RuntimeError):
 
 class _DuplicateResultShapeError(RuntimeError):
     pass
+
+
+class _DocumentReadyPhaseError(RuntimeError):
+    def __init__(self, phase: str) -> None:
+        self.phase = phase
+        super().__init__(phase)
 
 
 def _stalled_completion_phase(snapshot: RAGDiagnosticSnapshot) -> str:
@@ -720,6 +765,14 @@ def run(
                         else E_COMPLETION_UNCLASSIFIED
                     )
                     raise DashboardRAGVLLME2EError(completion_phase) from None
+                if phase == "E_DOCUMENT_READY":
+                    document_ready_phase = (
+                        error.phase
+                        if isinstance(error, _DocumentReadyPhaseError)
+                        and error.phase in DOCUMENT_READY_FAILURE_PHASES
+                        else E_DOCUMENT_READY_UNCLASSIFIED
+                    )
+                    raise DashboardRAGVLLME2EError(document_ready_phase) from None
                 if phase == "E_DUPLICATE":
                     duplicate_phase = (
                         error.phase
@@ -1228,29 +1281,98 @@ class _ProductionLifecycle:
                 raise RuntimeError
 
     def _document_ready(self) -> None:
-        from app.ingestion.registry_models import DocumentReadiness
+        from app.ingestion.registry_models import (
+            DocumentReadiness,
+            derive_document_readiness,
+        )
 
         runtime = self._document_runtime
         if runtime is None:
-            raise RuntimeError
-        deadline = time.monotonic() + DOCUMENT_POLL_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            entries = runtime.registry.list_documents(
-                tenant_id=runtime.tenant_id,
-                knowledge_base_id=runtime.knowledge_base_id,
+            raise _DocumentReadyPhaseError(E_DOCUMENT_READY_RUNTIME)
+        try:
+            deadline = time.monotonic() + DOCUMENT_POLL_TIMEOUT_SECONDS
+        except Exception:
+            raise _DocumentReadyPhaseError(E_DOCUMENT_READY_CLOCK) from None
+        while True:
+            try:
+                now = time.monotonic()
+            except Exception:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_CLOCK) from None
+            if now >= deadline:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_TIMEOUT)
+            try:
+                entries = runtime.registry.list_documents(
+                    tenant_id=runtime.tenant_id,
+                    knowledge_base_id=runtime.knowledge_base_id,
+                )
+            except Exception:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_LIST) from None
+            if type(entries) is not tuple or any(
+                not isinstance(item, DocumentRegistryEntry) for item in entries
+            ):
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_RESULT_SHAPE)
+            if len(entries) != 2:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_CARDINALITY)
+            target_matches = tuple(
+                item
+                for item in entries
+                if item.document.original_filename == "synthetic-guide.txt"
             )
-            ready = [
-                item for item in entries if item.readiness is DocumentReadiness.READY
-            ]
-            if len(ready) == 2:
-                by_name = {item.document.original_filename: item for item in ready}
-                self._target_entry = by_name["synthetic-guide.txt"]
-                self._other_entry = by_name["synthetic-other.txt"]
-                if any(item.document.storage_object_key is not None for item in ready):
-                    raise RuntimeError
+            other_matches = tuple(
+                item
+                for item in entries
+                if item.document.original_filename == "synthetic-other.txt"
+            )
+            if len(target_matches) > 1 or len(other_matches) > 1:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_RESULT_SHAPE)
+            if not target_matches:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_TARGET_MISSING)
+            if not other_matches:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_OTHER_MISSING)
+            target = target_matches[0]
+            other = other_matches[0]
+
+            def require_consistent(entry: DocumentRegistryEntry, *, phase: str) -> None:
+                try:
+                    consistent = (
+                        entry.document.tenant_id == entry.job.tenant_id
+                        and entry.document.knowledge_base_id
+                        == entry.job.knowledge_base_id
+                        and entry.document.document_id == entry.job.document_id
+                        and entry.readiness
+                        is derive_document_readiness(entry.document, entry.job)
+                    )
+                except Exception:
+                    raise _DocumentReadyPhaseError(phase) from None
+                if not consistent:
+                    raise _DocumentReadyPhaseError(phase)
+
+            require_consistent(target, phase=E_DOCUMENT_READY_TARGET_JOB)
+            require_consistent(other, phase=E_DOCUMENT_READY_OTHER_JOB)
+            if (
+                target.document.storage_object_key is not None
+                or other.document.storage_object_key is not None
+            ):
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_SOURCE_KEY)
+            if target.readiness is DocumentReadiness.FAILED:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_TARGET_FAILED)
+            if other.readiness is DocumentReadiness.FAILED:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_OTHER_FAILED)
+            if target.readiness is DocumentReadiness.CANCELLED:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_TARGET_CANCELLED)
+            if other.readiness is DocumentReadiness.CANCELLED:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_OTHER_CANCELLED)
+            if (
+                target.readiness is DocumentReadiness.READY
+                and other.readiness is DocumentReadiness.READY
+            ):
+                self._target_entry = target
+                self._other_entry = other
                 return
-            time.sleep(POLL_INTERVAL_SECONDS)
-        raise RuntimeError
+            try:
+                time.sleep(POLL_INTERVAL_SECONDS)
+            except Exception:
+                raise _DocumentReadyPhaseError(E_DOCUMENT_READY_SLEEP) from None
 
     def _vector_scope(self) -> None:
         from psycopg import connect
