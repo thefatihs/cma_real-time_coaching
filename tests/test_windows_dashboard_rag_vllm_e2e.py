@@ -1895,10 +1895,157 @@ def _windows_process_observations_from_payload(
         subject.subprocess,
         "run",
         lambda arguments, **_kwargs: subprocess.CompletedProcess(
-            arguments, 0, stdout=json.dumps(payload), stderr=""
+            arguments, 0, stdout=json.dumps(payload).encode("utf-8"), stderr=b""
         ),
     )
     return subject._ProductionLifecycle._windows_process_observations()
+
+
+def test_windows_process_observations_use_bounded_binary_utf8_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        captured.update(kwargs)
+        captured["command"] = arguments[-1]
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=json.dumps(
+                _wmi_row(1, 0, executable_path="C:/sentetik/çalıştırıcı.exe")
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "powershell.exe")
+    monkeypatch.setattr(subject.subprocess, "run", run)
+
+    observations = subject._ProductionLifecycle._windows_process_observations()
+
+    assert observations[0].process_id == 1
+    assert captured["text"] is False
+    assert captured["capture_output"] is True
+    assert "UTF8Encoding" in str(captured["command"])
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr"),
+    [
+        (b"\x81", b""),
+        (b"{}", b"\x81private-secret"),
+    ],
+)
+def test_windows_process_observations_reject_malformed_or_oversized_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stdout: bytes,
+    stderr: bytes,
+) -> None:
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "powershell.exe")
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout=stdout, stderr=stderr
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        subject._ProductionLifecycle._windows_process_observations()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert "private-secret" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("oversized_stream", ["stdout", "stderr"])
+def test_windows_process_observations_reject_oversized_output(
+    monkeypatch: pytest.MonkeyPatch, oversized_stream: str
+) -> None:
+    stdout = b"{}"
+    stderr = b""
+    oversized = b"x" * (subject._MAX_WMI_OUTPUT_BYTES + 1)
+    if oversized_stream == "stdout":
+        stdout = oversized
+    else:
+        stderr = oversized
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "powershell.exe")
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout=stdout, stderr=stderr
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        subject._ProductionLifecycle._windows_process_observations()
+
+
+def test_windows_process_observations_reject_nonzero_exit_without_output_leak(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "powershell.exe")
+
+    def run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.CalledProcessError(1, ["powershell"], b"\x81", b"secret")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        subject._ProductionLifecycle._windows_process_observations()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_malformed_wmi_bytes_emit_fixed_ownership_phase_and_cleanup_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    cleanup_count = 0
+    monkeypatch.setattr(subject.shutil, "which", lambda _name: "powershell.exe")
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments, 0, stdout=b"\x81", stderr=b"private-secret"
+        ),
+    )
+
+    class Operations:
+        def run_phase(self, phase: str) -> None:
+            assert phase == "E_POSTGRES_START"
+            subject._ProductionLifecycle._postgres_startup_call(
+                subject.E_POSTGRES_OWNERSHIP,
+                subject._ProductionLifecycle._windows_process_observations,
+            )
+
+        def cleanup(self) -> None:
+            nonlocal cleanup_count
+            cleanup_count += 1
+
+    run_postgres_startup_only = subject.run_postgres_startup_only
+    monkeypatch.setattr(
+        subject,
+        "run_postgres_startup_only",
+        lambda: run_postgres_startup_only(
+            environment=values, operations_factory=lambda _config: Operations()
+        ),
+    )
+
+    assert subject.main(["--postgres-startup-only"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == f"{subject.E_POSTGRES_OWNERSHIP}\n"
+    assert captured.err == ""
+    assert "private-secret" not in captured.out + captured.err
+    assert "Traceback" not in captured.out + captured.err
+    assert cleanup_count == 1
 
 
 def _wmi_row(
@@ -2324,9 +2471,9 @@ def test_production_cleanup_requests_graceful_service_signal_only(
 
     def run(
         arguments: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         commands.append(arguments)
-        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subject.subprocess, "run", run)
     _fake_process_tables(monkeypatch, lifecycle, process)
@@ -2366,7 +2513,7 @@ def test_graceful_signal_waits_for_tls_root_and_python_wrapper_exit(
         subject.subprocess,
         "run",
         lambda arguments, **_kwargs: subprocess.CompletedProcess(
-            arguments, 0, stdout="", stderr=""
+            arguments, 0, stdout=b"", stderr=b""
         ),
     )
     lifecycle._protected_resources = {
@@ -2400,9 +2547,11 @@ def test_remaining_exact_project_resource_fails_cleanup(
 
     def run(
         arguments: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         output = "residue" if arguments[1] == resource else ""
-        return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
+        return subprocess.CompletedProcess(
+            arguments, 0, stdout=output.encode("ascii"), stderr=b""
+        )
 
     monkeypatch.setattr(subject.subprocess, "run", run)
     _fake_process_tables(monkeypatch, lifecycle, process)
@@ -2431,7 +2580,7 @@ def test_remaining_handoff_fails_cleanup(
         subject.subprocess,
         "run",
         lambda arguments, **_kwargs: subprocess.CompletedProcess(
-            arguments, 0, stdout="", stderr=""
+            arguments, 0, stdout=b"", stderr=b""
         ),
     )
     _fake_process_tables(monkeypatch, lifecycle, process)
@@ -2690,7 +2839,7 @@ def test_remaining_owned_process_after_fallback_fails_cleanup(
         subject.subprocess,
         "run",
         lambda arguments, **_kwargs: subprocess.CompletedProcess(
-            arguments, 0, stdout="", stderr=""
+            arguments, 0, stdout=b"", stderr=b""
         ),
     )
 
@@ -2725,9 +2874,9 @@ def test_owned_process_tree_is_terminated_descendant_first(
 
     def run(
         arguments: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         terminated.append(int(arguments[2]))
-        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subject.subprocess, "run", run)
     lifecycle._terminate_owned_process_tree(
@@ -2755,13 +2904,13 @@ def test_marker_cleanup_rediscovers_and_terminates_reparented_processes_deepest_
 
     def run(
         arguments: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         process_id = int(arguments[2])
         terminated.append(process_id)
         active.pop(process_id)
         if process_id == 32448:
             active[777] = 6052
-        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subject.subprocess, "run", run)
 
@@ -2857,9 +3006,9 @@ def test_owned_descendants_are_terminated_after_root_disappears(
 
     def run(
         arguments: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         terminated.append(int(arguments[2]))
-        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subject.subprocess, "run", run)
 

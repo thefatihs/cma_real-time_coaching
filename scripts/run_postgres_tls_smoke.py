@@ -24,6 +24,7 @@ APPLICATION_USER = "callmetric_tls_application"
 LOOPBACK_HOST = "127.0.0.1"
 TLS_HOST = "localhost"
 HEALTH_TIMEOUT_SECONDS = 60.0
+MAX_SUBPROCESS_OUTPUT_BYTES = 1_048_576
 PROJECT_NAME_PATTERN = re.compile(r"^callmetric-pgvector-tls-[0-9]+-[a-f0-9]{12}$")
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -53,16 +54,36 @@ def _run(
     *,
     environment: dict[str, str] | None = None,
     capture_output: bool = False,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+) -> subprocess.CompletedProcess[bytes]:
+    result = subprocess.run(
         arguments,
         check=True,
         cwd=REPOSITORY_ROOT,
         env=environment,
-        text=True,
+        text=False,
         capture_output=capture_output,
         shell=False,
     )
+    if (
+        capture_output
+        and max(len(result.stdout or b""), len(result.stderr or b""))
+        > MAX_SUBPROCESS_OUTPUT_BYTES
+    ):
+        raise TLSSmokeRunError(_FIXED_FAILURE)
+    return result
+
+
+def _decoded_output(
+    result: subprocess.CompletedProcess[bytes], *, encoding: str
+) -> str:
+    stdout = result.stdout or b""
+    stderr = result.stderr or b""
+    if max(len(stdout), len(stderr)) > MAX_SUBPROCESS_OUTPUT_BYTES:
+        raise TLSSmokeRunError(_FIXED_FAILURE)
+    try:
+        return stdout.decode(encoding, errors="strict")
+    except UnicodeError:
+        raise TLSSmokeRunError(_FIXED_FAILURE) from None
 
 
 def _compose_arguments(
@@ -185,7 +206,7 @@ def _container_id(
         environment=environment,
         capture_output=True,
     )
-    container_id = result.stdout.strip()
+    container_id = _decoded_output(result, encoding="ascii").strip()
     if not container_id:
         return None
     if "\n" in container_id or "\r" in container_id:
@@ -209,8 +230,8 @@ def _wait_until_healthy(
             capture_output=True,
         )
         try:
-            state = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
+            state = json.loads(_decoded_output(result, encoding="utf-8"))
+        except (json.JSONDecodeError, TLSSmokeRunError) as error:
             raise TLSSmokeRunError(_FIXED_FAILURE) from error
         if not isinstance(state, dict):
             raise TLSSmokeRunError(_FIXED_FAILURE)
@@ -233,7 +254,7 @@ def _published_port(
         environment=environment,
         capture_output=True,
     )
-    endpoint = result.stdout.strip()
+    endpoint = _decoded_output(result, encoding="ascii").strip()
     if endpoint.count(":") != 1:
         raise TLSSmokeRunError(_FIXED_FAILURE)
     host, raw_port = endpoint.split(":", maxsplit=1)
@@ -336,7 +357,7 @@ def _require_no_project_resources(docker: str, project_name: str) -> None:
             ],
             capture_output=True,
         )
-        if result.stdout.strip():
+        if _decoded_output(result, encoding="ascii").strip():
             raise TLSSmokeRunError(_FIXED_FAILURE)
 
 

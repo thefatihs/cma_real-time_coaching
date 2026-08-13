@@ -1008,7 +1008,7 @@ def _stub_bounded_lifecycle(
         environment: dict[str, str] | None = None,
         capture_output: bool = True,
         timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         del environment, capture_output
         rendered = " ".join(arguments)
         calls.append((rendered, timeout))
@@ -1019,7 +1019,7 @@ def _stub_bounded_lifecycle(
                 output="synthetic-secret-output",
                 stderr="postgresql://synthetic-secret",
             )
-        return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subject, "_run_command", run_command)
     return calls
@@ -1027,6 +1027,52 @@ def _stub_bounded_lifecycle(
 
 def _timeout_for(calls: list[tuple[str, float]], marker: str) -> float:
     return next(timeout for rendered, timeout in calls if marker in rendered)
+
+
+def test_output_uses_strict_bounded_caller_thread_decoding(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        subject,
+        "_run_command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            ["synthetic"], 0, stdout=b"\x81", stderr=b"private-secret"
+        ),
+    )
+    with pytest.raises(subject.PostgreSQLTLSServiceError):
+        subject._output(["synthetic"], encoding="utf-8")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_run_command_uses_binary_mode_and_rejects_oversized_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
+    subject._run_command(["synthetic"], capture_output=True, timeout=1.0)
+    assert captured["text"] is False
+
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=b"x" * (subject.MAX_SUBPROCESS_OUTPUT_BYTES + 1),
+            stderr=b"private-secret",
+        ),
+    )
+    with pytest.raises(ValueError):
+        subject._run_command(["synthetic"], capture_output=True, timeout=1.0)
 
 
 def test_phase_specific_subprocess_timeout_mapping(

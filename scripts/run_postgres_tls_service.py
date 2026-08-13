@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-import csv
-import io
 import json
 import math
 import os
@@ -49,6 +47,7 @@ OWNER_MARKER_PATTERN = re.compile(r"^callmetric-owner-[0-9a-f]{32}$")
 HANDOFF_PATTERN = re.compile(r"^callmetric-postgres-tls-[a-z0-9_]{8}$")
 HANDOFF_FILES = frozenset({"application.dsn", "ca.crt", "connection.json"})
 MAX_HANDOFF_FILE_BYTES = 65_536
+MAX_SUBPROCESS_OUTPUT_BYTES = 1_048_576
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 DOCKER_NETWORK_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 DOCKER_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -115,17 +114,24 @@ def _run_command(
     environment: dict[str, str] | None = None,
     capture_output: bool = True,
     timeout: float,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+) -> subprocess.CompletedProcess[bytes]:
+    result = subprocess.run(
         arguments,
         check=True,
         cwd=REPOSITORY_ROOT,
         env=environment,
-        text=True,
+        text=False,
         capture_output=capture_output,
         shell=False,
         timeout=timeout,
     )
+    if (
+        capture_output
+        and max(len(result.stdout or b""), len(result.stderr or b""))
+        > MAX_SUBPROCESS_OUTPUT_BYTES
+    ):
+        raise ValueError
+    return result
 
 
 def _output(
@@ -133,15 +139,21 @@ def _output(
     *,
     environment: dict[str, str] | None = None,
     timeout: float = VALIDATION_TIMEOUT_SECONDS,
+    encoding: str = "ascii",
 ) -> str:
     try:
-        return _run_command(
+        result = _run_command(
             arguments,
             environment=environment,
             capture_output=True,
             timeout=timeout,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError) as error:
+        )
+        stdout = result.stdout or b""
+        stderr = result.stderr or b""
+        if max(len(stdout), len(stderr)) > MAX_SUBPROCESS_OUTPUT_BYTES:
+            raise ValueError
+        return stdout.decode(encoding, errors="strict").strip()
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
         raise PostgreSQLTLSServiceError() from error
 
 
@@ -154,7 +166,7 @@ def _bounded_smoke_runner(timeout: float) -> Iterator[None]:
         *,
         environment: dict[str, str] | None = None,
         capture_output: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         return _run_command(
             arguments,
             environment=environment,
@@ -226,7 +238,10 @@ def _validate_repository() -> None:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
     if _output(["git", "rev-parse", f"origin/{expected_branch}"]) != expected_head:
         raise PostgreSQLTLSServiceError(phase=E_REPOSITORY)
-    raw = _output(["git", "status", "--porcelain", "-z", "--untracked-files=all"])
+    raw = _output(
+        ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+        encoding="utf-8",
+    )
     records = [record for record in raw.split("\0") if record]
     observed = {record[3:] for record in records if record.startswith("?? ")}
     if len(records) != len(observed) or observed not in (
@@ -291,7 +306,8 @@ def _network_inventory(
     seen_ids: set[str] = set()
     seen_names: set[str] = set()
     for line in _output(
-        [docker, "network", "ls", "--no-trunc", "--format", "{{json .}}"]
+        [docker, "network", "ls", "--no-trunc", "--format", "{{json .}}"],
+        encoding="utf-8",
     ).splitlines():
         try:
             row = json.loads(line)
@@ -322,7 +338,15 @@ def _network_inventory(
         try:
             inspected = json.loads(
                 _output(
-                    [docker, "network", "inspect", "--format", "{{json .}}", network_id]
+                    [
+                        docker,
+                        "network",
+                        "inspect",
+                        "--format",
+                        "{{json .}}",
+                        network_id,
+                    ],
+                    encoding="utf-8",
                 )
             )
         except (TypeError, ValueError):
@@ -671,17 +695,36 @@ def _restrict_owner(path: Path, *, directory: bool) -> None:
         return
     permission = "(OI)(CI)F" if directory else "F"
     try:
-        identity = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"],
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if powershell is None:
+            raise PostgreSQLTLSServiceError(phase=E_HANDOFF)
+        identity_result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::OutputEncoding = "
+                "[System.Text.UTF8Encoding]::new($false); "
+                "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+            ],
             check=True,
             cwd=REPOSITORY_ROOT,
-            text=True,
+            text=False,
             capture_output=True,
             shell=False,
             timeout=IDENTITY_ACL_TIMEOUT_SECONDS,
-        ).stdout
-        row = next(csv.reader(io.StringIO(identity)))
-        if len(row) != 2 or not row[1].startswith("S-"):
+        )
+        identity_bytes = identity_result.stdout or b""
+        identity_stderr = identity_result.stderr or b""
+        if (
+            len(identity_bytes) > 256
+            or len(identity_stderr) > MAX_SUBPROCESS_OUTPUT_BYTES
+            or identity_stderr
+        ):
+            raise PostgreSQLTLSServiceError(phase=E_HANDOFF)
+        identity = identity_bytes.decode("ascii", errors="strict").strip()
+        if not re.fullmatch(r"S-[0-9-]{3,184}", identity):
             raise PostgreSQLTLSServiceError(phase=E_HANDOFF)
         subprocess.run(
             [
@@ -689,11 +732,11 @@ def _restrict_owner(path: Path, *, directory: bool) -> None:
                 str(path),
                 "/inheritance:r",
                 "/grant:r",
-                f"*{row[1]}:{permission}",
+                f"*{identity}:{permission}",
             ],
             check=True,
             cwd=REPOSITORY_ROOT,
-            text=True,
+            text=False,
             capture_output=True,
             shell=False,
             timeout=IDENTITY_ACL_TIMEOUT_SECONDS,

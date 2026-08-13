@@ -66,6 +66,9 @@ POLL_INTERVAL_SECONDS = 0.2
 ORCHESTRATION_MARGIN_SECONDS = 60.0
 MINIMUM_E2E_OUTPUT_TOKENS = 256
 OWNER_MARKER_PATTERN = re.compile(r"^callmetric-owner-[0-9a-f]{32}$")
+_MAX_GIT_OUTPUT_BYTES = 65_536
+_MAX_WMI_OUTPUT_BYTES = 4_194_304
+_MAX_RESOURCE_OUTPUT_BYTES = 65_536
 
 PREFLIGHT_OK = "PREFLIGHT_OK"
 E2E_OK = "E2E_OK"
@@ -486,16 +489,19 @@ def _read_json(path_value: str, expected: frozenset[str]) -> dict[str, object]:
 
 def _git_output(arguments: list[str]) -> str:
     try:
-        return subprocess.run(
+        result = subprocess.run(
             ["git", *arguments],
             cwd=REPOSITORY_ROOT,
             check=True,
             capture_output=True,
-            text=True,
+            text=False,
             shell=False,
             timeout=10,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        )
+        if max(len(result.stdout), len(result.stderr)) > _MAX_GIT_OUTPUT_BYTES:
+            raise ValueError
+        return result.stdout.decode("utf-8", errors="strict").strip()
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
         raise DashboardRAGVLLME2EError("E_PREFLIGHT") from None
 
 
@@ -1746,6 +1752,9 @@ class _ProductionLifecycle:
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
+                "[Console]::OutputEncoding = "
+                "[System.Text.UTF8Encoding]::new($false); "
+                "$OutputEncoding = [Console]::OutputEncoding; "
                 "Get-CimInstance Win32_Process | ForEach-Object { "
                 "[PSCustomObject]@{ProcessId=$_.ProcessId;"
                 "ParentProcessId=$_.ParentProcessId;"
@@ -1757,11 +1766,19 @@ class _ProductionLifecycle:
             cwd=REPOSITORY_ROOT,
             check=True,
             capture_output=True,
-            text=True,
+            text=False,
             shell=False,
             timeout=30,
         )
-        payload = json.loads(result.stdout)
+        if (
+            max(len(result.stdout), len(result.stderr)) > _MAX_WMI_OUTPUT_BYTES
+            or result.stderr
+        ):
+            raise RuntimeError
+        try:
+            payload = json.loads(result.stdout.decode("utf-8", errors="strict"))
+        except (UnicodeError, ValueError):
+            raise RuntimeError from None
         rows = payload if isinstance(payload, list) else [payload]
         observations: list[_WindowsProcessObservation] = []
         seen: set[int] = set()
@@ -2009,15 +2026,20 @@ class _ProductionLifecycle:
                 )
                 return
             try:
-                subprocess.run(
+                result = subprocess.run(
                     [taskkill_path(), "/PID", str(process_id), "/F"],
                     cwd=REPOSITORY_ROOT,
                     check=True,
                     capture_output=True,
-                    text=True,
+                    text=False,
                     shell=False,
                     timeout=30,
                 )
+                if (
+                    max(len(result.stdout or b""), len(result.stderr or b""))
+                    > _MAX_RESOURCE_OUTPUT_BYTES
+                ):
+                    raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
             except BaseException:
                 observed = observe()
                 if process_id not in observed:
@@ -2096,15 +2118,20 @@ class _ProductionLifecycle:
                 owned, key=lambda item: (depth(item), item), reverse=True
             ):
                 try:
-                    subprocess.run(
+                    result = subprocess.run(
                         [taskkill, "/PID", str(process_id), "/F"],
                         cwd=REPOSITORY_ROOT,
                         check=True,
                         capture_output=True,
-                        text=True,
+                        text=False,
                         shell=False,
                         timeout=30,
                     )
+                    if (
+                        max(len(result.stdout or b""), len(result.stderr or b""))
+                        > _MAX_RESOURCE_OUTPUT_BYTES
+                    ):
+                        raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
                 except BaseException:
                     if process_id in self._discover_marker_processes():
                         raise _CleanupPhaseError(E_CLEANUP_PROCESS_ACTION) from None
@@ -2202,13 +2229,19 @@ class _ProductionLifecycle:
                     cwd=REPOSITORY_ROOT,
                     check=True,
                     capture_output=True,
-                    text=True,
+                    text=False,
                     shell=False,
                     timeout=30,
                 )
             except BaseException:
                 raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
-            if result.stdout.strip():
+            if max(len(result.stdout), len(result.stderr)) > _MAX_RESOURCE_OUTPUT_BYTES:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE)
+            try:
+                output = result.stdout.decode("ascii", errors="strict").strip()
+            except UnicodeError:
+                raise _CleanupPhaseError(E_CLEANUP_UNVERIFIABLE) from None
+            if output:
                 raise _CleanupPhaseError(E_CLEANUP_PROJECT_VERIFY)
         if self._handoff is not None and os.path.lexists(self._handoff):
             raise _CleanupPhaseError(E_CLEANUP_HANDOFF_VERIFY)

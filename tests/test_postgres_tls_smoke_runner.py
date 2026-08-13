@@ -12,8 +12,62 @@ def _completed(
     arguments: list[str],
     *,
     stdout: str = "",
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(arguments, 0, stdout=stdout, stderr="")
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.CompletedProcess(
+        arguments, 0, stdout=stdout.encode("utf-8"), stderr=b""
+    )
+
+
+def test_run_uses_binary_mode_and_bounds_captured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run(
+        arguments: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subject.subprocess, "run", run)
+    subject._run(["synthetic"], capture_output=True)
+    assert captured["text"] is False
+
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        lambda arguments, **_kwargs: subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=b"x" * (subject.MAX_SUBPROCESS_OUTPUT_BYTES + 1),
+            stderr=b"private-secret",
+        ),
+    )
+    with pytest.raises(subject.TLSSmokeRunError, match="^PostgreSQL TLS smoke failed$"):
+        subject._run(["synthetic"], capture_output=True)
+
+
+@pytest.mark.parametrize("payload", [b"\x81", b"private-secret\x81"])
+def test_decoded_output_rejects_malformed_bytes_without_leak(
+    payload: bytes, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = subprocess.CompletedProcess(["synthetic"], 0, stdout=payload, stderr=b"")
+    with pytest.raises(subject.TLSSmokeRunError, match="^PostgreSQL TLS smoke failed$"):
+        subject._decoded_output(result, encoding="utf-8")
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_decoded_output_accepts_explicit_utf8_and_ascii() -> None:
+    utf8 = subprocess.CompletedProcess(
+        ["synthetic"], 0, stdout='{"durum":"sağlıklı"}'.encode("utf-8"), stderr=b""
+    )
+    ascii_result = subprocess.CompletedProcess(
+        ["synthetic"], 0, stdout=b"127.0.0.1:54321", stderr=b""
+    )
+    assert "sağlıklı" in subject._decoded_output(utf8, encoding="utf-8")
+    assert subject._decoded_output(ascii_result, encoding="ascii") == "127.0.0.1:54321"
 
 
 class _DeterministicCommandRunner:
@@ -28,7 +82,7 @@ class _DeterministicCommandRunner:
         *,
         environment: dict[str, str] | None = None,
         capture_output: bool = False,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> subprocess.CompletedProcess[bytes]:
         del capture_output
         self.calls.append((arguments, environment))
         rendered = " ".join(arguments)
