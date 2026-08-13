@@ -93,7 +93,7 @@ def environment(tmp_path: Path) -> dict[str, str]:
         subject.POLICY_ENV: str(policy),
         subject.TOKEN_ENV: "synthetic-private-token",
         subject.CA_ENV: str(ca),
-        subject.TTL_ENV: "300",
+        subject.TTL_ENV: "7200",
         "CALLMETRIC_VLLM_BASE_URL": "https://localhost:9443/v1",
         "CALLMETRIC_VLLM_MODEL_ID": "synthetic-served-model",
         "CALLMETRIC_VLLM_CONNECT_TIMEOUT_SECONDS": "5",
@@ -775,6 +775,70 @@ def test_unsafe_configuration_fails_closed(
     values[key] = value
     with pytest.raises(subject.DashboardRAGVLLME2EError, match="^E_PREFLIGHT$"):
         subject.preflight(values)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "True",
+        "+7200",
+        "-7200",
+        " 7200",
+        "7200 ",
+        "07200",
+        "300",
+        "600",
+        "1679",
+        "1680",
+        "7199",
+        "7201",
+    ],
+)
+def test_full_preflight_requires_exact_canonical_maximum_postgres_ttl(
+    value: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    if value is None:
+        values.pop(subject.TTL_ENV)
+    else:
+        values[subject.TTL_ENV] = value
+
+    with pytest.raises(subject.DashboardRAGVLLME2EError, match="^E_PREFLIGHT$"):
+        subject.preflight(values)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_full_preflight_preserves_exact_maximum_postgres_ttl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+
+    config = subject.preflight(values)
+
+    assert values[subject.TTL_ENV] == "7200"
+    assert config.ttl_seconds == subject.FULL_E2E_TTL_SECONDS == 7_200
+
+
+@pytest.mark.parametrize("ttl", [300, 600, 1_680, 7_199, 7_200])
+def test_postgres_startup_only_preflight_retains_independent_ttl_range(
+    ttl: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prepare_preflight(monkeypatch, tmp_path)
+    values = environment(tmp_path)
+    values[subject.TTL_ENV] = str(ttl)
+
+    config = subject.postgres_preflight(values)
+
+    assert config.ttl_seconds == ttl
 
 
 @pytest.mark.parametrize("labels", [["urun_bilgisi"], ["no_action"]])

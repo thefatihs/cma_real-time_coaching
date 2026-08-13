@@ -61,6 +61,7 @@ COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 MINIMUM_TTL_SECONDS = 300
 MAXIMUM_TTL_SECONDS = 7_200
+FULL_E2E_TTL_SECONDS = MAXIMUM_TTL_SECONDS
 DOCUMENT_POLL_TIMEOUT_SECONDS = 300.0
 POLL_INTERVAL_SECONDS = 0.2
 ORCHESTRATION_MARGIN_SECONDS = 60.0
@@ -697,6 +698,8 @@ def _postgres_preflight(
 def _preflight(environment: Mapping[str, str] | None = None) -> ControllerConfig:
     source = os.environ if environment is None else environment
     postgres = _postgres_preflight(source)
+    if source.get(TTL_ENV) != str(FULL_E2E_TTL_SECONDS):
+        raise DashboardRAGVLLME2EError("E_PREFLIGHT")
     provider = KnowledgeBaseRAGProviderSettings.model_validate(
         _read_json(
             _required(source, PROVIDER_ENV),
