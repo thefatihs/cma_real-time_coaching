@@ -6,9 +6,8 @@ from collections import deque
 from threading import Condition, Event, Thread, get_ident
 import socket
 import sys
+from typing import Any, cast
 
-import av
-import numpy as np
 import pytest
 from scripts import run_local_microphone_relay_client as relay_client_app
 
@@ -42,11 +41,11 @@ from app.audio_ingress.tcp_microphone_relay import (
 from app.events.models import AudioChunkEvent
 from scripts.run_local_microphone_relay_client import (
     BoundedRelaySender,
-    RelayCaptureSession,
+    NativeRelayCapture,
     RelayClientConfig,
     RelayClientSession,
     RelayClientStatus,
-    relay_capture_should_be_mounted,
+    _relay_failure_message,
     retained_relay_client_session,
     reset_terminal_relay_client_session,
 )
@@ -423,6 +422,82 @@ class TimeoutSocket:
 
     def close(self) -> None:
         self.closed += 1
+
+
+class PreStartSocket:
+    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+        self._chunks = deque(chunks)
+        self.closed = 0
+        self.sent: list[bytes] = []
+        self.timeouts: list[float] = []
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+
+    def recv(self, size: int) -> bytes:
+        assert size <= 4_096
+        if self._chunks:
+            return self._chunks.popleft()
+        raise TimeoutError
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_pre_start_timeout_records_recv_call_with_zero_received_bytes() -> None:
+    _resource, _session, receiver = session_and_receiver()
+    client = PreStartSocket(())
+
+    receiver.serve_connected_socket(client)  # type: ignore[arg-type]
+
+    diagnostics = receiver.pre_start_diagnostics
+    assert diagnostics.recv_call_count_before_start == 1
+    assert diagnostics.received_byte_count_before_start == 0
+    assert diagnostics.parsed_record_count_before_start == 0
+    assert receiver.last_failure_reason is RelayReason.IO_TIMEOUT
+    assert client.timeouts == [RELAY_IO_TIMEOUT_SECONDS, RELAY_IO_TIMEOUT_SECONDS]
+
+
+def test_partial_start_records_bytes_without_parsed_record_before_timeout() -> None:
+    _resource, _session, receiver = session_and_receiver()
+    partial_start = start_record()[:7]
+    client = PreStartSocket((partial_start,))
+
+    receiver.serve_connected_socket(client)  # type: ignore[arg-type]
+
+    diagnostics = receiver.pre_start_diagnostics
+    assert diagnostics.recv_call_count_before_start == 2
+    assert diagnostics.received_byte_count_before_start == len(partial_start)
+    assert diagnostics.parsed_record_count_before_start == 0
+    assert receiver.last_failure_reason is RelayReason.IO_TIMEOUT
+    assert client.timeouts == [RELAY_IO_TIMEOUT_SECONDS, RELAY_IO_TIMEOUT_SECONDS]
+
+
+def test_complete_start_counts_one_record_then_stops_pre_start_counters() -> None:
+    _resource, _session, receiver = session_and_receiver()
+    complete_start = start_record()
+    client = PreStartSocket((complete_start,))
+
+    receiver.serve_connected_socket(client)  # type: ignore[arg-type]
+
+    diagnostics = receiver.pre_start_diagnostics
+    assert diagnostics.recv_call_count_before_start == 1
+    assert diagnostics.received_byte_count_before_start == len(complete_start)
+    assert diagnostics.parsed_record_count_before_start == 1
+    assert receiver.start_validated
+    assert response_reason(client.sent[0]) == (
+        RelayMessageType.ACK,
+        RelayReason.STARTED,
+    )
+    assert client.timeouts == [
+        RELAY_IO_TIMEOUT_SECONDS,
+        RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS,
+        RELAY_IO_TIMEOUT_SECONDS,
+    ]
+    assert TOKEN not in repr(diagnostics)
 
 
 class ListenerTimeoutSocket:
@@ -878,6 +953,28 @@ class AckSocket:
         self._release.set()
 
 
+class FakeNativeStream:
+    def __init__(self) -> None:
+        self.started = 0
+        self.stopped = 0
+        self.closed = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def native_capture(sender: BoundedRelaySender) -> NativeRelayCapture:
+    return NativeRelayCapture(
+        sender, stream_factory=lambda _callback: FakeNativeStream()
+    )
+
+
 def client_config() -> RelayClientConfig:
     return RelayClientConfig(
         tenant_id="tenant_alpha",
@@ -1017,7 +1114,7 @@ def test_terminal_client_session_can_reset_and_retry_without_restart() -> None:
     failed_sender.fail(RelayReason.CONNECTION_CLOSED)
     failed_session = RelayClientSession(
         sender=failed_sender,
-        capture=RelayCaptureSession(failed_sender),
+        capture=native_capture(failed_sender),
     )
     session_state: dict[str, object] = {
         "relay_client_session": failed_session,
@@ -1033,7 +1130,7 @@ def test_terminal_client_session_can_reset_and_retry_without_restart() -> None:
     )
     retry_session = RelayClientSession(
         sender=retry_sender,
-        capture=RelayCaptureSession(retry_sender),
+        capture=native_capture(retry_sender),
     )
     session_state["relay_client_session"] = retry_session
 
@@ -1056,9 +1153,11 @@ def test_streamlit_rerun_recognizes_session_and_renders_without_second_sender(
         client_config(),
         socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
     )
+    stream = FakeNativeStream()
+    capture = NativeRelayCapture(sender, stream_factory=lambda _callback: stream)
     retained = RelayClientSession(
         sender=sender,
-        capture=RelayCaptureSession(sender),
+        capture=capture,
     )
     assert sender.start()
     connection.wait_for_records(1)
@@ -1087,6 +1186,8 @@ def test_streamlit_rerun_recognizes_session_and_renders_without_second_sender(
             self.infos: list[str] = []
             self.captions: list[str] = []
             self.connect_disabled: bool | None = None
+            self.start_microphone_clicks = 0
+            self.reruns = 0
 
         def set_page_config(self, **_kwargs: object) -> None:
             return None
@@ -1109,7 +1210,17 @@ def test_streamlit_rerun_recognizes_session_and_renders_without_second_sender(
         def button(self, label: str, **kwargs: object) -> bool:
             if label == "Connect / Start":
                 self.connect_disabled = bool(kwargs["disabled"])
+            if (
+                label == "Mikrofonu Başlat"
+                and not bool(kwargs["disabled"])
+                and self.start_microphone_clicks == 0
+            ):
+                self.start_microphone_clicks += 1
+                return True
             return False
+
+        def rerun(self) -> None:
+            self.reruns += 1
 
         def info(self, value: str) -> None:
             self.infos.append(value)
@@ -1124,93 +1235,211 @@ def test_streamlit_rerun_recognizes_session_and_renders_without_second_sender(
             return [Column() for _index in range(count)]
 
     fake_streamlit = FakeStreamlit()
-    mounted: list[object] = []
     monkeypatch.setitem(sys.modules, "streamlit", fake_streamlit)  # type: ignore[arg-type]
-    monkeypatch.setattr(
-        relay_client_app,
-        "microphone_webrtc_streamer",
-        lambda *, session, **_kwargs: mounted.append(session),
-    )
 
+    relay_client_app.render()
     relay_client_app.render()
 
     assert fake_streamlit.connect_disabled is True
     assert not fake_streamlit.infos
     assert ("Durum", RelayClientStatus.CONNECTING.value) in fake_streamlit.metrics
-    assert mounted == [retained.capture]
-    assert (
-        RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED
-        in retained.sender.progress_stages
-    )
     assert any("Yapılandırma doğrulandı" in value for value in fake_streamlit.captions)
     assert len(connection.records) == 1
     connection.release()
-    sender.close()
-
-
-def test_webrtc_capture_callback_only_normalizes_and_enqueues() -> None:
-    connection = AckSocket(block_type=RelayMessageType.AUDIO)
-    sender = BoundedRelaySender(
-        client_config(),
-        socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
-    )
-    capture = RelayCaptureSession(sender)
-    sender.start()
-    connection.wait_for_records(1)
     wait_for_client_status(sender, RelayClientStatus.STREAMING)
-    frame = av.AudioFrame.from_ndarray(
-        np.zeros((1, 32_000), dtype=np.int16),
-        format="s16",
-        layout="mono",
-    )
-    frame.sample_rate = 16_000
-    callback_thread = get_ident()
-
-    assert capture.accept_frame(frame) is frame
-    connection.wait_for_records(2)
-
-    assert callback_thread not in connection.send_threads
-    assert getattr(connection.records[1], "message_type") is RelayMessageType.AUDIO
-    connection.release()
-    sender.close()
+    relay_client_app.render()
+    relay_client_app.render()
+    for _attempt in range(1_000):
+        if stream.started == 1:
+            break
+        Event().wait(0.001)
+    assert stream.started == 1
+    assert fake_streamlit.start_microphone_clicks == 1
+    assert len(connection.records) == 1
+    retained.close()
 
 
-def test_connecting_mounts_capture_but_drops_frames_until_streaming() -> None:
+def test_native_capture_opens_after_start_ack_and_callback_queues_audio() -> None:
     connection = AckSocket(block_type=RelayMessageType.START)
     sender = BoundedRelaySender(
         client_config(),
         socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
     )
-    capture = RelayCaptureSession(sender)
-    frame = av.AudioFrame.from_ndarray(
-        np.zeros((1, 32_000), dtype=np.int16),
-        format="s16",
-        layout="mono",
+    stream = FakeNativeStream()
+    callbacks: list[Callable[[object, int, object, object], None]] = []
+    capture = NativeRelayCapture(
+        sender,
+        stream_factory=lambda callback: callbacks.append(callback) or stream,
     )
-    frame.sample_rate = 16_000
-
     assert sender.start()
     connection.wait_for_records(1)
     assert sender.diagnostics.status is RelayClientStatus.CONNECTING
-    assert relay_capture_should_be_mounted(RelayClientStatus.CONNECTING)
-    assert relay_capture_should_be_mounted(RelayClientStatus.STREAMING)
-    assert not relay_capture_should_be_mounted(RelayClientStatus.PAUSED)
-    assert (
-        RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED
-        not in sender.progress_stages
-    )
-    assert capture.accept_frame(frame) is frame
-    assert (
-        RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED
-        in sender.progress_stages
-    )
+    assert stream.started == 0
+    assert not callbacks
     assert len(connection.records) == 1
 
     connection.release()
     wait_for_client_status(sender, RelayClientStatus.STREAMING)
-    assert capture.accept_frame(frame) is frame
+    assert not capture.started
+    assert capture.start()
+    for _attempt in range(1_000):
+        if callbacks and stream.started == 1:
+            break
+        Event().wait(0.001)
+    assert RelayClientProgressStage.START_ACKNOWLEDGED in sender.progress_stages
+    assert capture.opened
+    assert capture.device_label is not None
+    assert RelayClientProgressStage.NATIVE_MICROPHONE_OPENED in sender.progress_stages
+    assert (
+        sender.progress_stages.count(RelayClientProgressStage.NATIVE_MICROPHONE_OPENED)
+        == 1
+    )
+    assert (
+        RelayClientProgressStage.FIRST_NATIVE_AUDIO_BLOCK_RECEIVED
+        not in sender.progress_stages
+    )
+    callback_thread = get_ident()
+    callbacks[0](b"\1\0" * 32_000, 32_000, object(), object())
     connection.wait_for_records(2)
+    assert callback_thread not in connection.send_threads
     assert getattr(connection.records[1], "message_type") is RelayMessageType.AUDIO
+    assert len(getattr(connection.records[1], "payload")) == LOCAL_MIC_CHUNK_BYTES
+    wait_for_client_status(sender, RelayClientStatus.STREAMING)
+    assert sender.diagnostics.sent_chunk_count == 1
+    assert sender.diagnostics.acknowledged_chunk_count == 1
+    assert (
+        RelayClientProgressStage.FIRST_NATIVE_AUDIO_BLOCK_RECEIVED
+        in sender.progress_stages
+    )
+    capture.close()
+    assert not capture.opened
+    sender.close()
+
+
+@pytest.mark.parametrize(
+    ("factory", "reason"),
+    [
+        (
+            lambda _callback: (_ for _ in ()).throw(LookupError()),
+            RelayReason.MICROPHONE_UNAVAILABLE,
+        ),
+        (
+            lambda _callback: (_ for _ in ()).throw(
+                RuntimeError("raw PortAudio device failure")
+            ),
+            RelayReason.MICROPHONE_OPEN_FAILED,
+        ),
+    ],
+)
+def test_native_microphone_open_failures_are_sanitized(
+    factory: Callable[[Callable[[object, int, object, object], None]], object],
+    reason: RelayReason,
+) -> None:
+    connection = AckSocket()
+    sender = BoundedRelaySender(
+        client_config(),
+        socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
+    )
+    capture = NativeRelayCapture(sender, stream_factory=cast(Any, factory))
+
+    sender.start()
+    connection.wait_for_records(1)
+    wait_for_client_status(sender, RelayClientStatus.STREAMING)
+    assert capture.start()
+    wait_for_client_status(sender, RelayClientStatus.FAILED)
+
+    assert sender.diagnostics.failure_reason is reason
+    assert TOKEN not in repr(capture)
+    assert "raw PortAudio device failure" not in repr(sender.diagnostics)
+    rendered = _relay_failure_message(reason)
+    assert rendered == f"Relay başarısız: {reason.value}"
+    assert "raw PortAudio device failure" not in rendered
+    capture.close()
+
+
+def test_native_capture_pause_resume_end_and_cleanup_use_existing_generation() -> None:
+    connection = AckSocket()
+    sender = BoundedRelaySender(
+        client_config(),
+        socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
+    )
+    stream = FakeNativeStream()
+    callbacks: list[Callable[[object, int, object, object], None]] = []
+    capture = NativeRelayCapture(
+        sender,
+        stream_factory=lambda callback: callbacks.append(callback) or stream,
+    )
+    sender.set_resume_callback(capture.resume)
+    session = RelayClientSession(sender=sender, capture=capture)
+
+    sender.start()
+    connection.wait_for_records(1)
+    wait_for_client_status(sender, RelayClientStatus.STREAMING)
+    assert capture.start()
+    for _attempt in range(1_000):
+        if callbacks and stream.started == 1:
+            break
+        Event().wait(0.001)
+    callbacks[0](b"\1\0" * 32_000, 32_000, object(), object())
+    connection.wait_for_records(2)
+    assert session.pause()
+    connection.wait_for_records(3)
+    wait_for_client_status(sender, RelayClientStatus.PAUSED)
+    assert stream.stopped == 1
+    assert session.resume()
+    connection.wait_for_records(4)
+    wait_for_client_status(sender, RelayClientStatus.STREAMING)
+    assert sender.diagnostics.generation == 2
+    assert stream.started == 2
+    assert (
+        sender.progress_stages.count(RelayClientProgressStage.NATIVE_MICROPHONE_OPENED)
+        == 1
+    )
+    callbacks[0](b"\2\0" * 800, 800, object(), object())
+    Event().wait(0.05)
+    assert session.end()
+    assert not capture.opened
+    assert stream.closed == 1
+    connection.wait_for_records(6)
+    wait_for_client_status(sender, RelayClientStatus.ENDED)
+    session.close()
+
+    assert stream.closed == 1
+    assert stream.stopped == 2
+    assert not capture.worker_active
+    assert getattr(connection.records[4], "message_type") is RelayMessageType.AUDIO
+    assert len(getattr(connection.records[4], "payload")) == 1_600
+
+
+def test_native_callback_queue_overflow_fails_safely() -> None:
+    connection = AckSocket(block_type=RelayMessageType.AUDIO)
+    sender = BoundedRelaySender(
+        client_config(),
+        socket_factory=lambda *_args: connection,  # type: ignore[arg-type]
+    )
+    stream = FakeNativeStream()
+    callbacks: list[Callable[[object, int, object, object], None]] = []
+    capture = NativeRelayCapture(
+        sender,
+        stream_factory=lambda callback: callbacks.append(callback) or stream,
+        queue_depth=1,
+    )
+    sender.start()
+    connection.wait_for_records(1)
+    wait_for_client_status(sender, RelayClientStatus.STREAMING)
+    assert capture.start()
+    for _attempt in range(1_000):
+        if callbacks and stream.started == 1:
+            break
+        Event().wait(0.001)
+
+    for _block in range(100):
+        callbacks[0](b"\1\0" * 16_000, 16_000, object(), object())
+    wait_for_client_status(sender, RelayClientStatus.FAILED)
+
+    assert sender.diagnostics.failure_reason is RelayReason.BUFFER_LIMIT
+    connection.release()
+    capture.close()
     sender.close()
 
 

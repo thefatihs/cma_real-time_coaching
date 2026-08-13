@@ -1497,6 +1497,27 @@ def _render_ssh_microphone_relay_details(
         and receiver.last_failure_reason is not None
     ):
         st.error(f"Relay hata nedeni: {receiver.last_failure_reason.value}")
+    if receiver is not None and (
+        receiver.state is RelaySessionState.AWAIT_START
+        or (receiver.state is RelaySessionState.FAILED and not receiver.start_validated)
+    ):
+        pre_start = receiver.pre_start_diagnostics
+        _metric_rows(
+            (
+                StatusCardViewModel(
+                    "START öncesi recv çağrısı",
+                    str(pre_start.recv_call_count_before_start),
+                ),
+                StatusCardViewModel(
+                    "START öncesi alınan bayt",
+                    str(pre_start.received_byte_count_before_start),
+                ),
+                StatusCardViewModel(
+                    "START öncesi ayrıştırılan kayıt",
+                    str(pre_start.parsed_record_count_before_start),
+                ),
+            )
+        )
     _metric_rows(
         (
             StatusCardViewModel("Relay adresi", RELAY_LOOPBACK_HOST),

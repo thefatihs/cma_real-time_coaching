@@ -46,6 +46,7 @@ RELAY_INITIAL_CLIENT_WAIT_TIMEOUT_SECONDS: Final = 300.0
 RELAY_FIRST_AUDIO_GRACE_TIMEOUT_SECONDS: Final = 30.0
 RELAY_RECV_BYTES: Final = 4_096
 MAX_RELAY_PROGRESS_TRANSITIONS: Final = 20
+MAX_RELAY_DIAGNOSTIC_COUNT: Final = 1_000_000
 
 
 class RelayClientProgressStage(str, Enum):
@@ -54,8 +55,9 @@ class RelayClientProgressStage(str, Enum):
     TCP_CONNECTED = "tcp_connected"
     START_SENT = "start_sent"
     START_ACKNOWLEDGED = "start_acknowledged"
-    MICROPHONE_COMPONENT_MOUNTED = "microphone_component_mounted"
-    FIRST_BROWSER_AUDIO_FRAME_RECEIVED = "first_browser_audio_frame_received"
+    NATIVE_MICROPHONE_OPENING = "native_microphone_opening"
+    NATIVE_MICROPHONE_OPENED = "native_microphone_opened"
+    FIRST_NATIVE_AUDIO_BLOCK_RECEIVED = "first_native_audio_block_received"
     FIRST_PCM_CHUNK_ENQUEUED = "first_pcm_chunk_enqueued"
     FIRST_AUDIO_CHUNK_SENT = "first_audio_chunk_sent"
     FIRST_AUDIO_CHUNK_ACKNOWLEDGED = "first_audio_chunk_acknowledged"
@@ -180,6 +182,8 @@ class RelayReason(str, Enum):
     IO_TIMEOUT = "io_timeout"
     CONNECTION_CLOSED = "connection_closed"
     SESSION_REJECTED = "session_rejected"
+    MICROPHONE_UNAVAILABLE = "microphone_unavailable"
+    MICROPHONE_OPEN_FAILED = "microphone_open_failed"
 
 
 class MicrophoneRelayProtocolError(ValueError):
@@ -263,6 +267,13 @@ class RelayAcceptance:
     record: MicrophoneRelayRecord | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class RelayPreStartDiagnostics:
+    recv_call_count_before_start: int
+    received_byte_count_before_start: int
+    parsed_record_count_before_start: int
+
+
 def relay_tokens_match(expected: str, received: str) -> bool:
     """Compare bounded opaque tokens without exposing either value."""
     if not _valid_token(expected) or not _valid_token(received):
@@ -322,6 +333,7 @@ class MicrophoneRelayRecordParser:
         self._metadata_length = 0
         self._payload_length = 0
         self._failed = False
+        self._parsed_record_count = 0
 
     @property
     def failed(self) -> bool:
@@ -330,6 +342,10 @@ class MicrophoneRelayRecordParser:
     @property
     def buffered_bytes(self) -> int:
         return len(self._buffer)
+
+    @property
+    def parsed_record_count(self) -> int:
+        return self._parsed_record_count
 
     def feed(
         self,
@@ -363,6 +379,7 @@ class MicrophoneRelayRecordParser:
                     raise MicrophoneRelayProtocolError(RelayReason.BUFFER_LIMIT)
                 if len(self._buffer) == self._expected_record_bytes:
                     records.append(self._finish_record())
+                    self._parsed_record_count += 1
             return tuple(records)
         except MicrophoneRelayProtocolError:
             self._fail()
@@ -630,6 +647,10 @@ class BoundedMicrophoneRelayProtocol:
     def duplicate_history_size(self) -> int:
         return self._state_machine.duplicate_history_size
 
+    @property
+    def parsed_record_count(self) -> int:
+        return self._parser.parsed_record_count
+
     def feed(
         self,
         data: bytes | bytearray | memoryview,
@@ -720,6 +741,11 @@ class LocalhostMicrophoneRelayReceiver:
         self._closed = False
         self._session_released = False
         self._last_failure_reason: RelayReason | None = None
+        self._diagnostics_lock = Lock()
+        self._recv_call_count_before_start = 0
+        self._received_byte_count_before_start = 0
+        self._parsed_record_count_before_start = 0
+        self._start_validated = False
         self._progress = RelayProgressHistory()
         self._progress.record(RelayReceiverProgressStage.RELAY_SESSION_CREATED)
 
@@ -730,6 +756,24 @@ class LocalhostMicrophoneRelayReceiver:
     @property
     def last_failure_reason(self) -> RelayReason | None:
         return self._last_failure_reason
+
+    @property
+    def start_validated(self) -> bool:
+        with self._diagnostics_lock:
+            return self._start_validated
+
+    @property
+    def pre_start_diagnostics(self) -> RelayPreStartDiagnostics:
+        with self._diagnostics_lock:
+            return RelayPreStartDiagnostics(
+                recv_call_count_before_start=self._recv_call_count_before_start,
+                received_byte_count_before_start=(
+                    self._received_byte_count_before_start
+                ),
+                parsed_record_count_before_start=(
+                    self._parsed_record_count_before_start
+                ),
+            )
 
     @property
     def progress_stages(self) -> tuple[RelayProgressStage, ...]:
@@ -839,6 +883,7 @@ class LocalhostMicrophoneRelayReceiver:
                 RelaySessionState.FAILED,
             }:
                 try:
+                    self._record_pre_start_recv_call()
                     data = client.recv(RELAY_RECV_BYTES)
                 except TimeoutError:
                     self._fail(RelayReason.IO_TIMEOUT)
@@ -847,6 +892,7 @@ class LocalhostMicrophoneRelayReceiver:
                 if not data:
                     self._fail(RelayReason.CONNECTION_CLOSED)
                     return
+                self._record_pre_start_received_bytes(len(data))
                 for response in self.process_bytes(data):
                     client.sendall(response)
                 received_audio = self._session.diagnostics.received_chunk_count > 0
@@ -878,11 +924,18 @@ class LocalhostMicrophoneRelayReceiver:
         if self._closed:
             return (self._error_record(0, RelayReason.TERMINAL_STATE),)
         now = arrived_at_utc or datetime.now(UTC)
+        parsed_before = self._protocol.parsed_record_count
         try:
             acceptances = self._protocol.feed(data)
         except MicrophoneRelayProtocolError as error:
+            self._record_pre_start_parsed_records(
+                self._protocol.parsed_record_count - parsed_before
+            )
             self._fail(error.reason)
             return (self._error_record(0, error.reason),)
+        self._record_pre_start_parsed_records(
+            self._protocol.parsed_record_count - parsed_before
+        )
         responses: list[bytes] = []
         for acceptance in acceptances:
             sequence = (
@@ -908,6 +961,8 @@ class LocalhostMicrophoneRelayReceiver:
                 break
             if record.message_type is RelayMessageType.START:
                 self.record_progress(RelayReceiverProgressStage.START_VALIDATED)
+                with self._diagnostics_lock:
+                    self._start_validated = True
             elif record.message_type is RelayMessageType.AUDIO:
                 self.record_progress(RelayReceiverProgressStage.FIRST_AUDIO_RECEIVED)
                 self.record_progress(RelayReceiverProgressStage.AUDIO_STREAMING)
@@ -915,6 +970,30 @@ class LocalhostMicrophoneRelayReceiver:
                 self.record_progress(RelayReceiverProgressStage.ENDED)
             responses.append(self._ack_record(sequence, acceptance.reason))
         return tuple(responses)
+
+    def _record_pre_start_recv_call(self) -> None:
+        with self._diagnostics_lock:
+            if not self._start_validated:
+                self._recv_call_count_before_start = min(
+                    self._recv_call_count_before_start + 1,
+                    MAX_RELAY_DIAGNOSTIC_COUNT,
+                )
+
+    def _record_pre_start_received_bytes(self, byte_count: int) -> None:
+        with self._diagnostics_lock:
+            if not self._start_validated:
+                self._received_byte_count_before_start = min(
+                    self._received_byte_count_before_start + byte_count,
+                    MAX_RELAY_DIAGNOSTIC_COUNT,
+                )
+
+    def _record_pre_start_parsed_records(self, record_count: int) -> None:
+        with self._diagnostics_lock:
+            if not self._start_validated:
+                self._parsed_record_count_before_start = min(
+                    self._parsed_record_count_before_start + record_count,
+                    MAX_RELAY_DIAGNOSTIC_COUNT,
+                )
 
     def close(self) -> None:
         if self._closed:

@@ -401,9 +401,19 @@ This log uses local chronological numbering and records only Fatih-owned work.
   live sender/capture session remains recognized and rendered across Streamlit
   script re-execution without duplicate connections.
 - Added fixed, Turkish-labeled, 20-transition progress histories for both relay
-  dashboards, driven only by concrete socket, protocol, browser callback,
+  dashboards, driven only by concrete socket, protocol, capture callback,
   queue, ASR, classification and coaching evidence.
 - Observability tests: focused relay/dashboard suites 93 passed; Ruff,
   formatting, and focused Pyright passed.
-- Next planned step: manually verify browser permission and first audio over
+- Replaced only the Windows relay client's browser capture with one retained
+  native `RawInputStream` feeding a bounded callback queue and capture worker;
+  an explicit post-START-acknowledgement action opens the default Windows input
+  device, and the PortAudio callback never performs network I/O.
+- Automated lifecycle coverage verifies initial open state, bounded audio
+  draining, pause/resume/end cleanup and rerun-safe session retention; native
+  capture has not yet been manually accepted on Windows or the GPU host.
+- Added bounded content-free pre-START recv-call, byte and parsed-record
+  counters to distinguish an empty forwarded connection from a partial record;
+  protocol, authentication and timeout behavior are unchanged.
+- Next planned step: manually verify native Windows capture and first audio over
   the SSH tunnel workflow end to end.

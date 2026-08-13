@@ -16,20 +16,15 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 import socket
 import sys
-from threading import Lock, Thread, current_thread
-from typing import Callable, Final, MutableMapping, cast
-
-import av
+from threading import Event, Lock, Thread, current_thread
+from typing import Any, Callable, Final, MutableMapping, Protocol, cast
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.audio_ingress.local_microphone import (  # noqa: E402
-    LOCAL_MIC_CHUNK_BYTES,
-    PyAVLocalMicrophoneNormalizer,
-)
+from app.audio_ingress.local_microphone import LOCAL_MIC_CHUNK_BYTES  # noqa: E402
 from app.audio_ingress.tcp_microphone_relay import (  # noqa: E402
     MAX_RELAY_RECORD_BYTES,
     RELAY_IO_TIMEOUT_SECONDS,
@@ -45,11 +40,10 @@ from app.audio_ingress.tcp_microphone_relay import (  # noqa: E402
     RelayProgressStage,
     encode_relay_record,
 )
-from live_dashboard.local_microphone import microphone_webrtc_streamer  # noqa: E402
-
 
 DEFAULT_RELAY_PORT: Final = 18_765
 LOCAL_RELAY_SENDER_QUEUE_DEPTH: Final = 4
+LOCAL_NATIVE_CAPTURE_QUEUE_DEPTH: Final = 8
 CLIENT_START_COMMAND: Final = (
     "uv run streamlit run scripts/run_local_microphone_relay_client.py "
     "--server.address 127.0.0.1 --server.port 8503"
@@ -60,9 +54,10 @@ _CLIENT_PROGRESS_LABELS: Final = {
     RelayClientProgressStage.TCP_CONNECTED: "TCP bağlantısı kuruldu",
     RelayClientProgressStage.START_SENT: "START gönderildi",
     RelayClientProgressStage.START_ACKNOWLEDGED: "START GPU tarafından onaylandı",
-    RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED: "Mikrofon bileşeni açıldı",
-    RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED: (
-        "İlk tarayıcı mikrofon karesi alındı"
+    RelayClientProgressStage.NATIVE_MICROPHONE_OPENING: "Yerel mikrofon açılıyor",
+    RelayClientProgressStage.NATIVE_MICROPHONE_OPENED: "Yerel mikrofon açıldı",
+    RelayClientProgressStage.FIRST_NATIVE_AUDIO_BLOCK_RECEIVED: (
+        "İlk yerel mikrofon ses bloğu alındı"
     ),
     RelayClientProgressStage.FIRST_PCM_CHUNK_ENQUEUED: "İlk PCM parçası kuyruğa alındı",
     RelayClientProgressStage.FIRST_AUDIO_CHUNK_SENT: "İlk ses parçası gönderildi",
@@ -77,7 +72,7 @@ _CLIENT_PROGRESS_LABELS: Final = {
 }
 _CLIENT_WAITING_STAGES: Final = {
     RelayClientProgressStage.TCP_CONNECTING,
-    RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED,
+    RelayClientProgressStage.NATIVE_MICROPHONE_OPENING,
     RelayClientProgressStage.STREAMING,
 }
 
@@ -172,6 +167,7 @@ class BoundedRelaySender:
         self._failure_reason: RelayReason | None = None
         self._closed = False
         self._progress = RelayProgressHistory()
+        self._resume_callback: Callable[[], bool] | None = None
 
     @property
     def progress_stages(self) -> tuple[RelayProgressStage, ...]:
@@ -179,6 +175,9 @@ class BoundedRelaySender:
 
     def record_progress(self, stage: RelayClientProgressStage) -> None:
         self._progress.record(stage)
+
+    def set_resume_callback(self, callback: Callable[[], bool]) -> None:
+        self._resume_callback = callback
 
     @property
     def diagnostics(self) -> RelayClientDiagnostics:
@@ -390,6 +389,7 @@ class BoundedRelaySender:
                 )
             ),
         )
+        resume_callback: Callable[[], bool] | None = None
         with self._lock:
             if outbound.message_type is RelayMessageType.AUDIO:
                 self._sent_chunks += 1
@@ -405,6 +405,9 @@ class BoundedRelaySender:
                 self._generation = outbound.generation
                 self._status = RelayClientStatus.STREAMING
                 self.record_progress(RelayClientProgressStage.RESUMED)
+                resume_callback = self._resume_callback
+        if resume_callback is not None and not resume_callback():
+            raise _RelayClientError(RelayReason.MICROPHONE_OPEN_FAILED)
 
     @staticmethod
     def _exchange(
@@ -470,110 +473,270 @@ class BoundedRelaySender:
             connection.close()
 
 
-@dataclass(frozen=True, slots=True)
-class _CaptureDiagnostics:
-    capture_generation: int
+class NativeInputStream(Protocol):
+    def start(self) -> object: ...
+    def stop(self) -> object: ...
+    def close(self) -> object: ...
 
 
-class RelayCaptureSession:
-    """WebRTC callback adapter restricted to normalization and bounded enqueue."""
+NativeStreamFactory = Callable[
+    [Callable[[object, int, object, object], None]], NativeInputStream
+]
 
-    def __init__(self, sender: BoundedRelaySender) -> None:
+
+def _sounddevice_stream_factory(
+    callback: Callable[[object, int, object, object], None],
+) -> NativeInputStream:
+    import sounddevice  # type: ignore[import-untyped]
+
+    devices = sounddevice.query_devices(kind="input")
+    if not devices or int(devices.get("max_input_channels", 0)) < 1:
+        raise LookupError
+    return cast(
+        NativeInputStream,
+        sounddevice.RawInputStream(
+            samplerate=16_000,
+            channels=1,
+            dtype="int16",
+            callback=callback,
+        ),
+    )
+
+
+class NativeRelayCapture:
+    """Bounded Windows native PCM capture feeding the existing relay sender."""
+
+    def __init__(
+        self,
+        sender: BoundedRelaySender,
+        *,
+        stream_factory: NativeStreamFactory = _sounddevice_stream_factory,
+        queue_depth: int = LOCAL_NATIVE_CAPTURE_QUEUE_DEPTH,
+    ) -> None:
         self._sender = sender
-        self._normalizer = PyAVLocalMicrophoneNormalizer()
+        self._stream_factory = stream_factory
+        self._queue: Queue[bytes] = Queue(maxsize=queue_depth)
+        self._stop = Event()
+        self._overflow = Event()
+        self._admitting = Event()
+        self._drained = Event()
+        self._drained.set()
+        self._worker: Thread | None = None
+        self._stream: NativeInputStream | None = None
         self._buffer = bytearray()
         self._lock = Lock()
+        self._opened = Event()
 
     @property
-    def diagnostics(self) -> _CaptureDiagnostics:
-        return _CaptureDiagnostics(self._sender.diagnostics.generation)
+    def worker_active(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
 
-    def accept_frame(
-        self,
-        frame: av.AudioFrame,
-        *,
-        capture_generation: int | None = None,
-    ) -> av.AudioFrame:
+    @property
+    def started(self) -> bool:
+        return self._worker is not None
+
+    @property
+    def opened(self) -> bool:
+        return self._opened.is_set()
+
+    @property
+    def device_label(self) -> str | None:
+        return "Windows varsayılan giriş aygıtı" if self.opened else None
+
+    def start(self) -> bool:
+        if self._sender.diagnostics.status is not RelayClientStatus.STREAMING:
+            return False
         with self._lock:
+            if self._worker is not None:
+                return False
             self._sender.record_progress(
-                RelayClientProgressStage.FIRST_BROWSER_AUDIO_FRAME_RECEIVED
+                RelayClientProgressStage.NATIVE_MICROPHONE_OPENING
             )
-            if self._sender.diagnostics.status is not RelayClientStatus.STREAMING:
-                return frame
-            if (
-                capture_generation is not None
-                and capture_generation != self._sender.diagnostics.generation
-            ):
-                raise PermissionError(RelayReason.STALE_GENERATION.value)
-            for item in self._normalizer.normalize(frame):
-                self._append(item.pcm_s16le)
-        return frame
+            self._worker = Thread(
+                target=self._run, name="native-relay-capture", daemon=True
+            )
+            self._worker.start()
+            return True
 
-    def mark_reconnecting(self, *, capture_generation: int | None = None) -> bool:
-        del capture_generation
-        self._sender.fail(RelayReason.CONNECTION_CLOSED)
+    def audio_callback(
+        self,
+        input_data: object,
+        frames: int,
+        time_info: object,
+        status: object,
+    ) -> None:
+        del frames, time_info, status
+        if not self._admitting.is_set():
+            return
+        pcm = bytes(cast(Any, input_data))
+        if not pcm or len(pcm) > LOCAL_MIC_CHUNK_BYTES or len(pcm) % 2:
+            self._overflow.set()
+            return
+        try:
+            self._drained.clear()
+            self._queue.put_nowait(pcm)
+        except Full:
+            self._overflow.set()
+            if self._queue.empty():
+                self._drained.set()
+
+    def pause(self) -> bool:
+        self._admitting.clear()
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                self._sender.fail(RelayReason.MICROPHONE_OPEN_FAILED)
+                return False
+        if not self._drained.wait(timeout=RELAY_IO_TIMEOUT_SECONDS):
+            self._sender.fail(RelayReason.BUFFER_LIMIT)
+            return False
+        return self.flush()
+
+    def resume(self) -> bool:
+        stream = self._stream
+        if stream is None:
+            return False
+        try:
+            stream.start()
+        except Exception:
+            self._sender.fail(RelayReason.MICROPHONE_OPEN_FAILED)
+            return False
+        self._admitting.set()
+        self._opened.set()
         return True
 
     def flush(self) -> bool:
         with self._lock:
-            for item in self._normalizer.flush():
-                self._append(item.pcm_s16le)
             if not self._buffer:
                 return True
             payload = bytes(self._buffer)
             self._buffer.clear()
-            accepted = self._sender.enqueue_audio(
-                payload,
-                captured_at_utc=datetime.now(UTC),
-            )
-            if accepted:
-                self._sender.record_progress(
-                    RelayClientProgressStage.FIRST_PCM_CHUNK_ENQUEUED
-                )
-            return accepted
+        return self._enqueue(payload)
 
-    def _append(self, pcm_s16le: bytes) -> None:
+    def close(self) -> None:
+        was_admitting = self._admitting.is_set()
+        self._admitting.clear()
+        self._stop.set()
+        with self._lock:
+            stream, self._stream = self._stream, None
+            self._opened.clear()
+        if stream is not None:
+            if was_admitting:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        worker = self._worker
+        if worker is not None and worker is not current_thread():
+            worker.join(timeout=RELAY_IO_TIMEOUT_SECONDS)
+
+    def _run(self) -> None:
+        try:
+            stream = self._stream_factory(self.audio_callback)
+            with self._lock:
+                if self._stop.is_set():
+                    stream.close()
+                    return
+                self._stream = stream
+            stream.start()
+        except LookupError:
+            self._sender.fail(RelayReason.MICROPHONE_UNAVAILABLE)
+            return
+        except Exception:
+            self._sender.fail(RelayReason.MICROPHONE_OPEN_FAILED)
+            return
+        with self._lock:
+            if self._stop.is_set():
+                if self._stream is stream:
+                    self._stream = None
+                    stream.close()
+                return
+            self._opened.set()
+            self._admitting.set()
+        self._sender.record_progress(RelayClientProgressStage.NATIVE_MICROPHONE_OPENED)
+        while not self._stop.is_set():
+            if self._overflow.is_set():
+                self._sender.fail(RelayReason.BUFFER_LIMIT)
+                self._stop.set()
+                break
+            try:
+                pcm = self._queue.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                self._sender.record_progress(
+                    RelayClientProgressStage.FIRST_NATIVE_AUDIO_BLOCK_RECEIVED
+                )
+                self._append(pcm)
+            finally:
+                self._queue.task_done()
+                if self._queue.empty():
+                    self._drained.set()
+
+    def _append(self, pcm: bytes) -> None:
         offset = 0
-        while offset < len(pcm_s16le):
-            remaining = LOCAL_MIC_CHUNK_BYTES - len(self._buffer)
-            take = min(remaining, len(pcm_s16le) - offset)
-            self._buffer.extend(pcm_s16le[offset : offset + take])
-            offset += take
-            if len(self._buffer) == LOCAL_MIC_CHUNK_BYTES:
+        while offset < len(pcm):
+            with self._lock:
+                take = min(LOCAL_MIC_CHUNK_BYTES - len(self._buffer), len(pcm) - offset)
+                self._buffer.extend(pcm[offset : offset + take])
+                offset += take
+                if len(self._buffer) < LOCAL_MIC_CHUNK_BYTES:
+                    continue
                 payload = bytes(self._buffer)
                 self._buffer.clear()
-                if not self._sender.enqueue_audio(
-                    payload,
-                    captured_at_utc=datetime.now(UTC),
-                ):
-                    raise RuntimeError(RelayReason.BUFFER_LIMIT.value)
-                self._sender.record_progress(
-                    RelayClientProgressStage.FIRST_PCM_CHUNK_ENQUEUED
-                )
+            if not self._enqueue(payload):
+                self._stop.set()
+                return
+
+    def _enqueue(self, payload: bytes) -> bool:
+        accepted = self._sender.enqueue_audio(
+            payload, captured_at_utc=datetime.now(UTC)
+        )
+        if accepted:
+            self._sender.record_progress(
+                RelayClientProgressStage.FIRST_PCM_CHUNK_ENQUEUED
+            )
+        return accepted
 
 
 @dataclass(slots=True)
 class RelayClientSession(RelayClientSessionHandle):
     sender: BoundedRelaySender
-    capture: RelayCaptureSession
+    capture: NativeRelayCapture
 
     def pause(self) -> bool:
-        return self.capture.flush() and self.sender.pause()
+        return self.capture.pause() and self.sender.pause()
 
     def resume(self) -> bool:
         return self.sender.resume()
 
     def end(self) -> bool:
-        return self.capture.flush() and self.sender.end()
+        if not self.capture.pause() or not self.sender.end():
+            return False
+        self.capture.close()
+        return True
 
     def close(self) -> None:
+        self.capture.close()
         self.sender.close()
 
 
-def create_relay_client_session(config: RelayClientConfig) -> RelayClientSession:
+def create_relay_client_session(
+    config: RelayClientConfig,
+    *,
+    stream_factory: NativeStreamFactory = _sounddevice_stream_factory,
+) -> RelayClientSession:
     sender = BoundedRelaySender(config)
+    capture = NativeRelayCapture(sender, stream_factory=stream_factory)
+    sender.set_resume_callback(capture.resume)
     sender.record_progress(RelayClientProgressStage.CONFIGURATION_VALIDATED)
-    return RelayClientSession(sender=sender, capture=RelayCaptureSession(sender))
+    return RelayClientSession(sender=sender, capture=capture)
 
 
 def retained_relay_client_session(value: object) -> RelayClientSession | None:
@@ -596,10 +759,6 @@ def reset_terminal_relay_client_session(
     return True
 
 
-def relay_capture_should_be_mounted(status: RelayClientStatus) -> bool:
-    return status in {RelayClientStatus.CONNECTING, RelayClientStatus.STREAMING}
-
-
 def _render_relay_progress(st: object, sender: BoundedRelaySender) -> None:
     stages = sender.progress_stages
     for index, stage in enumerate(stages):
@@ -607,6 +766,10 @@ def _render_relay_progress(st: object, sender: BoundedRelaySender) -> None:
         current = index == len(stages) - 1
         prefix = "…" if current and stage in _CLIENT_WAITING_STAGES else "✓"
         getattr(st, "caption")(f"{prefix} {_CLIENT_PROGRESS_LABELS[stage]}")
+
+
+def _relay_failure_message(reason: RelayReason) -> str:
+    return f"Relay başarısız: {reason.value}"
 
 
 def render() -> None:
@@ -659,7 +822,7 @@ def render() -> None:
     st.metric("Onaylanan parça", diagnostics.acknowledged_chunk_count)
     st.metric("Kuyruk", diagnostics.queue_depth)
     if diagnostics.failure_reason is not None:
-        st.error(f"Relay başarısız: {diagnostics.failure_reason.value}")
+        st.error(_relay_failure_message(diagnostics.failure_reason))
     if diagnostics.status in {RelayClientStatus.FAILED, RelayClientStatus.ENDED}:
         if st.button("Reset / Reconnect"):
             reset_terminal_relay_client_session(
@@ -667,20 +830,25 @@ def render() -> None:
             )
             st.rerun()
         return
-    if relay_capture_should_be_mounted(diagnostics.status):
-        microphone_webrtc_streamer(
-            session=session.capture,  # type: ignore[arg-type]
-            key="ssh-microphone-relay-capture",
-            desired_playing_state=True,
-        )
-        session.sender.record_progress(
-            RelayClientProgressStage.MICROPHONE_COMPONENT_MOUNTED
-        )
     _render_relay_progress(st, session.sender)
+    if session.capture.device_label is not None:
+        st.caption(f"Giriş aygıtı: {session.capture.device_label}")
+    if st.button(
+        "Mikrofonu Başlat",
+        disabled=(
+            diagnostics.status is not RelayClientStatus.STREAMING
+            or session.capture.started
+        ),
+    ):
+        session.capture.start()
+        st.rerun()
     pause, resume, end = st.columns(3)
     if pause.button(
         "Pause",
-        disabled=diagnostics.status is not RelayClientStatus.STREAMING,
+        disabled=(
+            diagnostics.status is not RelayClientStatus.STREAMING
+            or not session.capture.opened
+        ),
     ):
         session.pause()
         st.rerun()

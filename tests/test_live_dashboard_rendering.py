@@ -13,6 +13,7 @@ from typing import Any, cast
 import pytest
 
 from app.audio_ingress.tcp_microphone_relay import (
+    RelayPreStartDiagnostics,
     RelayProgressHistory,
     RelayReason,
     RelayReceiverProgressStage,
@@ -2002,6 +2003,8 @@ def test_ssh_relay_details_render_only_sanitized_failure_reason(
     class FailedReceiver:
         state = app.RelaySessionState.FAILED
         last_failure_reason = RelayReason.IO_TIMEOUT
+        start_validated = False
+        pre_start_diagnostics = RelayPreStartDiagnostics(2, 7, 0)
         worker_active = False
         progress_stages = (
             RelayReceiverProgressStage.RELAY_SESSION_CREATED,
@@ -2015,8 +2018,14 @@ def test_ssh_relay_details_render_only_sanitized_failure_reason(
     )
 
     assert recorder.errors == ["Relay hata nedeni: io_timeout"]
+    assert ("START öncesi recv çağrısı", "2") in recorder.metrics
+    assert ("START öncesi alınan bayt", "7") in recorder.metrics
+    assert ("START öncesi ayrıştırılan kayıt", "0") in recorder.metrics
     assert token not in "\n".join(recorder.errors)
     assert token not in "\n".join(recorder.captions)
+    assert token not in " ".join(
+        value for metric in recorder.metrics for value in metric
+    )
     assert token not in recorder.codes[1]
 
 
