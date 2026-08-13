@@ -1938,7 +1938,6 @@ def test_duplicate_replay_is_synchronous_and_does_not_poll(
         ("after_list", subject.E_DUPLICATE_AFTER_LIST),
         ("target_lookup", subject.E_DUPLICATE_TARGET_LOOKUP),
         ("other_lookup", subject.E_DUPLICATE_OTHER_LOOKUP),
-        ("vector_query", subject.E_DUPLICATE_VECTOR_QUERY),
     ],
 )
 def test_duplicate_reviewed_helper_failures_have_exact_phases(
@@ -1975,13 +1974,6 @@ def test_duplicate_reviewed_helper_failures_have_exact_phases(
             return original_get(document_id=document_id)
 
         registry.get_entry = get_entry
-    else:
-        monkeypatch.setattr(
-            lifecycle,
-            "_target_vector_count",
-            lambda: (_ for _ in ()).throw(RuntimeError("private-secret")),
-        )
-
     with pytest.raises(subject._DuplicatePhaseError, match=f"^{phase}$"):
         lifecycle._duplicate()
     captured = capsys.readouterr()
@@ -2036,9 +2028,12 @@ def test_duplicate_malformed_helper_shapes_have_fixed_phase(
         counts = iter((1, -1))
         monkeypatch.setattr(lifecycle, "_target_vector_count", lambda: next(counts))
 
-    with pytest.raises(
-        subject._DuplicatePhaseError, match=f"^{subject.E_DUPLICATE_RESULT_SHAPE}$"
-    ):
+    expected_phase = (
+        subject.E_DUPLICATE_VECTOR_AFTER_RESULT_SHAPE
+        if operation == "vector_count"
+        else subject.E_DUPLICATE_RESULT_SHAPE
+    )
+    with pytest.raises(subject._DuplicatePhaseError, match=f"^{expected_phase}$"):
         lifecycle._duplicate()
 
 
@@ -2098,19 +2093,30 @@ class _VectorCountCursor:
         self,
         row: object,
         *,
+        enter_failure: bool = False,
         execute_failure: bool = False,
         fetch_failure: bool = False,
+        exit_failure: bool = False,
     ) -> None:
         self.row = row
+        self.enter_failure = enter_failure
         self.execute_failure = execute_failure
         self.fetch_failure = fetch_failure
+        self.exit_failure = exit_failure
+        self.entered = 0
+        self.exited = 0
         self.executed = 0
 
     def __enter__(self) -> _VectorCountCursor:
+        self.entered += 1
+        if self.enter_failure:
+            raise RuntimeError("private-secret")
         return self
 
     def __exit__(self, *_args: object) -> None:
-        return None
+        self.exited += 1
+        if self.exit_failure:
+            raise RuntimeError("private-secret")
 
     def execute(self, *_args: object) -> None:
         self.executed += 1
@@ -2130,17 +2136,25 @@ class _VectorCountConnection:
         *,
         execute_failure: bool = False,
         cursor_failure: bool = False,
+        enter_failure: bool = False,
         fetch_failure: bool = False,
+        exit_failure: bool = False,
         close_failure: bool = False,
     ) -> None:
         self.cursor_instance = _VectorCountCursor(
-            row, execute_failure=execute_failure, fetch_failure=fetch_failure
+            row,
+            enter_failure=enter_failure,
+            execute_failure=execute_failure,
+            fetch_failure=fetch_failure,
+            exit_failure=exit_failure,
         )
         self.cursor_failure = cursor_failure
         self.close_failure = close_failure
+        self.cursor_calls = 0
         self.closed = 0
 
     def cursor(self) -> _VectorCountCursor:
+        self.cursor_calls += 1
         if self.cursor_failure:
             raise RuntimeError("private-secret")
         return self.cursor_instance
@@ -2164,6 +2178,8 @@ def test_target_vector_count_runs_production_shaped_connection(
 
     assert lifecycle._target_vector_count() == 3
     assert connection.cursor_instance.executed == 1
+    assert connection.cursor_instance.entered == 1
+    assert connection.cursor_instance.exited == 1
     assert connection.closed == 1
 
 
@@ -2178,78 +2194,207 @@ def test_target_vector_count_rejects_malformed_production_rows(
     connection = _VectorCountConnection(row)
     monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
     monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: connection)
-    with pytest.raises(subject._DuplicateResultShapeError):
+    with pytest.raises(subject._DuplicateVectorOperationError) as caught:
         lifecycle._target_vector_count()
+    assert caught.value.operation == "RESULT_SHAPE"
     assert connection.closed == 1
 
 
+@pytest.mark.parametrize("position", ["BEFORE", "AFTER"])
+def test_duplicate_vector_snapshot_maps_missing_state_to_settings(
+    position: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.delattr(lifecycle, "_target_vector_count")
+    lifecycle._target_entry = None
+    expected = getattr(subject, f"E_DUPLICATE_VECTOR_{position}_SETTINGS")
+    with pytest.raises(subject._DuplicatePhaseError, match=f"^{expected}$"):
+        lifecycle._duplicate_vector_snapshot(position=position)
+
+
+def test_duplicate_real_vector_success_uses_separate_connections_without_polling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import psycopg
+
+    lifecycle, _, manager = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.delattr(lifecycle, "_target_vector_count")
+    monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
+    connections = [_VectorCountConnection((1,)), _VectorCountConnection((1,))]
+    pending = list(connections)
+    monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: pending.pop(0))
+    monkeypatch.setattr(subject.time, "sleep", lambda _seconds: pytest.fail("polled"))
+
+    lifecycle._duplicate()
+
+    assert manager.calls == 1
+    assert pending == []
+    assert all(connection.cursor_calls == 1 for connection in connections)
+    assert all(connection.cursor_instance.executed == 1 for connection in connections)
+    assert all(connection.cursor_instance.exited == 1 for connection in connections)
+    assert all(connection.closed == 1 for connection in connections)
+
+
 @pytest.mark.parametrize(
-    "boundary", ["dsn", "connect", "cursor", "execute", "fetchone", "close"]
+    ("boundary", "operation"),
+    [
+        ("dsn", "SETTINGS"),
+        ("connect", "CONNECT"),
+        ("cursor", "CURSOR"),
+        ("enter", "CURSOR"),
+        ("execute", "EXECUTE"),
+        ("fetch", "FETCH"),
+        ("exit", "CLOSE"),
+        ("close", "CLOSE"),
+    ],
 )
-def test_duplicate_real_vector_query_boundaries_have_exact_phase(
+@pytest.mark.parametrize("position", ["BEFORE", "AFTER"])
+def test_duplicate_real_vector_boundaries_have_positioned_phase(
     boundary: str,
+    operation: str,
+    position: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     import psycopg
 
-    lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
+    lifecycle, _, manager = _duplicate_lifecycle(monkeypatch, tmp_path)
     monkeypatch.delattr(lifecycle, "_target_vector_count")
-    if boundary == "dsn":
-        monkeypatch.setattr(
-            lifecycle,
-            "_application_dsn",
-            lambda: (_ for _ in ()).throw(RuntimeError("private-secret")),
-        )
-    else:
-        monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
-    connection = _VectorCountConnection(
-        (1,),
-        cursor_failure=boundary == "cursor",
-        execute_failure=boundary == "execute",
-        fetch_failure=boundary == "fetchone",
-        close_failure=boundary == "close",
-    )
-    if boundary == "connect":
-        monkeypatch.setattr(
-            psycopg,
-            "connect",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("private-secret")
-            ),
-        )
-    else:
-        monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: connection)
+    call_index = 0
+    connections: list[_VectorCountConnection] = []
 
+    def is_failure_call() -> bool:
+        return call_index == (0 if position == "BEFORE" else 1)
+
+    def application_dsn() -> str:
+        nonlocal call_index
+        if boundary == "dsn" and is_failure_call():
+            raise RuntimeError("private-secret")
+        return "private-dsn"
+
+    def connect(*_args: object, **_kwargs: object) -> _VectorCountConnection:
+        nonlocal call_index
+        failing = is_failure_call()
+        if boundary == "connect" and failing:
+            call_index += 1
+            raise RuntimeError("private-secret")
+        connection = _VectorCountConnection(
+            (1,),
+            cursor_failure=boundary == "cursor" and failing,
+            enter_failure=boundary == "enter" and failing,
+            execute_failure=boundary == "execute" and failing,
+            fetch_failure=boundary == "fetch" and failing,
+            exit_failure=boundary == "exit" and failing,
+            close_failure=boundary == "close" and failing,
+        )
+        connections.append(connection)
+        call_index += 1
+        return connection
+
+    monkeypatch.setattr(lifecycle, "_application_dsn", application_dsn)
+    monkeypatch.setattr(psycopg, "connect", connect)
+
+    expected = getattr(subject, f"E_DUPLICATE_VECTOR_{position}_{operation}")
     with pytest.raises(
         subject._DuplicatePhaseError,
-        match=f"^{subject.E_DUPLICATE_VECTOR_QUERY}$",
+        match=f"^{expected}$",
     ):
         lifecycle._duplicate()
+    assert manager.calls == (0 if position == "BEFORE" else 1)
+    expected_connections = (0 if position == "BEFORE" else 1) + (
+        0 if boundary in {"connect", "dsn"} else 1
+    )
+    assert len(connections) == expected_connections
+    assert all(connection.closed == 1 for connection in connections)
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
 
 
-def test_duplicate_real_vector_row_shape_has_exact_phase(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("position", ["BEFORE", "AFTER"])
+@pytest.mark.parametrize("row", [None, (), (1, 2), (True,), (-1,), ("1",)])
+def test_duplicate_real_vector_row_shape_has_positioned_phase(
+    position: str, row: object, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import psycopg
+
+    lifecycle, _, manager = _duplicate_lifecycle(monkeypatch, tmp_path)
+    monkeypatch.delattr(lifecycle, "_target_vector_count")
+    monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
+    connections = [
+        _VectorCountConnection((1,)),
+        _VectorCountConnection(row),
+    ]
+    if position == "BEFORE":
+        connections.reverse()
+    pending = list(connections)
+    monkeypatch.setattr(
+        psycopg,
+        "connect",
+        lambda *_args, **_kwargs: pending.pop(0),
+    )
+    expected = getattr(subject, f"E_DUPLICATE_VECTOR_{position}_RESULT_SHAPE")
+    with pytest.raises(
+        subject._DuplicatePhaseError,
+        match=f"^{expected}$",
+    ):
+        lifecycle._duplicate()
+    assert manager.calls == (0 if position == "BEFORE" else 1)
+
+
+@pytest.mark.parametrize("position", ["BEFORE", "AFTER"])
+def test_duplicate_unexpected_vector_defect_has_positioned_phase(
+    position: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lifecycle, _, manager = _duplicate_lifecycle(monkeypatch, tmp_path)
+    calls = 0
+
+    def unexpected() -> int:
+        nonlocal calls
+        calls += 1
+        if calls == (1 if position == "BEFORE" else 2):
+            raise RuntimeError("private-secret")
+        return 1
+
+    monkeypatch.setattr(lifecycle, "_target_vector_count", unexpected)
+    expected = getattr(subject, f"E_DUPLICATE_VECTOR_{position}_UNCLASSIFIED")
+    with pytest.raises(subject._DuplicatePhaseError, match=f"^{expected}$"):
+        lifecycle._duplicate()
+    assert manager.calls == (0 if position == "BEFORE" else 1)
+
+
+@pytest.mark.parametrize(
+    ("position", "operation"), [("BEFORE", "EXECUTE"), ("AFTER", "FETCH")]
+)
+def test_duplicate_vector_cleanup_failure_does_not_replace_primary(
+    position: str,
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import psycopg
 
     lifecycle, _, _ = _duplicate_lifecycle(monkeypatch, tmp_path)
     monkeypatch.delattr(lifecycle, "_target_vector_count")
     monkeypatch.setattr(lifecycle, "_application_dsn", lambda: "private-dsn")
-    monkeypatch.setattr(
-        psycopg,
-        "connect",
-        lambda *_args, **_kwargs: _VectorCountConnection(("malformed",)),
+    valid = _VectorCountConnection((1,))
+    failing = _VectorCountConnection(
+        (1,),
+        execute_failure=operation == "EXECUTE",
+        fetch_failure=operation == "FETCH",
+        exit_failure=True,
+        close_failure=True,
     )
-    with pytest.raises(
-        subject._DuplicatePhaseError,
-        match=f"^{subject.E_DUPLICATE_RESULT_SHAPE}$",
-    ):
+    connections = [failing] if position == "BEFORE" else [valid, failing]
+    monkeypatch.setattr(
+        psycopg, "connect", lambda *_args, **_kwargs: connections.pop(0)
+    )
+    expected = getattr(subject, f"E_DUPLICATE_VECTOR_{position}_{operation}")
+    with pytest.raises(subject._DuplicatePhaseError, match=f"^{expected}$"):
         lifecycle._duplicate()
+    assert failing.cursor_instance.exited == 1
+    assert failing.closed == 1
 
 
 def test_duplicate_missing_runtime_and_submit_failure_have_fixed_phases(
@@ -2367,20 +2512,25 @@ def test_duplicate_rejection_and_query_failure_are_secret_safe(
     assert "secret-like-value" not in captured.out + captured.err
 
 
+@pytest.mark.parametrize(
+    "phase",
+    [subject.E_DUPLICATE_STATUS, subject.E_DUPLICATE_VECTOR_AFTER_FETCH],
+)
 def test_duplicate_subphase_remains_primary_when_cleanup_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    phase: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     prepare_preflight(monkeypatch, tmp_path)
 
     class Operations(FakeOperations):
         def run_phase(self, phase: str) -> None:
             if phase == "E_DUPLICATE":
-                raise subject._DuplicatePhaseError(subject.E_DUPLICATE_STATUS)
+                raise subject._DuplicatePhaseError(expected_phase)
 
+    expected_phase = phase
     operations = Operations(cleanup_failure=True)
     with pytest.raises(
         subject.DashboardRAGVLLME2EError,
-        match=f"^{subject.E_DUPLICATE_STATUS}$",
+        match=f"^{expected_phase}$",
     ):
         subject.run(
             preflight_only=False,

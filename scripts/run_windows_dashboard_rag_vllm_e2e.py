@@ -100,7 +100,22 @@ E_DUPLICATE_STATUS = "E_DUPLICATE_STATUS"
 E_DUPLICATE_AFTER_LIST = "E_DUPLICATE_AFTER_LIST"
 E_DUPLICATE_TARGET_LOOKUP = "E_DUPLICATE_TARGET_LOOKUP"
 E_DUPLICATE_OTHER_LOOKUP = "E_DUPLICATE_OTHER_LOOKUP"
-E_DUPLICATE_VECTOR_QUERY = "E_DUPLICATE_VECTOR_QUERY"
+E_DUPLICATE_VECTOR_BEFORE_SETTINGS = "E_DUPLICATE_VECTOR_BEFORE_SETTINGS"
+E_DUPLICATE_VECTOR_BEFORE_CONNECT = "E_DUPLICATE_VECTOR_BEFORE_CONNECT"
+E_DUPLICATE_VECTOR_BEFORE_CURSOR = "E_DUPLICATE_VECTOR_BEFORE_CURSOR"
+E_DUPLICATE_VECTOR_BEFORE_EXECUTE = "E_DUPLICATE_VECTOR_BEFORE_EXECUTE"
+E_DUPLICATE_VECTOR_BEFORE_FETCH = "E_DUPLICATE_VECTOR_BEFORE_FETCH"
+E_DUPLICATE_VECTOR_BEFORE_RESULT_SHAPE = "E_DUPLICATE_VECTOR_BEFORE_RESULT_SHAPE"
+E_DUPLICATE_VECTOR_BEFORE_CLOSE = "E_DUPLICATE_VECTOR_BEFORE_CLOSE"
+E_DUPLICATE_VECTOR_BEFORE_UNCLASSIFIED = "E_DUPLICATE_VECTOR_BEFORE_UNCLASSIFIED"
+E_DUPLICATE_VECTOR_AFTER_SETTINGS = "E_DUPLICATE_VECTOR_AFTER_SETTINGS"
+E_DUPLICATE_VECTOR_AFTER_CONNECT = "E_DUPLICATE_VECTOR_AFTER_CONNECT"
+E_DUPLICATE_VECTOR_AFTER_CURSOR = "E_DUPLICATE_VECTOR_AFTER_CURSOR"
+E_DUPLICATE_VECTOR_AFTER_EXECUTE = "E_DUPLICATE_VECTOR_AFTER_EXECUTE"
+E_DUPLICATE_VECTOR_AFTER_FETCH = "E_DUPLICATE_VECTOR_AFTER_FETCH"
+E_DUPLICATE_VECTOR_AFTER_RESULT_SHAPE = "E_DUPLICATE_VECTOR_AFTER_RESULT_SHAPE"
+E_DUPLICATE_VECTOR_AFTER_CLOSE = "E_DUPLICATE_VECTOR_AFTER_CLOSE"
+E_DUPLICATE_VECTOR_AFTER_UNCLASSIFIED = "E_DUPLICATE_VECTOR_AFTER_UNCLASSIFIED"
 E_DUPLICATE_RESULT_SHAPE = "E_DUPLICATE_RESULT_SHAPE"
 E_DUPLICATE_DOCUMENT_IDENTITY = "E_DUPLICATE_DOCUMENT_IDENTITY"
 E_DUPLICATE_JOB_IDENTITY = "E_DUPLICATE_JOB_IDENTITY"
@@ -119,7 +134,22 @@ DUPLICATE_FAILURE_PHASES = frozenset(
         E_DUPLICATE_AFTER_LIST,
         E_DUPLICATE_TARGET_LOOKUP,
         E_DUPLICATE_OTHER_LOOKUP,
-        E_DUPLICATE_VECTOR_QUERY,
+        E_DUPLICATE_VECTOR_BEFORE_SETTINGS,
+        E_DUPLICATE_VECTOR_BEFORE_CONNECT,
+        E_DUPLICATE_VECTOR_BEFORE_CURSOR,
+        E_DUPLICATE_VECTOR_BEFORE_EXECUTE,
+        E_DUPLICATE_VECTOR_BEFORE_FETCH,
+        E_DUPLICATE_VECTOR_BEFORE_RESULT_SHAPE,
+        E_DUPLICATE_VECTOR_BEFORE_CLOSE,
+        E_DUPLICATE_VECTOR_BEFORE_UNCLASSIFIED,
+        E_DUPLICATE_VECTOR_AFTER_SETTINGS,
+        E_DUPLICATE_VECTOR_AFTER_CONNECT,
+        E_DUPLICATE_VECTOR_AFTER_CURSOR,
+        E_DUPLICATE_VECTOR_AFTER_EXECUTE,
+        E_DUPLICATE_VECTOR_AFTER_FETCH,
+        E_DUPLICATE_VECTOR_AFTER_RESULT_SHAPE,
+        E_DUPLICATE_VECTOR_AFTER_CLOSE,
+        E_DUPLICATE_VECTOR_AFTER_UNCLASSIFIED,
         E_DUPLICATE_RESULT_SHAPE,
         E_DUPLICATE_DOCUMENT_IDENTITY,
         E_DUPLICATE_JOB_IDENTITY,
@@ -383,8 +413,37 @@ class _DuplicatePhaseError(RuntimeError):
         super().__init__(phase)
 
 
-class _DuplicateResultShapeError(RuntimeError):
-    pass
+_DUPLICATE_VECTOR_OPERATIONS = frozenset(
+    {"SETTINGS", "CONNECT", "CURSOR", "EXECUTE", "FETCH", "RESULT_SHAPE", "CLOSE"}
+)
+_DUPLICATE_VECTOR_PHASES = {
+    "BEFORE": {
+        "SETTINGS": E_DUPLICATE_VECTOR_BEFORE_SETTINGS,
+        "CONNECT": E_DUPLICATE_VECTOR_BEFORE_CONNECT,
+        "CURSOR": E_DUPLICATE_VECTOR_BEFORE_CURSOR,
+        "EXECUTE": E_DUPLICATE_VECTOR_BEFORE_EXECUTE,
+        "FETCH": E_DUPLICATE_VECTOR_BEFORE_FETCH,
+        "RESULT_SHAPE": E_DUPLICATE_VECTOR_BEFORE_RESULT_SHAPE,
+        "CLOSE": E_DUPLICATE_VECTOR_BEFORE_CLOSE,
+    },
+    "AFTER": {
+        "SETTINGS": E_DUPLICATE_VECTOR_AFTER_SETTINGS,
+        "CONNECT": E_DUPLICATE_VECTOR_AFTER_CONNECT,
+        "CURSOR": E_DUPLICATE_VECTOR_AFTER_CURSOR,
+        "EXECUTE": E_DUPLICATE_VECTOR_AFTER_EXECUTE,
+        "FETCH": E_DUPLICATE_VECTOR_AFTER_FETCH,
+        "RESULT_SHAPE": E_DUPLICATE_VECTOR_AFTER_RESULT_SHAPE,
+        "CLOSE": E_DUPLICATE_VECTOR_AFTER_CLOSE,
+    },
+}
+
+
+class _DuplicateVectorOperationError(RuntimeError):
+    def __init__(self, operation: str) -> None:
+        if operation not in _DUPLICATE_VECTOR_OPERATIONS:
+            raise ValueError
+        self.operation = operation
+        super().__init__(operation)
 
 
 class _DocumentReadyPhaseError(RuntimeError):
@@ -1690,14 +1749,7 @@ class _ProductionLifecycle:
             raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
         if fresh_target_before is None or fresh_other_before is None:
             raise _DuplicatePhaseError(E_DUPLICATE_DOCUMENT_IDENTITY)
-        try:
-            vector_count_before = self._target_vector_count()
-        except _DuplicateResultShapeError:
-            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE) from None
-        except Exception:
-            raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_QUERY) from None
-        if type(vector_count_before) is not int or vector_count_before < 0:
-            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
+        vector_count_before = self._duplicate_vector_snapshot(position="BEFORE")
         try:
             result = runtime.manager.submit(
                 submission_token="duplicate",
@@ -1748,14 +1800,7 @@ class _ProductionLifecycle:
             other_after, DocumentRegistryEntry
         ):
             raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
-        try:
-            vector_count_after = self._target_vector_count()
-        except _DuplicateResultShapeError:
-            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE) from None
-        except Exception:
-            raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_QUERY) from None
-        if type(vector_count_after) is not int or vector_count_after < 0:
-            raise _DuplicatePhaseError(E_DUPLICATE_RESULT_SHAPE)
+        vector_count_after = self._duplicate_vector_snapshot(position="AFTER")
         if len(after_entries) != 2 or len(after_entries) != len(before_entries):
             raise _DuplicatePhaseError(E_DUPLICATE_REGISTRY_CARDINALITY)
         if target_after is None or other_after is None:
@@ -1778,36 +1823,109 @@ class _ProductionLifecycle:
         if vector_count_after != vector_count_before:
             raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_CARDINALITY)
 
-    def _target_vector_count(self) -> int:
-        from psycopg import connect
-
-        entry = self._target_entry
-        if entry is None:
-            raise RuntimeError
-        connection = connect(self._application_dsn(), autocommit=False)
+    def _duplicate_vector_snapshot(self, *, position: str) -> int:
+        phases = _DUPLICATE_VECTOR_PHASES.get(position)
+        if phases is None:
+            raise _DuplicatePhaseError(E_DUPLICATE_VECTOR_BEFORE_UNCLASSIFIED)
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT count(*) FROM callmetric_vector.vector_records "
-                    "WHERE tenant_id = %s AND knowledge_base_id = %s "
-                    "AND document_id = %s",
-                    (
-                        entry.document.tenant_id,
-                        entry.document.knowledge_base_id,
-                        entry.document.document_id,
-                    ),
-                )
-                row = cursor.fetchone()
+            count = self._target_vector_count()
+        except _DuplicateVectorOperationError as error:
+            raise _DuplicatePhaseError(phases[error.operation]) from None
+        except Exception:
+            unclassified = (
+                E_DUPLICATE_VECTOR_BEFORE_UNCLASSIFIED
+                if position == "BEFORE"
+                else E_DUPLICATE_VECTOR_AFTER_UNCLASSIFIED
+            )
+            raise _DuplicatePhaseError(unclassified) from None
+        if type(count) is not int or count < 0:
+            raise _DuplicatePhaseError(phases["RESULT_SHAPE"])
+        return count
+
+    def _target_vector_count(self) -> int:
+        try:
+            from psycopg import connect
+
+            entry = self._target_entry
+            if entry is None:
+                raise RuntimeError
+            dsn = self._application_dsn()
+            parameters = (
+                entry.document.tenant_id,
+                entry.document.knowledge_base_id,
+                entry.document.document_id,
+            )
+        except Exception:
+            raise _DuplicateVectorOperationError("SETTINGS") from None
+        try:
+            connection = connect(dsn, autocommit=False)
+        except Exception:
+            raise _DuplicateVectorOperationError("CONNECT") from None
+        primary_error: _DuplicateVectorOperationError | None = None
+        result: int | None = None
+        cursor_manager = None
+        cursor = None
+        cursor_entered = False
+        try:
+            try:
+                constructed_cursor = connection.cursor()
+                cursor_manager = constructed_cursor
+                cursor = constructed_cursor.__enter__()
+                cursor_entered = True
+            except Exception:
+                primary_error = _DuplicateVectorOperationError("CURSOR")
+            if primary_error is None:
+                if cursor is None:
+                    primary_error = _DuplicateVectorOperationError("CURSOR")
+            if primary_error is None and cursor is not None:
+                try:
+                    cursor.execute(
+                        "SELECT count(*) FROM callmetric_vector.vector_records "
+                        "WHERE tenant_id = %s AND knowledge_base_id = %s "
+                        "AND document_id = %s",
+                        parameters,
+                    )
+                except Exception:
+                    primary_error = _DuplicateVectorOperationError("EXECUTE")
+            row: object = None
+            if primary_error is None and cursor is not None:
+                try:
+                    row = cursor.fetchone()
+                except Exception:
+                    primary_error = _DuplicateVectorOperationError("FETCH")
+            if primary_error is None:
                 if (
                     type(row) is not tuple
                     or len(row) != 1
                     or type(row[0]) is not int
                     or row[0] < 0
                 ):
-                    raise _DuplicateResultShapeError
-                return row[0]
+                    primary_error = _DuplicateVectorOperationError("RESULT_SHAPE")
+                else:
+                    result = row[0]
         finally:
-            connection.close()
+            if cursor_entered and cursor_manager is not None:
+                try:
+                    cursor_manager.__exit__(
+                        type(primary_error) if primary_error is not None else None,
+                        primary_error,
+                        primary_error.__traceback__
+                        if primary_error is not None
+                        else None,
+                    )
+                except Exception:
+                    if primary_error is None:
+                        primary_error = _DuplicateVectorOperationError("CLOSE")
+            try:
+                connection.close()
+            except Exception:
+                if primary_error is None:
+                    primary_error = _DuplicateVectorOperationError("CLOSE")
+        if primary_error is not None:
+            raise primary_error
+        if result is None:
+            raise _DuplicateVectorOperationError("RESULT_SHAPE")
+        return result
 
     def _delete(self) -> None:
         runtime = self._document_runtime
