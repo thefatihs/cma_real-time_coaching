@@ -417,3 +417,46 @@ This log uses local chronological numbering and records only Fatih-owned work.
   protocol, authentication and timeout behavior are unchanged.
 - Next planned step: manually verify native Windows capture and first audio over
   the SSH tunnel workflow end to end.
+
+## SSH stdin microphone demo fallback
+
+- Added a Streamlit/TCP-independent development fallback that sends exact
+  Windows native PCM16 16 kHz mono audio through an owned SSH subprocess stdin
+  and feeds it on the GPU into the existing bounded local microphone ingress,
+  Faster-Whisper, SetFit and deterministic coaching pipeline.
+- Added synthetic transport, chunking, cleanup and readable-result tests; no
+  microphone, SSH connection or model execution is required by tests.
+- Changed files: the two fallback CLI scripts, one focused synthetic test file
+  and this progress file.
+- Tests: focused fallback/ingress/runtime wiring 53 passed; full Windows suite
+  2663 passed and 17 skipped, with only the 19 documented POSIX-only vLLM
+  controller failures. Ruff and formatting passed; focused Pyright passed and
+  repository Pyright remains limited to the three documented POSIX findings.
+- Next planned step: run one controlled Windows-to-GPU fallback demo with the
+  existing cached `large-v3` and SetFit artifacts.
+
+## DCV stdin microphone backpressure
+
+- Manually verified that Amazon DCV delivers real Windows microphone audio to
+  the Ubuntu `AWS-Virtual-Microphone` source (recorded RMS 1578, peak 32768).
+- Replaced the GPU stdin demo's eager local-ingress producer queue with lazy,
+  scoped PCM16 audio events consumed under existing streaming-pipeline
+  backpressure; exact local-test capability authorization and in-memory-only
+  processing remain unchanged.
+- Changed files: GPU stdin demo runner, focused synthetic fallback tests, and
+  this progress file.
+- Tests: focused fallback/streaming 76 passed; full Windows suite 2663 passed
+  and 17 skipped, with only the 19 documented POSIX-only vLLM failures. Ruff
+  and formatting passed; focused Pyright passed and repository Pyright remains
+  limited to the three documented POSIX portability findings.
+- Live GPU acceptance passed end to end from Windows microphone through Amazon
+  DCV and `AWS-Virtual-Microphone` into Faster-Whisper `large-v3` CUDA, live
+  transcript, Runtime SetFit classification and deterministic coaching.
+- Accepted command: `parec --device=AWS-Virtual-Microphone --format=s16le
+  --rate=16000 --channels=1 | PYTHONPATH=. .venv/bin/python
+  scripts/run_gpu_stdin_microphone_demo.py --tenant-key tenant_alpha --call-id
+  dcv-demo`.
+- Non-blocking follow-up warnings: ONNX Runtime `/sys/class/drm/card0` device
+  discovery, SetFit tokenizer `fix_mistral_regex`, and joblib/NumPy deprecation.
+- Next planned step: retain the accepted command as the GPU microphone demo
+  checkpoint and review the three dependency warnings separately.
